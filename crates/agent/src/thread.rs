@@ -1,7 +1,7 @@
 use crate::{
-    CaduceusCodeGraphTool, CaduceusConversationTool, CaduceusDependencyScanTool,
+    CaduceusCheckpointTool, CaduceusCodeGraphTool, CaduceusConversationTool, CaduceusDependencyScanTool,
     CaduceusErrorAnalysisTool, CaduceusGitReadTool, CaduceusGitWriteTool,
-    CaduceusIndexTool, CaduceusKanbanTool, CaduceusMarketplaceTool, CaduceusMcpSecurityTool,
+    CaduceusIndexTool, CaduceusKanbanTool, CaduceusKillSwitchTool, CaduceusMarketplaceTool, CaduceusMcpSecurityTool,
     CaduceusMemoryReadTool, CaduceusMemoryWriteTool, CaduceusPrdTool,
     CaduceusProgressTool, CaduceusScaffoldTool, CaduceusSecurityScanTool,
     CaduceusSemanticSearchTool, CaduceusStorageTool, CaduceusTaskTreeTool,
@@ -1438,6 +1438,35 @@ impl Thread {
         self.caduceus_mode = mode;
     }
 
+    /// Caduceus: check if a tool is allowed in the current privilege ring.
+    /// Ring 0 (Plan/Research/Architect/Review): read-only tools only
+    /// Ring 1 (Act/Debug): all tools with approval
+    /// Ring 2 (Autopilot): all tools, no approval
+    fn is_tool_allowed_in_current_mode(&self, tool_name: &str) -> bool {
+        let mode = self.caduceus_mode.as_deref().unwrap_or("act");
+        let read_only_modes = ["plan", "research", "architect", "review"];
+
+        if read_only_modes.contains(&mode) {
+            // Ring 0: only allow read-only tools
+            let write_tools = [
+                "edit_file",
+                "streaming_edit_file",
+                "save_file",
+                "create_directory",
+                "delete_path",
+                "move_path",
+                "terminal",
+                "caduceus_git_write",
+                "caduceus_memory_write",
+                "caduceus_kanban",
+                "caduceus_storage",
+            ];
+            !write_tools.contains(&tool_name)
+        } else {
+            true // Ring 1+ allows all tools
+        }
+    }
+
     /// Caduceus: auto-compact context when approaching token limits.
     /// Writes a summary of older messages to .caduceus/context/ and removes them
     /// from the active conversation, keeping only the most recent messages.
@@ -1671,6 +1700,7 @@ impl Thread {
             self.add_tool(CaduceusMemoryReadTool::new(project_root.clone()));
             self.add_tool(CaduceusMemoryWriteTool::new(project_root.clone()));
             self.add_tool(CaduceusStorageTool::new(project_root.clone()));
+            self.add_tool(CaduceusCheckpointTool::new(project_root.clone()));
             self.add_tool(CaduceusWikiTool::new(project_root.clone()));
             self.add_tool(CaduceusKanbanTool::new(project_root));
         }
@@ -1683,6 +1713,7 @@ impl Thread {
         self.add_tool(CaduceusTelemetryTool::new());
         self.add_tool(CaduceusTimeTrackingTool::new());
         self.add_tool(CaduceusTaskTreeTool::new());
+        self.add_tool(CaduceusKillSwitchTool::new());
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
             self.add_tool(SpawnAgentTool::new(environment));
@@ -2441,6 +2472,23 @@ impl Thread {
 
         self.send_or_update_tool_use(&tool_use, title, kind, event_stream);
 
+        // Caduceus: enforce privilege rings — block write tools in read-only modes
+        if !self.is_tool_allowed_in_current_mode(tool_use.name.as_ref()) {
+            let mode = self.caduceus_mode.as_deref().unwrap_or("act");
+            let content = format!(
+                "Tool '{}' is not available in {} mode (read-only ring). Switch to act or autopilot mode to use write tools.",
+                tool_use.name, mode
+            );
+            log::warn!("[caduceus] Blocked tool '{}' in {} mode", tool_use.name, mode);
+            return Some(Task::ready(LanguageModelToolResult {
+                content: LanguageModelToolResultContent::Text(Arc::from(content)),
+                tool_use_id: tool_use.id,
+                tool_name: tool_use.name,
+                is_error: true,
+                output: None,
+            }));
+        }
+
         let Some(tool) = tool else {
             let content = format!("No tool named {} exists", tool_use.name);
             return Some(Task::ready(LanguageModelToolResult {
@@ -3108,7 +3156,13 @@ impl Thread {
         // Inject Caduceus mode prefix into system prompt
         let system_prompt = if let Some(mode) = &self.caduceus_mode {
             let mode_prefix = match mode.as_str() {
-                "plan" => "You are in PLAN mode. Analyze only — do NOT modify any files, do NOT execute any write operations. Produce a numbered action plan. For any tool call, respond with what you WOULD do instead of executing it. Output a structured markdown plan with numbered steps.\n\n",
+                "plan" => "You are in PLAN mode. Analyze only — do NOT modify any files.\n\
+Output your plan as a numbered list with this format:\n\
+## Plan\n\
+1. **[Action]** Description (tool: tool_name)\n\
+2. **[Action]** Description (tool: tool_name)\n\
+...\n\
+Each step should say what you WOULD do, not what you ARE doing.\n\n",
                 "act" => "You are in ACT mode. Execute code changes as requested. Each write operation requires user approval before proceeding.\n\n",
                 "research" => "You are in RESEARCH mode. Read-only exploration. Search the codebase, read files, and summarize your findings. Do NOT modify any files.\n\n",
                 "autopilot" => "You are in AUTOPILOT mode. Fully autonomous execution. Plan, implement, test, and commit changes without waiting for approval. Be thorough and verify your changes work before committing.\n\n",

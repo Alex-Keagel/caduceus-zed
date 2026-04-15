@@ -4369,6 +4369,23 @@ impl AgentPanel {
                                 cx,
                             ))
                         })
+                        .when(self.active_thread_has_messages(cx), |this| {
+                            this.child(
+                                IconButton::new("caduceus-kill-switch", IconName::XCircle)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Error)
+                                    .tooltip(Tooltip::text("Emergency Stop All Agents"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        log::warn!("[caduceus] Kill switch activated from UI");
+                                        if let Some(view) = this.active_conversation_view().cloned()
+                                        {
+                                            view.update(cx, |view, cx| {
+                                                view.cancel_generation(cx);
+                                            });
+                                        }
+                                    })),
+                            )
+                        })
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
                 )
@@ -4420,6 +4437,23 @@ impl AgentPanel {
                                 Corner::TopRight,
                                 cx,
                             ))
+                        })
+                        .when(self.active_thread_has_messages(cx), |this| {
+                            this.child(
+                                IconButton::new("caduceus-kill-switch", IconName::XCircle)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Error)
+                                    .tooltip(Tooltip::text("Emergency Stop All Agents"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        log::warn!("[caduceus] Kill switch activated from UI");
+                                        if let Some(view) = this.active_conversation_view().cloned()
+                                        {
+                                            view.update(cx, |view, cx| {
+                                                view.cancel_generation(cx);
+                                            });
+                                        }
+                                    })),
+                            )
                         })
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),

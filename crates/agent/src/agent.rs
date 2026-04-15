@@ -289,6 +289,17 @@ impl NativeAgent {
         })
     }
 
+    /// Caduceus: emergency kill switch — cancels ALL running sessions immediately
+    pub fn kill_all_sessions(&mut self, cx: &mut Context<Self>) {
+        log::warn!("[caduceus] KILL SWITCH activated — stopping all sessions");
+        for (session_id, session) in &self.sessions {
+            log::info!("[caduceus] Killing session: {}", session_id);
+            session.thread.update(cx, |thread, cx| {
+                thread.cancel(cx).detach();
+            });
+        }
+    }
+
     fn new_session(
         &mut self,
         project: Entity<Project>,

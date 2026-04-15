@@ -3297,10 +3297,12 @@ impl ThreadView {
                                 h_flex()
                                     .gap_1()
                                     .children(self.render_token_usage(cx))
+                                    .children(self.render_checkpoint_status(cx))
                                     .children(self.profile_selector.clone())
                                     .map(|this| match self.config_options_view.clone() {
                                         Some(config_view) => this.child(config_view),
                                         None => this
+                                            .children(self.render_mode_safety_indicator(cx))
                                             .children(self.mode_selector.clone())
                                             .children(self.model_selector.clone()),
                                     })
@@ -3496,6 +3498,80 @@ impl ThreadView {
         self.as_native_thread(cx)
             .and_then(|thread| thread.read(cx).model())
             .is_some_and(|model| model.supports_split_token_display())
+    }
+
+    fn mode_safety_color(&self, cx: &Context<Self>) -> Hsla {
+        let mode_id = self
+            .mode_selector
+            .as_ref()
+            .map(|s| s.read(cx).mode().0.to_string())
+            .unwrap_or_default();
+
+        match mode_id.as_str() {
+            "plan" | "research" | "architect" | "review" => cx.theme().status().success,
+            "act" | "debug" => cx.theme().status().warning,
+            "autopilot" => cx.theme().status().error,
+            _ => cx.theme().status().info,
+        }
+    }
+
+    fn mode_safety_tooltip(&self, cx: &Context<Self>) -> &'static str {
+        let mode_id = self
+            .mode_selector
+            .as_ref()
+            .map(|s| s.read(cx).mode().0.to_string())
+            .unwrap_or_default();
+
+        match mode_id.as_str() {
+            "plan" | "research" | "architect" | "review" => "Safe: read-only mode",
+            "act" | "debug" => "Careful: requires approval",
+            "autopilot" => "Danger: autonomous mode",
+            _ => "Mode safety level",
+        }
+    }
+
+    fn render_mode_safety_indicator(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        // Only show when mode_selector is present
+        self.mode_selector.as_ref()?;
+
+        let color = self.mode_safety_color(cx);
+        let tooltip_text = self.mode_safety_tooltip(cx);
+
+        Some(
+            div()
+                .id("mode-safety-indicator")
+                .w(px(8.))
+                .h(px(8.))
+                .rounded_full()
+                .bg(color)
+                .tooltip(Tooltip::text(tooltip_text)),
+        )
+    }
+
+    fn render_checkpoint_status(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let project = self.project.upgrade()?;
+        let project_read = project.read(cx);
+        let worktree = project_read.worktrees(cx).next()?;
+        let root = worktree.read(cx).abs_path();
+        let checkpoint_dir = root.join(".caduceus").join("checkpoints");
+
+        if checkpoint_dir.exists() {
+            let count = std::fs::read_dir(&checkpoint_dir).ok()?.count();
+            if count > 0 {
+                return Some(
+                    div()
+                        .id("checkpoint-status")
+                        .px_1()
+                        .child(
+                            Label::new(format!("\u{1F4CC} {} checkpoints", count))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .tooltip(Tooltip::text("Caduceus safety checkpoints")),
+                );
+            }
+        }
+        None
     }
 
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
