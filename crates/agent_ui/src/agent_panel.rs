@@ -4258,6 +4258,7 @@ impl AgentPanel {
 
         let show_history_menu = self.has_history_for_selected_agent(cx);
         let agent_v2_enabled = agent_v2_enabled(cx);
+        let automation_count = self.automations_count(cx);
         let is_empty_state = !self.active_thread_has_messages(cx);
 
         let is_in_history_or_config = self.is_history_or_configuration_visible();
@@ -4369,6 +4370,13 @@ impl AgentPanel {
                                 cx,
                             ))
                         })
+                        .when(automation_count > 0, |this| {
+                            this.child(
+                                Label::new(format!("⚡ {automation_count}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
                         .when(self.active_thread_has_messages(cx), |this| {
                             this.child(
                                 IconButton::new("caduceus-kill-switch", IconName::XCircle)
@@ -4438,6 +4446,13 @@ impl AgentPanel {
                                 cx,
                             ))
                         })
+                        .when(automation_count > 0, |this| {
+                            this.child(
+                                Label::new(format!("⚡ {automation_count}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
                         .when(self.active_thread_has_messages(cx), |this| {
                             this.child(
                                 IconButton::new("caduceus-kill-switch", IconName::XCircle)
@@ -4470,6 +4485,21 @@ impl AgentPanel {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(toolbar_content)
+    }
+
+    fn automations_count(&self, cx: &Context<Self>) -> usize {
+        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
+            let root = worktree.read(cx).abs_path();
+            let path = root.join(".caduceus/automations.json");
+            if path.exists() {
+                if let Ok(json) = std::fs::read_to_string(&path) {
+                    if let Ok(autos) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+                        return autos.len();
+                    }
+                }
+            }
+        }
+        0
     }
 
     fn render_worktree_creation_status(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

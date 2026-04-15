@@ -29,7 +29,12 @@ pub use caduceus_orchestrator::{
     TaskTree as BridgeTaskTree,
     HierarchicalTask as BridgeHierarchicalTask,
     kanban::{KanbanBoard, KanbanCard, KanbanColumn, CardStatus},
+    automations::{Automation, AutomationTrigger, AutomationAgentConfig, AutomationRegistry},
 };
+
+// Re-export types needed by tools.
+pub use caduceus_orchestrator::modes::AgentMode as BridgeAgentMode;
+pub use caduceus_core::ModelId as BridgeModelId;
 
 /// Wrapper around the AgentHarness for the bridge.
 pub struct OrchestratorBridge {

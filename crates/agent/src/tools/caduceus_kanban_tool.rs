@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 
+use caduceus_bridge::engine::CaduceusEngine;
 use caduceus_bridge::orchestrator::{KanbanBoard, KanbanCard};
 
 /// Manages a Kanban board for multi-agent task orchestration. Each card represents
@@ -104,11 +105,16 @@ impl From<CaduceusKanbanToolOutput> for LanguageModelToolResultContent {
 
 pub struct CaduceusKanbanTool {
     project_root: PathBuf,
+    engine: Arc<CaduceusEngine>,
 }
 
 impl CaduceusKanbanTool {
-    pub fn new(project_root: PathBuf) -> Self {
-        Self { project_root }
+    pub fn new(project_root: PathBuf, engine: Arc<CaduceusEngine>) -> Self {
+        Self { project_root, engine }
+    }
+
+    fn worktree_path(branch: &str) -> String {
+        format!(".caduceus/worktrees/{branch}")
     }
 
     fn load_or_create_board(&self) -> Result<KanbanBoard, String> {
@@ -236,6 +242,15 @@ impl AgentTool for CaduceusKanbanTool {
                     }
                 }
                 KanbanOperation::MoveCard { card_id, column_id } => {
+                    // Create worktree when moving to in-progress
+                    if column_id == "in-progress" {
+                        if let Some(card) = board.cards.iter().find(|c| c.id == card_id) {
+                            if let Some(branch) = &card.worktree_branch {
+                                let wt_path = Self::worktree_path(branch);
+                                let _ = self.engine.git_create_worktree(branch, &wt_path);
+                            }
+                        }
+                    }
                     board.move_card(&card_id, &column_id).map_err(|e| {
                         CaduceusKanbanToolOutput::Error {
                             error: format!("{e}"),
@@ -265,12 +280,37 @@ impl AgentTool for CaduceusKanbanTool {
                     }
                 }
                 KanbanOperation::CompleteCard { card_id } => {
+                    // Capture worktree branch before completing (card may move)
+                    let completed_branch = board
+                        .cards
+                        .iter()
+                        .find(|c| c.id == card_id)
+                        .and_then(|c| c.worktree_branch.clone());
+
                     let auto_started =
                         board.on_card_complete(&card_id).map_err(|e| {
                             CaduceusKanbanToolOutput::Error {
                                 error: format!("{e}"),
                             }
                         })?;
+
+                    // Remove worktree for the completed card
+                    if let Some(branch) = &completed_branch {
+                        let wt_path = Self::worktree_path(branch);
+                        let _ = self.engine.git_remove_worktree(&wt_path);
+                    }
+
+                    // Create worktrees for auto-started dependents
+                    for started_id in &auto_started {
+                        let id_part = started_id.split(':').next().unwrap_or(started_id);
+                        if let Some(card) = board.cards.iter().find(|c| c.id == id_part) {
+                            if let Some(branch) = &card.worktree_branch {
+                                let wt_path = Self::worktree_path(branch);
+                                let _ = self.engine.git_create_worktree(branch, &wt_path);
+                            }
+                        }
+                    }
+
                     self.save_board(&board).map_err(|e| {
                         CaduceusKanbanToolOutput::Error { error: e }
                     })?;

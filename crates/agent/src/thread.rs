@@ -1,5 +1,5 @@
 use crate::{
-    CaduceusCheckpointTool, CaduceusCodeGraphTool, CaduceusConversationTool, CaduceusDependencyScanTool,
+    CaduceusAutomationsTool, CaduceusCheckpointTool, CaduceusCodeGraphTool, CaduceusConversationTool, CaduceusDependencyScanTool,
     CaduceusErrorAnalysisTool, CaduceusGitReadTool, CaduceusGitWriteTool,
     CaduceusIndexTool, CaduceusKanbanTool, CaduceusKillSwitchTool, CaduceusMarketplaceTool, CaduceusMcpSecurityTool,
     CaduceusMemoryReadTool, CaduceusMemoryWriteTool, CaduceusPrdTool,
@@ -1696,13 +1696,14 @@ impl Thread {
             self.add_tool(CaduceusErrorAnalysisTool::new(engine.clone()));
             self.add_tool(CaduceusMcpSecurityTool::new(engine.clone()));
             self.add_tool(CaduceusGitReadTool::new(engine.clone()));
-            self.add_tool(CaduceusGitWriteTool::new(engine));
+            self.add_tool(CaduceusGitWriteTool::new(engine.clone()));
             self.add_tool(CaduceusMemoryReadTool::new(project_root.clone()));
             self.add_tool(CaduceusMemoryWriteTool::new(project_root.clone()));
             self.add_tool(CaduceusStorageTool::new(project_root.clone()));
             self.add_tool(CaduceusCheckpointTool::new(project_root.clone()));
             self.add_tool(CaduceusWikiTool::new(project_root.clone()));
-            self.add_tool(CaduceusKanbanTool::new(project_root));
+            self.add_tool(CaduceusKanbanTool::new(project_root.clone(), engine));
+            self.add_tool(CaduceusAutomationsTool::new(project_root));
         }
         self.add_tool(CaduceusDependencyScanTool::new());
         self.add_tool(CaduceusScaffoldTool::new());

@@ -1,3 +1,4 @@
+mod caduceus_automations_tool;
 mod caduceus_checkpoint_tool;
 mod caduceus_code_graph_tool;
 mod caduceus_conversation_tool;
@@ -51,6 +52,7 @@ mod web_search_tool;
 use crate::AgentTool;
 use language_model::{LanguageModelRequestTool, LanguageModelToolSchemaFormat};
 
+pub use caduceus_automations_tool::*;
 pub use caduceus_checkpoint_tool::*;
 pub use caduceus_code_graph_tool::*;
 pub use caduceus_conversation_tool::*;
@@ -167,6 +169,7 @@ macro_rules! tools {
 }
 
 tools! {
+    CaduceusAutomationsTool,
     CaduceusCheckpointTool,
     CaduceusCodeGraphTool,
     CaduceusConversationTool,
