@@ -18,5 +18,9 @@ pub mod search;
 pub mod git;
 pub mod security;
 pub mod memory;
+pub mod storage;
+pub mod telemetry;
+pub mod crdt;
+pub mod orchestrator;
 
 pub use engine::CaduceusEngine;
