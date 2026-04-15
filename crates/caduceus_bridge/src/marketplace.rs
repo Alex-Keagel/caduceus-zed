@@ -3,7 +3,8 @@
 use caduceus_marketplace::{
     EvolvedSkill, EvolverConfig, GarbageCandidate, McpRegistryBrowser, McpRegistryEntry,
     MemoryGarbageCollector, PatternAggregator, PatternEntry, SessionSummary, SkillAutoGenerator,
-    SkillEvolver, SkillQualityScorer, SkillScoreInput, SkillVersionManager,
+    SkillEvolver, SkillQualityScorer, SkillScoreInput, SkillSyncManager, SkillVersionManager,
+    SyncAction, SyncableSkill,
 };
 
 /// Unified bridge into caduceus-marketplace subsystems.
@@ -14,6 +15,7 @@ pub struct MarketplaceBridge {
     pub versions: SkillVersionManager,
     pub gc: MemoryGarbageCollector,
     pub browser: McpRegistryBrowser,
+    pub sync: SkillSyncManager,
 }
 
 impl MarketplaceBridge {
@@ -29,6 +31,7 @@ impl MarketplaceBridge {
             versions: SkillVersionManager::new(),
             gc: MemoryGarbageCollector::new(90, 1000),
             browser: McpRegistryBrowser::new(),
+            sync: SkillSyncManager::new(),
         }
     }
 
@@ -129,6 +132,64 @@ impl MarketplaceBridge {
     /// Evolve new skills from session summaries.
     pub fn evolve_from_summaries(&mut self, summaries: &[SessionSummary]) -> Vec<EvolvedSkill> {
         self.evolver.evolve_from_summaries(summaries)
+    }
+
+    /// Check if a skill should evolve based on session count.
+    pub fn should_evolve(&self, session_count: usize) -> bool {
+        self.evolver.should_evolve(session_count)
+    }
+
+    /// Register an evolved skill.
+    pub fn register_evolved(&mut self, skill: EvolvedSkill) {
+        self.evolver.register_evolved(skill);
+    }
+
+    /// List all evolved skills.
+    pub fn list_evolved(&self) -> &[EvolvedSkill] {
+        self.evolver.list_evolved()
+    }
+
+    // ── Skill sync ───────────────────────────────────────────────────────
+
+    /// Add a local skill for synchronization.
+    pub fn add_local(&mut self, skill: SyncableSkill) {
+        self.sync.add_local(skill);
+    }
+
+    /// Add a remote skill for synchronization.
+    pub fn add_remote(&mut self, skill: SyncableSkill) {
+        self.sync.add_remote(skill);
+    }
+
+    /// Resolve sync conflicts, preferring "local" or "remote".
+    pub fn resolve_conflicts(&self, prefer: &str) -> Vec<SyncAction> {
+        self.sync.resolve_conflicts(prefer)
+    }
+
+    // ── Versioning (new) ─────────────────────────────────────────────────
+
+    /// Get the latest version of a skill.
+    pub fn latest_version(&self, name: &str) -> Option<&caduceus_marketplace::SkillVersion> {
+        self.versions.latest_version(name)
+    }
+
+    /// Rollback a skill to a previous version, returning its content.
+    pub fn rollback(&self, name: &str, version: u32) -> Option<String> {
+        self.versions.rollback(name, version)
+    }
+
+    // ── Registry browser (new) ───────────────────────────────────────────
+
+    /// Filter entries to verified-only.
+    pub fn verified_only(&self) -> Vec<&McpRegistryEntry> {
+        self.browser.verified_only()
+    }
+
+    // ── Pattern aggregation (new) ────────────────────────────────────────
+
+    /// Aggregate ingested patterns, returning those meeting the minimum occurrence threshold.
+    pub fn aggregate(&self) -> Vec<&PatternEntry> {
+        self.aggregator.aggregate()
     }
 }
 
@@ -297,6 +358,97 @@ mod tests {
         let evolved = bridge.evolve_from_summaries(&summaries);
         assert!(!evolved.is_empty(), "Should evolve a skill from 5 sessions");
         assert_eq!(evolved[0].name, "rust-refactor");
+    }
+
+    #[test]
+    fn marketplace_should_evolve_and_register() {
+        let mut bridge = MarketplaceBridge::new();
+        assert!(!bridge.should_evolve(1));
+        assert!(bridge.should_evolve(5));
+
+        assert!(bridge.list_evolved().is_empty());
+        bridge.register_evolved(EvolvedSkill {
+            name: "test-skill".into(),
+            content: "# Test".into(),
+            version: 1,
+            source_sessions: vec!["s1".into()],
+            quality_score: 0.9,
+            created_at: 0,
+        });
+        assert_eq!(bridge.list_evolved().len(), 1);
+        assert_eq!(bridge.list_evolved()[0].name, "test-skill");
+    }
+
+    #[test]
+    fn marketplace_sync_add_local_remote_resolve() {
+        let mut bridge = MarketplaceBridge::new();
+        bridge.add_local(SyncableSkill {
+            name: "shared".into(),
+            version: 2,
+            hash: "aaa".into(),
+            content: "v2 local".into(),
+        });
+        bridge.add_remote(SyncableSkill {
+            name: "shared".into(),
+            version: 1,
+            hash: "bbb".into(),
+            content: "v1 remote".into(),
+        });
+        let resolved = bridge.resolve_conflicts("local");
+        assert!(
+            resolved.iter().any(|a| matches!(a, SyncAction::Push(n) if n == "shared")),
+            "Local preference should produce Push"
+        );
+    }
+
+    #[test]
+    fn marketplace_latest_version_and_rollback() {
+        let mut bridge = MarketplaceBridge::new();
+        bridge.record_version("sk", "content-v1", "initial");
+        bridge.record_version("sk", "content-v2", "update");
+
+        let latest = bridge.latest_version("sk").unwrap();
+        assert_eq!(latest.version, 2);
+
+        let rolled_back = bridge.rollback("sk", 1).unwrap();
+        assert_eq!(rolled_back, "content-v1");
+    }
+
+    #[test]
+    fn marketplace_verified_only() {
+        let mut bridge = MarketplaceBridge::new();
+        bridge.add_entry(McpRegistryEntry {
+            name: "verified-tool".into(),
+            description: "".into(),
+            author: "".into(),
+            downloads: 10,
+            version: "1".into(),
+            tags: vec![],
+            verified: true,
+        });
+        bridge.add_entry(McpRegistryEntry {
+            name: "unverified-tool".into(),
+            description: "".into(),
+            author: "".into(),
+            downloads: 10,
+            version: "1".into(),
+            tags: vec![],
+            verified: false,
+        });
+        let verified = bridge.verified_only();
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].name, "verified-tool");
+    }
+
+    #[test]
+    fn marketplace_aggregate_patterns() {
+        let mut bridge = MarketplaceBridge::new();
+        bridge.ingest_session("s1", &["debug".into(), "test".into()]);
+        bridge.ingest_session("s2", &["debug".into()]);
+        bridge.ingest_session("s3", &["debug".into(), "deploy".into()]);
+        let agg = bridge.aggregate();
+        assert!(!agg.is_empty());
+        assert_eq!(agg[0].pattern, "debug");
     }
 
     #[test]

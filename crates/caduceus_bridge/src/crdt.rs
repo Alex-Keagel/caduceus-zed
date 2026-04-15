@@ -1,6 +1,6 @@
 //! CRDT bridge — conflict-free replicated data types for collaborative editing.
 
-use caduceus_crdt::{Buffer, Operation, ReplicaId};
+use caduceus_crdt::{Anchor, Buffer, FragmentId, Operation, ReplicaId, VersionVector};
 
 /// Wrapper around the CRDT Buffer for collaborative editing.
 pub struct CrdtBridge {
@@ -104,6 +104,49 @@ impl CrdtBridge {
     pub fn close_buffer(&mut self, file_path: &str) -> bool {
         self.buffers.remove(file_path).is_some()
     }
+
+    // ── New CRDT methods ─────────────────────────────────────────────────
+
+    /// Undo the last operation by its FragmentId.
+    pub fn undo(
+        &mut self,
+        file_path: &str,
+        op_id: FragmentId,
+        replica_id: u16,
+    ) -> Result<Operation, String> {
+        let buf = self
+            .buffers
+            .get_mut(file_path)
+            .ok_or_else(|| format!("No buffer for {file_path}"))?;
+        Ok(buf.undo(op_id, ReplicaId(replica_id)))
+    }
+
+    /// Get an anchor at a given character offset.
+    pub fn anchor_at(&self, file_path: &str, offset: usize) -> Result<Anchor, String> {
+        let buf = self
+            .buffers
+            .get(file_path)
+            .ok_or_else(|| format!("No buffer for {file_path}"))?;
+        Ok(buf.anchor_at(offset))
+    }
+
+    /// Get the character offset for an anchor.
+    pub fn offset_of(&self, file_path: &str, anchor: &Anchor) -> Result<usize, String> {
+        let buf = self
+            .buffers
+            .get(file_path)
+            .ok_or_else(|| format!("No buffer for {file_path}"))?;
+        Ok(buf.offset_of(anchor))
+    }
+
+    /// Get the version vector for a buffer.
+    pub fn version(&self, file_path: &str) -> Result<VersionVector, String> {
+        let buf = self
+            .buffers
+            .get(file_path)
+            .ok_or_else(|| format!("No buffer for {file_path}"))?;
+        Ok(buf.version().clone())
+    }
 }
 
 impl Default for CrdtBridge {
@@ -187,5 +230,51 @@ mod tests {
         let mut crdt = CrdtBridge::new();
         let result = crdt.insert("nonexistent.txt", 0, "text", 1);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn crdt_anchor_roundtrip() {
+        let mut crdt = CrdtBridge::new();
+        crdt.open_buffer("test.txt", Some("hello world"));
+        let anchor = crdt.anchor_at("test.txt", 5).unwrap();
+        let offset = crdt.offset_of("test.txt", &anchor).unwrap();
+        assert_eq!(offset, 5);
+    }
+
+    #[test]
+    fn crdt_anchor_start() {
+        let mut crdt = CrdtBridge::new();
+        crdt.open_buffer("test.txt", Some("abc"));
+        let anchor = crdt.anchor_at("test.txt", 0).unwrap();
+        let offset = crdt.offset_of("test.txt", &anchor).unwrap();
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn crdt_version_vector() {
+        let mut crdt = CrdtBridge::new();
+        crdt.open_buffer("test.txt", Some("hello"));
+        let v1 = crdt.version("test.txt").unwrap();
+        crdt.insert("test.txt", 5, " world", 1).unwrap();
+        let v2 = crdt.version("test.txt").unwrap();
+        // After an insert, the version vector should have observed the new operation
+        assert_ne!(format!("{:?}", v1), format!("{:?}", v2));
+    }
+
+    #[test]
+    fn crdt_undo_insert() {
+        let mut crdt = CrdtBridge::new();
+        crdt.open_buffer("test.txt", Some("hello"));
+        let op = crdt.insert("test.txt", 5, " world", 1).unwrap();
+        assert_eq!(crdt.get_text("test.txt"), Some("hello world".to_string()));
+        let op_id = op.id().clone();
+        crdt.undo("test.txt", op_id, 1).unwrap();
+        assert_eq!(crdt.get_text("test.txt"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn crdt_version_missing_buffer() {
+        let crdt = CrdtBridge::new();
+        assert!(crdt.version("no.txt").is_err());
     }
 }
