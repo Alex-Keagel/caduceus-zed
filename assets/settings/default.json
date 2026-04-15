@@ -2559,7 +2559,13 @@
   // Default: 60
   "context_server_timeout": 60,
   // Configures context servers for use by the agent.
-  "context_servers": {},
+  "context_servers": {
+    "caduceus": {
+      "command": "caduceus-mcp-server",
+      "args": [],
+      "settings": {}
+    }
+  },
   // Configures agent servers available in the agent panel.
   "agent_servers": {},
   "debugger": {

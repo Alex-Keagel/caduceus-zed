@@ -3565,6 +3565,10 @@ impl Panel for AgentPanel {
         AGENT_PANEL_KEY
     }
 
+    fn starts_open(&self, _: &Window, _cx: &App) -> bool {
+        true
+    }
+
     fn position(&self, _window: &Window, cx: &App) -> DockPosition {
         agent_panel_dock_position(cx)
     }
