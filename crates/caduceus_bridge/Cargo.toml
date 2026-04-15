@@ -1,0 +1,27 @@
+[package]
+name = "caduceus_bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+caduceus-core = { workspace = true }
+caduceus-tools = { workspace = true }
+caduceus-orchestrator = { workspace = true }
+caduceus-providers = { workspace = true }
+caduceus-omniscience = { workspace = true }
+caduceus-git = { workspace = true }
+caduceus-telemetry = { workspace = true }
+caduceus-scanner = { workspace = true }
+caduceus-storage = { workspace = true }
+caduceus-permissions = { workspace = true }
+caduceus-crdt = { workspace = true }
+caduceus-mcp = { workspace = true }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

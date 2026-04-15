@@ -223,6 +223,7 @@ members = [
     "crates/worktree_benchmarks",
     "crates/x_ai",
     "crates/zed",
+    "crates/caduceus_bridge",
     "crates/zed_actions",
     "crates/zed_credentials_provider",
     "crates/zed_env_vars",
@@ -256,6 +257,26 @@ publish = false
 edition = "2024"
 
 [workspace.dependencies]
+
+#
+# Caduceus AI Engine crates (external path deps)
+#
+
+caduceus-core = { path = "../caduceus/crates/caduceus-core" }
+caduceus-orchestrator = { path = "../caduceus/crates/caduceus-orchestrator" }
+caduceus-providers = { path = "../caduceus/crates/caduceus-providers" }
+caduceus-tools = { path = "../caduceus/crates/caduceus-tools" }
+caduceus-git = { path = "../caduceus/crates/caduceus-git" }
+caduceus-omniscience = { path = "../caduceus/crates/caduceus-omniscience" }
+caduceus-telemetry = { path = "../caduceus/crates/caduceus-telemetry" }
+caduceus-scanner = { path = "../caduceus/crates/caduceus-scanner" }
+caduceus-storage = { path = "../caduceus/crates/caduceus-storage" }
+caduceus-permissions = { path = "../caduceus/crates/caduceus-permissions" }
+caduceus-crdt = { path = "../caduceus/crates/caduceus-crdt" }
+caduceus-runtime = { path = "../caduceus/crates/caduceus-runtime" }
+caduceus-mcp = { path = "../caduceus/crates/caduceus-mcp" }
+caduceus-marketplace = { path = "../caduceus/crates/caduceus-marketplace" }
+caduceus_bridge = { path = "crates/caduceus_bridge" }
 
 #
 # Workspace member crates
