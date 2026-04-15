@@ -1,46 +1,82 @@
-# Zed
+# 🐍 Caduceus
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+AI-powered code editor built on [Zed](https://github.com/zed-industries/zed) with a 14-crate Rust AI engine.
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+## What is this
 
----
+Caduceus = Zed + a custom AI engine. Zed handles the editor (GPU rendering, Tree-sitter, LSP). Our engine provides 13 agent tools via MCP that any AI model can use.
 
-### Installation
+## Quick Start
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+```bash
+# Install the MCP server
+cargo install --path ../caduceus-mcp-server
 
-Other platforms are not yet available:
+# Build Caduceus (needs Xcode on macOS)
+./build-caduceus.sh
 
-- Web ([tracking issue](https://github.com/zed-industries/zed/issues/5396))
+# Or just use stock Zed with our tools
+brew install zed
+# Tools auto-connect via ~/.config/zed/settings.json
+```
 
-### Developing Zed
+## Architecture
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+```
+┌─────────────────────────────────┐
+│ Caduceus (Zed fork)             │
+│  • GPUI — native GPU rendering  │
+│  • Tree-sitter — syntax         │
+│  • LSP — code intelligence      │
+│  • Agent panel — AI chat        │
+└────────────┬────────────────────┘
+             │ MCP (stdio)
+┌────────────▼────────────────────┐
+│ caduceus-mcp-server (7.3MB)     │
+│  13 tools from 14 Rust crates   │
+│  bash, read/write/edit files,   │
+│  grep, glob, tree, git, web     │
+└─────────────────────────────────┘
+```
 
-### Contributing
+## Tools
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
+| Tool | What it does |
+|------|-------------|
+| `bash` | Execute shell commands |
+| `read_file` | Read file contents |
+| `write_file` | Create/overwrite files |
+| `edit_file` | Surgical string replacement |
+| `grep_search` | ripgrep content search |
+| `glob_search` | Find files by pattern |
+| `list_files` | List directory entries |
+| `tree` | Directory tree view |
+| `git_status` | Git working tree status |
+| `git_diff` | Git diff output |
+| `think` | Agent reasoning step |
+| `web_search` | Search the web |
+| `web_fetch` | Fetch URL content |
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
+## Engine Crates
 
-### Licensing
+The AI engine lives in [caduceus](https://github.com/Alex-Keagel/caduceus) — 14 Rust crates, 1,121 tests:
 
-License information for third party dependencies must be correctly provided for CI to pass.
+`core` · `orchestrator` · `providers` · `tools` · `git` · `omniscience` · `telemetry` · `scanner` · `storage` · `permissions` · `crdt` · `runtime` · `mcp` · `marketplace`
 
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
+## Building
 
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
+Requires: Rust, cmake, Xcode (macOS)
 
-## Sponsorship
+```bash
+git clone https://github.com/Alex-Keagel/caduceus-zed.git
+cd caduceus-zed
+./build-caduceus.sh
+```
 
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
+## License
 
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+GPL-3.0 (inherited from Zed). Engine crates are MIT.
+
+## Credits
+
+Built on [Zed](https://zed.dev) by Zed Industries.
