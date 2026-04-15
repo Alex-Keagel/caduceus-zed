@@ -1438,6 +1438,75 @@ impl Thread {
         self.caduceus_mode = mode;
     }
 
+    /// Caduceus: auto-compact context when approaching token limits.
+    /// Writes a summary of older messages to .caduceus/context/ and removes them
+    /// from the active conversation, keeping only the most recent messages.
+    fn auto_compact_context(&mut self, cx: &mut Context<Self>) {
+        const COMPACT_THRESHOLD: usize = 40; // compact after 40 messages
+        const KEEP_RECENT: usize = 10; // keep last 10 messages
+
+        if self.messages.len() < COMPACT_THRESHOLD {
+            return;
+        }
+
+        let messages_to_compact = self.messages.len() - KEEP_RECENT;
+        log::info!(
+            "[caduceus] Auto-compacting: {} messages → keeping last {}",
+            self.messages.len(),
+            KEEP_RECENT
+        );
+
+        // Build summary of older messages
+        let mut summary = String::from("# Conversation Context (auto-compacted)\n\n");
+        for msg in &self.messages[..messages_to_compact] {
+            match msg {
+                Message::User(u) => {
+                    summary.push_str("**User:** ");
+                    for content in &u.content {
+                        match content {
+                            UserMessageContent::Text(t) => {
+                                let truncated = if t.len() > 200 { &t[..200] } else { t };
+                                summary.push_str(truncated);
+                            }
+                            _ => summary.push_str("[attachment]"),
+                        }
+                    }
+                    summary.push('\n');
+                }
+                Message::Agent(a) => {
+                    summary.push_str("**Assistant:** ");
+                    let text = a.to_markdown();
+                    let truncated = if text.len() > 300 { &text[..300] } else { &text };
+                    summary.push_str(truncated);
+                    summary.push('\n');
+                }
+                Message::Resume => {
+                    summary.push_str("[session resumed]\n");
+                }
+            }
+        }
+
+        // Save context summary to project
+        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
+            let root = worktree.read(cx).abs_path().to_path_buf();
+            let context_dir = root.join(".caduceus").join("context");
+            let _ = std::fs::create_dir_all(&context_dir);
+            let session_id = self.id.0.to_string();
+            let filename = format!("compact-{}.md", &session_id[..8.min(session_id.len())]);
+            let path = context_dir.join(&filename);
+            if std::fs::write(&path, &summary).is_ok() {
+                log::info!("[caduceus] Context saved to {}", path.display());
+            }
+        }
+
+        // Remove older messages, keep recent
+        self.messages.drain(..messages_to_compact);
+        log::info!(
+            "[caduceus] Compacted: {} messages remain",
+            self.messages.len()
+        );
+    }
+
     pub fn set_model(&mut self, model: Arc<dyn LanguageModel>, cx: &mut Context<Self>) {
         let old_usage = self.latest_token_usage();
         self.model = Some(model.clone());
@@ -1881,6 +1950,9 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        // Caduceus: auto-compact context when message count is high
+        self.auto_compact_context(cx);
+
         // Flush the old pending message synchronously before cancelling,
         // to avoid a race where the detached cancel task might flush the NEW
         // turn's pending message instead of the old one.

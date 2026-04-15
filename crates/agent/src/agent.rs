@@ -448,7 +448,7 @@ impl NativeAgent {
         self.projects.insert(
             project_id,
             ProjectState {
-                project,
+                project: project.clone(),
                 project_context,
                 project_context_needs_refresh: project_context_needs_refresh_tx,
                 _maintain_project_context: cx.spawn(async move |this, cx| {
@@ -464,6 +464,65 @@ impl NativeAgent {
                 _subscriptions: subscriptions,
             },
         );
+
+        // Caduceus: auto-index project on open and populate wiki
+        let project_for_index = project.clone();
+        cx.spawn(async move |_this, mut cx| {
+            let project_root = cx.update(|cx| {
+                project_for_index
+                    .read(cx)
+                    .worktrees(cx)
+                    .next()
+                    .map(|wt| wt.read(cx).abs_path().to_path_buf())
+            });
+
+            if let Some(root) = project_root {
+                log::info!("[caduceus] Auto-indexing project: {}", root.display());
+                let engine = caduceus_bridge::engine::CaduceusEngine::new(&root);
+
+                // Index project files in background
+                match engine.index_directory(&root).await {
+                    Ok(chunks) => log::info!("[caduceus] Indexed {} chunks", chunks),
+                    Err(e) => log::warn!("[caduceus] Index failed: {e}"),
+                }
+
+                // Populate wiki with project overview
+                let wiki_root = root.clone();
+                let readme_path = root.join("README.md");
+                let readme = std::fs::read_to_string(&readme_path).unwrap_or_default();
+
+                // Build project structure page
+                let mut structure = String::from("# Project Structure\n\n");
+                if let Ok(entries) = std::fs::read_dir(&root) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with('.') { continue; }
+                        let kind = if entry.path().is_dir() { "📁" } else { "📄" };
+                        structure.push_str(&format!("- {kind} {name}\n"));
+                    }
+                }
+
+                // Write wiki pages
+                let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:project-overview", &structure);
+                if !readme.is_empty() {
+                    let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:readme", &readme);
+                }
+
+                // Git context
+                if let Ok(branch) = engine.git_branch() {
+                    let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:git-branch", &branch);
+                }
+                if let Ok(log) = engine.git_log(10) {
+                    let log_text: String = log.iter()
+                        .map(|c| format!("{} — {}", &c.sha[..7.min(c.sha.len())], c.message))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:recent-commits", &log_text);
+                }
+
+                log::info!("[caduceus] Wiki populated for {}", root.display());
+            }
+        }).detach();
     }
 
     fn session_project_state(&self, session_id: &acp::SessionId) -> Option<&ProjectState> {
@@ -704,6 +763,17 @@ impl NativeAgent {
         match event {
             project::Event::WorktreeAdded(_) | project::Event::WorktreeRemoved(_) => {
                 state.project_context_needs_refresh.send(()).ok();
+                // Caduceus: re-index on worktree changes
+                if let Some(wt) = project.read(_cx).worktrees(_cx).next() {
+                    let root = wt.read(_cx).abs_path().to_path_buf();
+                    _cx.background_executor()
+                        .spawn(async move {
+                            let engine = caduceus_bridge::engine::CaduceusEngine::new(&root);
+                            let _ = engine.index_directory(&root).await;
+                            log::info!("[caduceus] Re-indexed after worktree change");
+                        })
+                        .detach();
+                }
             }
             project::Event::WorktreeUpdatedEntries(_, items) => {
                 if items.iter().any(|(path, _, _)| {
