@@ -2407,6 +2407,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "caduceus-marketplace"
+version = "0.1.0"
+dependencies = [
+ "caduceus-core",
+ "glob",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "walkdir",
+]
+
+[[package]]
 name = "caduceus-mcp"
 version = "0.1.0"
 dependencies = [
@@ -2600,6 +2612,7 @@ dependencies = [
  "caduceus-core",
  "caduceus-crdt",
  "caduceus-git",
+ "caduceus-marketplace",
  "caduceus-mcp",
  "caduceus-omniscience",
  "caduceus-orchestrator",

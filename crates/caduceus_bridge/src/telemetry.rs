@@ -1,6 +1,6 @@
 //! Telemetry bridge — token counting, cost calculation, usage tracking.
 
-use caduceus_telemetry::{CostCalculator, CostLogger, TokenCounter};
+use caduceus_telemetry::{CostCalculator, CostLogger, CostRecord, ModelPricing, TokenCounter};
 use caduceus_core::{ModelId, ProviderId};
 
 /// Re-export the telemetry TokenUsage (different from core::TokenUsage)
@@ -79,6 +79,32 @@ impl TelemetryBridge {
     pub fn reset_session(&mut self) {
         self.counter.reset_session();
     }
+
+    // ── New methods ──────────────────────────────────────────────────────
+
+    /// Add custom model pricing to the calculator.
+    pub fn add_pricing(&mut self, pricing: ModelPricing) {
+        self.calculator.add_pricing(pricing);
+    }
+
+    /// Cost breakdown for a specific model (sum of all records for that model).
+    pub fn cost_for_model(&self, model: &str) -> f64 {
+        self.logger
+            .records_for_model(model)
+            .iter()
+            .map(|r| r.cost_usd)
+            .sum()
+    }
+
+    /// All cost records filtered to a single model.
+    pub fn records_for_model(&self, model: &str) -> Vec<&CostRecord> {
+        self.logger.records_for_model(model)
+    }
+
+    /// Export full telemetry state as JSON.
+    pub fn export_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(self.logger.records()).map_err(|e| e.to_string())
+    }
 }
 
 impl Default for TelemetryBridge {
@@ -149,5 +175,46 @@ mod tests {
         t.record_usage("model-b", &u2);
         let all = t.all_model_usage();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn telemetry_add_pricing() {
+        let mut t = TelemetryBridge::new();
+        t.add_pricing(ModelPricing {
+            provider_id: ProviderId::new("custom"),
+            model_id: ModelId::new("custom-model"),
+            input_per_million: 5.0,
+            output_per_million: 15.0,
+        });
+        let usage = TelemetryTokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            cached_tokens: 0,
+        };
+        let cost = t.calculate_cost("custom", "custom-model", &usage);
+        assert!(cost > 0.0, "Custom pricing should produce cost: {cost}");
+    }
+
+    #[test]
+    fn telemetry_cost_for_model() {
+        let mut t = TelemetryBridge::new();
+        let usage = TelemetryTokenUsage { input_tokens: 1000, output_tokens: 500, cached_tokens: 0 };
+        t.log_cost("anthropic", "claude-sonnet", usage.clone());
+        t.log_cost("anthropic", "claude-sonnet", usage);
+        let cost = t.cost_for_model("claude-sonnet");
+        let records = t.records_for_model("claude-sonnet");
+        assert_eq!(records.len(), 2);
+        assert!(cost >= 0.0);
+    }
+
+    #[test]
+    fn telemetry_export_json() {
+        let mut t = TelemetryBridge::new();
+        let usage = TelemetryTokenUsage { input_tokens: 100, output_tokens: 50, cached_tokens: 0 };
+        t.log_cost("anthropic", "claude-sonnet", usage);
+        let json = t.export_json().unwrap();
+        assert!(json.contains("claude-sonnet"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_array());
     }
 }

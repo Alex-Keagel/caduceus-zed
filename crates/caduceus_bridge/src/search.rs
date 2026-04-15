@@ -22,3 +22,20 @@ pub struct ProjectInfo {
     pub file_count: u32,
     pub root: String,
 }
+
+#[derive(Debug, Clone)]
+pub struct ChunkInfo {
+    pub file_path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub language: String,
+    pub content_length: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SymbolInfo {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+}

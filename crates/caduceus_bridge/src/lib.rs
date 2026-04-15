@@ -22,5 +22,6 @@ pub mod storage;
 pub mod telemetry;
 pub mod crdt;
 pub mod orchestrator;
+pub mod marketplace;
 
 pub use engine::CaduceusEngine;

@@ -16,6 +16,7 @@ caduceus-scanner = { workspace = true }
 caduceus-storage = { workspace = true }
 caduceus-permissions = { workspace = true }
 caduceus-crdt = { workspace = true }
+caduceus-marketplace = { workspace = true }
 caduceus-mcp = { workspace = true }
 
 serde = { version = "1", features = ["derive"] }
