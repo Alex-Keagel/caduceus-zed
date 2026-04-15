@@ -1,7 +1,10 @@
+mod caduceus_code_graph_tool;
 mod caduceus_dependency_scan_tool;
+mod caduceus_error_analysis_tool;
 mod caduceus_git_read_tool;
 mod caduceus_git_write_tool;
 mod caduceus_index_tool;
+mod caduceus_mcp_security_tool;
 mod caduceus_memory_read_tool;
 mod caduceus_memory_write_tool;
 mod caduceus_prd_tool;
@@ -37,10 +40,13 @@ mod web_search_tool;
 use crate::AgentTool;
 use language_model::{LanguageModelRequestTool, LanguageModelToolSchemaFormat};
 
+pub use caduceus_code_graph_tool::*;
 pub use caduceus_dependency_scan_tool::*;
+pub use caduceus_error_analysis_tool::*;
 pub use caduceus_git_read_tool::*;
 pub use caduceus_git_write_tool::*;
 pub use caduceus_index_tool::*;
+pub use caduceus_mcp_security_tool::*;
 pub use caduceus_memory_read_tool::*;
 pub use caduceus_memory_write_tool::*;
 pub use caduceus_prd_tool::*;
@@ -139,10 +145,13 @@ macro_rules! tools {
 }
 
 tools! {
+    CaduceusCodeGraphTool,
     CaduceusDependencyScanTool,
+    CaduceusErrorAnalysisTool,
     CaduceusGitReadTool,
     CaduceusGitWriteTool,
     CaduceusIndexTool,
+    CaduceusMcpSecurityTool,
     CaduceusMemoryReadTool,
     CaduceusMemoryWriteTool,
     CaduceusPrdTool,

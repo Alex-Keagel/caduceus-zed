@@ -1404,6 +1404,58 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
     }
 }
 
+// ── Caduceus agent modes ─────────────────────────────────────────────────────
+
+use std::cell::RefCell;
+
+/// Caduceus agent modes backed by caduceus-orchestrator.
+/// Defines 7 modes: Plan, Act, Research, Autopilot, Architect, Debug, Review.
+struct CaduceusSessionModes {
+    current: RefCell<acp::SessionModeId>,
+}
+
+impl CaduceusSessionModes {
+    fn new() -> Self {
+        Self {
+            current: RefCell::new(acp::SessionModeId::new("act")),
+        }
+    }
+
+    fn all_caduceus_modes() -> Vec<acp::SessionMode> {
+        vec![
+            acp::SessionMode::new("plan", "Plan")
+                .description("Read-only analysis and strategy. No code changes."),
+            acp::SessionMode::new("act", "Act")
+                .description("Execute code changes with approval."),
+            acp::SessionMode::new("research", "Research")
+                .description("Read-only exploration. Summarize findings."),
+            acp::SessionMode::new("autopilot", "Autopilot")
+                .description("Fully autonomous — plan, act, test, commit."),
+            acp::SessionMode::new("architect", "Architect")
+                .description("High-level design — architecture and modules."),
+            acp::SessionMode::new("debug", "Debug")
+                .description("Investigate errors, trace bugs, propose fixes."),
+            acp::SessionMode::new("review", "Review")
+                .description("Code review — find issues, suggest improvements."),
+        ]
+    }
+}
+
+impl acp_thread::AgentSessionModes for CaduceusSessionModes {
+    fn current_mode(&self) -> acp::SessionModeId {
+        self.current.borrow().clone()
+    }
+
+    fn all_modes(&self) -> Vec<acp::SessionMode> {
+        Self::all_caduceus_modes()
+    }
+
+    fn set_mode(&self, mode: acp::SessionModeId, _cx: &mut App) -> Task<Result<()>> {
+        *self.current.borrow_mut() = mode;
+        Task::ready(Ok(()))
+    }
+}
+
 pub static ZED_AGENT_ID: LazyLock<AgentId> = LazyLock::new(|| AgentId::new("Caduceus Agent"));
 
 impl acp_thread::AgentConnection for NativeAgentConnection {
@@ -1487,6 +1539,14 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         }) as Rc<dyn AgentModelSelector>)
     }
 
+    fn session_modes(
+        &self,
+        _session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionModes>> {
+        Some(Rc::new(CaduceusSessionModes::new()))
+    }
+
     fn prompt(
         &self,
         id: acp_thread::UserMessageId,
@@ -1543,7 +1603,12 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
         let path_style = project_state.project.read(cx).path_style(cx);
 
-        self.run_turn(session_id, cx, move |thread, cx| {
+        // Capture current Caduceus mode before entering the closure
+        let current_mode = self
+            .session_modes(&session_id, cx)
+            .map(|modes| modes.current_mode().0.to_string());
+
+        self.run_turn(session_id.clone(), cx, move |thread, cx| {
             let content: Vec<UserMessageContent> = params
                 .prompt
                 .into_iter()
@@ -1553,7 +1618,10 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
             log::debug!("Message id: {:?}", id);
             log::debug!("Message content: {:?}", content);
 
-            thread.update(cx, |thread, cx| thread.send(id, content, cx))
+            thread.update(cx, |thread, cx| {
+                thread.set_caduceus_mode(current_mode);
+                thread.send(id, content, cx)
+            })
         })
     }
 

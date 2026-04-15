@@ -1,6 +1,7 @@
 use crate::{
-    CaduceusDependencyScanTool, CaduceusGitReadTool, CaduceusGitWriteTool,
-    CaduceusIndexTool, CaduceusMemoryReadTool, CaduceusMemoryWriteTool,
+    CaduceusCodeGraphTool, CaduceusDependencyScanTool, CaduceusErrorAnalysisTool,
+    CaduceusGitReadTool, CaduceusGitWriteTool, CaduceusIndexTool,
+    CaduceusMcpSecurityTool, CaduceusMemoryReadTool, CaduceusMemoryWriteTool,
     CaduceusPrdTool, CaduceusScaffoldTool, CaduceusSecurityScanTool,
     CaduceusSemanticSearchTool, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, DbLanguageModel, DbThread, DeletePathTool,
@@ -983,6 +984,8 @@ pub struct Thread {
     ui_scroll_position: Option<gpui::ListOffset>,
     /// Weak references to running subagent threads for cancellation propagation
     running_subagents: Vec<WeakEntity<Thread>>,
+    /// Current Caduceus agent mode (Plan, Act, Research, etc.)
+    caduceus_mode: Option<String>,
 }
 
 impl Thread {
@@ -1103,6 +1106,7 @@ impl Thread {
             draft_prompt: None,
             ui_scroll_position: None,
             running_subagents: Vec::new(),
+            caduceus_mode: None,
         }
     }
 
@@ -1335,6 +1339,7 @@ impl Thread {
                 offset_in_item: gpui::px(sp.offset_in_item),
             }),
             running_subagents: Vec::new(),
+            caduceus_mode: None,
         }
     }
 
@@ -1424,6 +1429,10 @@ impl Thread {
 
     pub fn model(&self) -> Option<&Arc<dyn LanguageModel>> {
         self.model.as_ref()
+    }
+
+    pub fn set_caduceus_mode(&mut self, mode: Option<String>) {
+        self.caduceus_mode = mode;
     }
 
     pub fn set_model(&mut self, model: Arc<dyn LanguageModel>, cx: &mut Context<Self>) {
@@ -1582,6 +1591,9 @@ impl Thread {
             self.add_tool(CaduceusSemanticSearchTool::new(engine.clone()));
             self.add_tool(CaduceusIndexTool::new(engine.clone()));
             self.add_tool(CaduceusSecurityScanTool::new(engine.clone()));
+            self.add_tool(CaduceusCodeGraphTool::new(engine.clone()));
+            self.add_tool(CaduceusErrorAnalysisTool::new(engine.clone()));
+            self.add_tool(CaduceusMcpSecurityTool::new(engine.clone()));
             self.add_tool(CaduceusGitReadTool::new(engine.clone()));
             self.add_tool(CaduceusGitWriteTool::new(engine));
             self.add_tool(CaduceusMemoryReadTool::new(project_root.clone()));
@@ -3008,6 +3020,23 @@ impl Thread {
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
+
+        // Inject Caduceus mode prefix into system prompt
+        let system_prompt = if let Some(mode) = &self.caduceus_mode {
+            let mode_prefix = match mode.as_str() {
+                "plan" => "You are in PLAN mode. Analyze only — do NOT modify any files, do NOT execute any write operations. Produce a numbered action plan. For any tool call, respond with what you WOULD do instead of executing it. Output a structured markdown plan with numbered steps.\n\n",
+                "act" => "You are in ACT mode. Execute code changes as requested. Each write operation requires user approval before proceeding.\n\n",
+                "research" => "You are in RESEARCH mode. Read-only exploration. Search the codebase, read files, and summarize your findings. Do NOT modify any files.\n\n",
+                "autopilot" => "You are in AUTOPILOT mode. Fully autonomous execution. Plan, implement, test, and commit changes without waiting for approval. Be thorough and verify your changes work before committing.\n\n",
+                "architect" => "You are in ARCHITECT mode. Focus on high-level design. Discuss architecture, dependencies, module boundaries, and system design. You may read files for context but do NOT make code changes.\n\n",
+                "debug" => "You are in DEBUG mode. Investigate errors and trace bugs. Read files, check logs, run diagnostic commands, and propose fixes. Output a step-by-step trace of your investigation.\n\n",
+                "review" => "You are in REVIEW mode. Perform a code review. Read code, identify issues, suggest improvements. Do NOT modify any files. Output a structured findings list.\n\n",
+                _ => "",
+            };
+            format!("{mode_prefix}{system_prompt}")
+        } else {
+            system_prompt
+        };
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
             content: vec![system_prompt.into()],
