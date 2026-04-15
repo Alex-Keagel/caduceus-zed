@@ -63,6 +63,7 @@ path = "src/visual_test_runner.rs"
 required-features = ["visual-tests"]
 
 [dependencies]
+codestral.workspace = true
 acp_tools.workspace = true
 activity_indicator.workspace = true
 agent.workspace = true
@@ -82,7 +83,6 @@ channel.workspace = true
 clap.workspace = true
 cli.workspace = true
 client.workspace = true
-codestral.workspace = true
 collab_ui.workspace = true
 collections.workspace = true
 command_palette.workspace = true

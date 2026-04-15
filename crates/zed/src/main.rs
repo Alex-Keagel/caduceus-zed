@@ -612,9 +612,10 @@ fn main() {
         });
         AppState::set_global(app_state.clone(), cx);
 
-        auto_update::init(client.clone(), cx);
+        // Caduceus: disabled auto-update (no zed.dev update server)
+        // auto_update::init(client.clone(), cx);
         dap_adapters::init(cx);
-        auto_update_ui::init(cx);
+        // auto_update_ui::init(cx);
         reliability::init(client.clone(), cx);
         extension_host::init(
             extension_host_proxy.clone(),
@@ -655,7 +656,8 @@ fn main() {
         );
         language_models::init(app_state.user_store.clone(), app_state.client.clone(), cx);
         acp_tools::init(cx);
-        zed::telemetry_log::init(cx);
+        // Caduceus: disabled telemetry (no zed.dev telemetry)
+        // zed::telemetry_log::init(cx);
         zed::remote_debug::init(cx);
         edit_prediction_ui::init(cx);
         web_search::init(cx);
@@ -701,7 +703,8 @@ fn main() {
         outline_panel::init(cx);
         tasks_ui::init(cx);
         snippets_ui::init(cx);
-        channel::init(&app_state.client.clone(), app_state.user_store.clone(), cx);
+        // Caduceus: disabled collab, calls, notifications (no zed.dev collaboration)
+        // channel::init(&app_state.client.clone(), app_state.user_store.clone(), cx);
         search::init(cx);
         cx.set_global(workspace::PaneSearchBarCallbacks {
             setup_search_bar: |languages, toolbar, window, cx| {
@@ -722,9 +725,9 @@ fn main() {
         theme_selector::init(cx);
         settings_profile_selector::init(cx);
         language_tools::init(cx);
-        call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
-        notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
-        collab_ui::init(&app_state, cx);
+        // call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+        // notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+        // collab_ui::init(&app_state, cx);
         git_ui::init(cx);
         git_graph::init(cx);
         feedback::init(cx);

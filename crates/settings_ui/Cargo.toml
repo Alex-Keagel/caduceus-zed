@@ -16,12 +16,12 @@ default = []
 test-support = []
 
 [dependencies]
+codestral.workspace = true
 agent.workspace = true
 agent_settings.workspace = true
 anyhow.workspace = true
 audio.workspace = true
 component.workspace = true
-codestral.workspace = true
 copilot.workspace = true
 copilot_ui.workspace = true
 cpal.workspace = true
