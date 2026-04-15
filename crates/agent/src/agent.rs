@@ -489,6 +489,10 @@ impl NativeAgent {
 
             if let Some(root) = project_root {
                 log::info!("[caduceus] Auto-indexing project: {}", root.display());
+                let ignore_patterns = load_caduceuignore(&root);
+                if !ignore_patterns.is_empty() {
+                    log::info!("[caduceus] Loaded {} .caduceuignore patterns", ignore_patterns.len());
+                }
                 let engine = caduceus_bridge::engine::CaduceusEngine::new(&root);
 
                 // Index project files in background
@@ -508,6 +512,7 @@ impl NativeAgent {
                     for entry in entries.flatten() {
                         let name = entry.file_name().to_string_lossy().to_string();
                         if name.starts_with('.') { continue; }
+                        if !should_index_path(&entry.path(), &ignore_patterns) { continue; }
                         let kind = if entry.path().is_dir() { "📁" } else { "📄" };
                         structure.push_str(&format!("- {kind} {name}\n"));
                     }
@@ -3240,6 +3245,35 @@ mod internal_tests {
             LanguageModelRegistry::test(cx);
         });
     }
+}
+
+fn should_index_path(path: &std::path::Path, ignore_patterns: &[String]) -> bool {
+    let path_str = path.to_string_lossy();
+    for pattern in ignore_patterns {
+        if pattern.starts_with('!') {
+            continue;
+        }
+        if path_str.contains(pattern.trim_start_matches('/')) {
+            return false;
+        }
+        if pattern.starts_with("*.") {
+            let ext = &pattern[1..];
+            if path_str.ends_with(ext) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn load_caduceuignore(project_root: &std::path::Path) -> Vec<String> {
+    let ignore_path = project_root.join(".caduceuignore");
+    std::fs::read_to_string(&ignore_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn mcp_message_content_to_acp_content_block(

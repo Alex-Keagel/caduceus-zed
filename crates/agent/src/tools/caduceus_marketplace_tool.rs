@@ -42,6 +42,20 @@ pub enum MarketplaceOperation {
     },
     /// List all evolved skills.
     ListEvolved,
+    /// Ingest session data for pattern evolution.
+    IngestSession {
+        /// Session identifier to track.
+        session_id: String,
+        /// Patterns observed in this session.
+        patterns: Vec<String>,
+    },
+    /// Show top emerging patterns from aggregated sessions.
+    TopPatterns {
+        /// Maximum number of patterns to return.
+        count: usize,
+    },
+    /// Trigger skill evolution from accumulated patterns.
+    Evolve,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,6 +112,9 @@ impl AgentTool for CaduceusMarketplaceTool {
                 MarketplaceOperation::GenerateSkill { .. } => "generate skill",
                 MarketplaceOperation::SuggestName { .. } => "suggest name",
                 MarketplaceOperation::ListEvolved => "list evolved",
+                MarketplaceOperation::IngestSession { .. } => "ingest session",
+                MarketplaceOperation::TopPatterns { .. } => "top patterns",
+                MarketplaceOperation::Evolve => "evolve",
             };
             format!("Marketplace {op}").into()
         } else {
@@ -119,7 +136,7 @@ impl AgentTool for CaduceusMarketplaceTool {
                 }
             })?;
 
-            let guard = bridge.lock().map_err(|e| {
+            let mut guard = bridge.lock().map_err(|e| {
                 CaduceusMarketplaceToolOutput::Error {
                     error: format!("Lock poisoned: {e}"),
                 }
@@ -183,6 +200,54 @@ impl AgentTool for CaduceusMarketplaceTool {
                             })
                             .collect::<Vec<_>>()
                             .join("\n")
+                    }
+                }
+                MarketplaceOperation::IngestSession {
+                    session_id,
+                    patterns,
+                } => {
+                    let pattern_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
+                    guard.ingest_session(&session_id, &pattern_refs.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                    format!("✅ Ingested {} patterns from session {session_id}", patterns.len())
+                }
+                MarketplaceOperation::TopPatterns { count } => {
+                    let patterns = guard.top_patterns(count);
+                    if patterns.is_empty() {
+                        "No patterns aggregated yet.".to_string()
+                    } else {
+                        patterns
+                            .iter()
+                            .map(|p| format!("- {} (count: {})", p.pattern, p.occurrences))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                }
+                MarketplaceOperation::Evolve => {
+                    let aggregated = guard.aggregate();
+                    let session_count = aggregated.len();
+                    if !guard.should_evolve(session_count) {
+                        "Not enough data to trigger evolution yet.".to_string()
+                    } else {
+                        let summaries: Vec<caduceus_marketplace::SessionSummary> = aggregated
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| caduceus_marketplace::SessionSummary {
+                                session_id: format!("agg-{i}"),
+                                patterns: vec![p.pattern.clone()],
+                                tools_used: vec![],
+                                success: true,
+                            })
+                            .collect();
+                        let evolved = guard.evolve_from_summaries(&summaries);
+                        if evolved.is_empty() {
+                            "Evolution produced no new skills.".to_string()
+                        } else {
+                            let names: Vec<_> = evolved.iter().map(|s| s.name.clone()).collect();
+                            for skill in evolved {
+                                guard.register_evolved(skill);
+                            }
+                            format!("🧬 Evolved {} skills: {}", names.len(), names.join(", "))
+                        }
                     }
                 }
             };

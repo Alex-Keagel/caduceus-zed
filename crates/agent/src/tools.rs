@@ -1,4 +1,5 @@
 mod caduceus_automations_tool;
+mod caduceus_background_agent_tool;
 mod caduceus_checkpoint_tool;
 mod caduceus_code_graph_tool;
 mod caduceus_conversation_tool;
@@ -13,6 +14,7 @@ mod caduceus_marketplace_tool;
 mod caduceus_mcp_security_tool;
 mod caduceus_memory_read_tool;
 mod caduceus_memory_write_tool;
+mod caduceus_policy_tool;
 mod caduceus_prd_tool;
 mod caduceus_progress_tool;
 mod caduceus_scaffold_tool;
@@ -53,6 +55,7 @@ use crate::AgentTool;
 use language_model::{LanguageModelRequestTool, LanguageModelToolSchemaFormat};
 
 pub use caduceus_automations_tool::*;
+pub use caduceus_background_agent_tool::*;
 pub use caduceus_checkpoint_tool::*;
 pub use caduceus_code_graph_tool::*;
 pub use caduceus_conversation_tool::*;
@@ -67,6 +70,7 @@ pub use caduceus_marketplace_tool::*;
 pub use caduceus_mcp_security_tool::*;
 pub use caduceus_memory_read_tool::*;
 pub use caduceus_memory_write_tool::*;
+pub use caduceus_policy_tool::*;
 pub use caduceus_prd_tool::*;
 pub use caduceus_progress_tool::*;
 pub use caduceus_scaffold_tool::*;
@@ -170,6 +174,7 @@ macro_rules! tools {
 
 tools! {
     CaduceusAutomationsTool,
+    CaduceusBackgroundAgentTool,
     CaduceusCheckpointTool,
     CaduceusCodeGraphTool,
     CaduceusConversationTool,
@@ -184,6 +189,7 @@ tools! {
     CaduceusMcpSecurityTool,
     CaduceusMemoryReadTool,
     CaduceusMemoryWriteTool,
+    CaduceusPolicyTool,
     CaduceusPrdTool,
     CaduceusProgressTool,
     CaduceusScaffoldTool,

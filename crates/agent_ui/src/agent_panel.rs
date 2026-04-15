@@ -4259,6 +4259,9 @@ impl AgentPanel {
         let show_history_menu = self.has_history_for_selected_agent(cx);
         let agent_v2_enabled = agent_v2_enabled(cx);
         let automation_count = self.automations_count(cx);
+        let background_agent_count = self.background_agents_count(cx);
+        let evolved_skill_count = self.evolved_skills_count(cx);
+        let security_score = self.security_compliance_score(cx);
         let is_empty_state = !self.active_thread_has_messages(cx);
 
         let is_in_history_or_config = self.is_history_or_configuration_visible();
@@ -4377,6 +4380,25 @@ impl AgentPanel {
                                     .color(Color::Muted),
                             )
                         })
+                        .when(background_agent_count > 0, |this| {
+                            this.child(
+                                Label::new(format!("🤖 {background_agent_count}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .when(evolved_skill_count > 0, |this| {
+                            this.child(
+                                Label::new(format!("🧬 {evolved_skill_count}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .child(
+                            Label::new(format!("🛡️ {:.0}%", security_score * 100.0))
+                                .size(LabelSize::Small)
+                                .color(if security_score >= 0.8 { Color::Success } else if security_score >= 0.5 { Color::Warning } else { Color::Error }),
+                        )
                         .when(self.active_thread_has_messages(cx), |this| {
                             this.child(
                                 IconButton::new("caduceus-kill-switch", IconName::XCircle)
@@ -4453,6 +4475,25 @@ impl AgentPanel {
                                     .color(Color::Muted),
                             )
                         })
+                        .when(background_agent_count > 0, |this| {
+                            this.child(
+                                Label::new(format!("🤖 {background_agent_count}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .when(evolved_skill_count > 0, |this| {
+                            this.child(
+                                Label::new(format!("🧬 {evolved_skill_count}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .child(
+                            Label::new(format!("🛡️ {:.0}%", security_score * 100.0))
+                                .size(LabelSize::Small)
+                                .color(if security_score >= 0.8 { Color::Success } else if security_score >= 0.5 { Color::Warning } else { Color::Error }),
+                        )
                         .when(self.active_thread_has_messages(cx), |this| {
                             this.child(
                                 IconButton::new("caduceus-kill-switch", IconName::XCircle)
@@ -4500,6 +4541,50 @@ impl AgentPanel {
             }
         }
         0
+    }
+
+    fn background_agents_count(&self, cx: &Context<Self>) -> usize {
+        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
+            let root = worktree.read(cx).abs_path();
+            let dir = root.join(".caduceus/agents");
+            if dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    return entries
+                        .flatten()
+                        .filter(|e| {
+                            e.path()
+                                .extension()
+                                .map_or(false, |ext| ext == "json")
+                        })
+                        .count();
+                }
+            }
+        }
+        0
+    }
+
+    fn evolved_skills_count(&self, cx: &Context<Self>) -> usize {
+        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
+            let root = worktree.read(cx).abs_path();
+            let path = root.join(".caduceus/evolved_skills.json");
+            if path.exists() {
+                if let Ok(json) = std::fs::read_to_string(&path) {
+                    if let Ok(skills) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+                        return skills.len();
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    fn security_compliance_score(&self, cx: &Context<Self>) -> f64 {
+        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
+            let root = worktree.read(cx).abs_path();
+            let bridge = caduceus_bridge::security::PermissionsBridge::new(root.as_ref());
+            return bridge.compliance_score();
+        }
+        0.0
     }
 
     fn render_worktree_creation_status(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
