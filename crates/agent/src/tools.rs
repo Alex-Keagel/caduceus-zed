@@ -1,3 +1,13 @@
+mod caduceus_dependency_scan_tool;
+mod caduceus_git_read_tool;
+mod caduceus_git_write_tool;
+mod caduceus_index_tool;
+mod caduceus_memory_read_tool;
+mod caduceus_memory_write_tool;
+mod caduceus_prd_tool;
+mod caduceus_scaffold_tool;
+mod caduceus_security_scan_tool;
+mod caduceus_semantic_search_tool;
 mod context_server_registry;
 mod copy_path_tool;
 mod create_directory_tool;
@@ -27,6 +37,16 @@ mod web_search_tool;
 use crate::AgentTool;
 use language_model::{LanguageModelRequestTool, LanguageModelToolSchemaFormat};
 
+pub use caduceus_dependency_scan_tool::*;
+pub use caduceus_git_read_tool::*;
+pub use caduceus_git_write_tool::*;
+pub use caduceus_index_tool::*;
+pub use caduceus_memory_read_tool::*;
+pub use caduceus_memory_write_tool::*;
+pub use caduceus_prd_tool::*;
+pub use caduceus_scaffold_tool::*;
+pub use caduceus_security_scan_tool::*;
+pub use caduceus_semantic_search_tool::*;
 pub use context_server_registry::*;
 pub use copy_path_tool::*;
 pub use create_directory_tool::*;
@@ -119,6 +139,16 @@ macro_rules! tools {
 }
 
 tools! {
+    CaduceusDependencyScanTool,
+    CaduceusGitReadTool,
+    CaduceusGitWriteTool,
+    CaduceusIndexTool,
+    CaduceusMemoryReadTool,
+    CaduceusMemoryWriteTool,
+    CaduceusPrdTool,
+    CaduceusScaffoldTool,
+    CaduceusSecurityScanTool,
+    CaduceusSemanticSearchTool,
     CopyPathTool,
     CreateDirectoryTool,
     DeletePathTool,

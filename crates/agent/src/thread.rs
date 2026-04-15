@@ -1,6 +1,10 @@
 use crate::{
-    ContextServerRegistry, CopyPathTool, CreateDirectoryTool, DbLanguageModel, DbThread,
-    DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, GrepTool,
+    CaduceusDependencyScanTool, CaduceusGitReadTool, CaduceusGitWriteTool,
+    CaduceusIndexTool, CaduceusMemoryReadTool, CaduceusMemoryWriteTool,
+    CaduceusPrdTool, CaduceusScaffoldTool, CaduceusSecurityScanTool,
+    CaduceusSemanticSearchTool, ContextServerRegistry, CopyPathTool,
+    CreateDirectoryTool, DbLanguageModel, DbThread, DeletePathTool,
+    DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, GrepTool,
     ListDirectoryTool, MovePathTool, NowTool, OpenTool, ProjectSnapshot, ReadFileTool,
     RestoreFileFromDiskTool, SaveFileTool, SpawnAgentTool, StreamingEditFileTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision,
@@ -1569,6 +1573,23 @@ impl Thread {
         self.add_tool(RestoreFileFromDiskTool::new(self.project.clone()));
         self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
         self.add_tool(WebSearchTool);
+
+        // Caduceus engine tools — derive project root from first worktree
+        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
+            let project_root = worktree.read(cx).abs_path().to_path_buf();
+            let engine = Arc::new(caduceus_bridge::engine::CaduceusEngine::new(&project_root));
+
+            self.add_tool(CaduceusSemanticSearchTool::new(engine.clone()));
+            self.add_tool(CaduceusIndexTool::new(engine.clone()));
+            self.add_tool(CaduceusSecurityScanTool::new(engine.clone()));
+            self.add_tool(CaduceusGitReadTool::new(engine.clone()));
+            self.add_tool(CaduceusGitWriteTool::new(engine));
+            self.add_tool(CaduceusMemoryReadTool::new(project_root.clone()));
+            self.add_tool(CaduceusMemoryWriteTool::new(project_root));
+        }
+        self.add_tool(CaduceusDependencyScanTool::new());
+        self.add_tool(CaduceusScaffoldTool::new());
+        self.add_tool(CaduceusPrdTool::new());
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
             self.add_tool(SpawnAgentTool::new(environment));

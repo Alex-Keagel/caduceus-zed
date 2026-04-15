@@ -149,6 +149,7 @@ dependencies = [
  "agent_servers",
  "agent_settings",
  "anyhow",
+ "caduceus_bridge",
  "chrono",
  "client",
  "clock",
