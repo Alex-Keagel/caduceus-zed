@@ -7,8 +7,8 @@ use caduceus_orchestrator::{
     PrdParser, PrdTask, TaskRecommender, TaskRecommendation,
     ProgressInferrer, InferredProgress,
     AgentScaffolder, SkillScaffolder,
-    ExecutionTreeViz, VizTreeNode,
-    TimeTracker, TimeEntry,
+    ExecutionTreeViz,
+    TimeTracker,
     TaskTree, HierarchicalTask,
 };
 use caduceus_core::{ModelId, ProviderId, SessionState};
@@ -296,6 +296,7 @@ impl OrchestratorBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caduceus_orchestrator::VizTreeNode;
 
     #[test]
     fn orchestrator_new_history() {

@@ -23,6 +23,7 @@ pub mod telemetry;
 pub mod crdt;
 pub mod orchestrator;
 pub mod marketplace;
+pub mod providers;
 pub mod runtime;
 
 pub use engine::CaduceusEngine;
