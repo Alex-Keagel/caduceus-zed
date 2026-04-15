@@ -253,6 +253,16 @@ fn restore_checkpoint(
     checkpoint_id: &str,
 ) -> Result<String, String> {
     let checkpoint_dir = checkpoints_dir(project_root).join(checkpoint_id);
+
+    // Prevent path traversal
+    let base = checkpoints_dir(project_root);
+    let _ = std::fs::create_dir_all(&base);
+    let resolved = checkpoint_dir.canonicalize().unwrap_or(checkpoint_dir.clone());
+    let base_resolved = base.canonicalize().unwrap_or(base.clone());
+    if !resolved.starts_with(&base_resolved) {
+        return Err("Invalid checkpoint id: path traversal detected".to_string());
+    }
+
     let manifest_path = checkpoint_dir.join("manifest.json");
     if !manifest_path.exists() {
         return Err(format!("Checkpoint '{checkpoint_id}' not found."));
@@ -263,8 +273,26 @@ fn restore_checkpoint(
     let manifest: CheckpointManifest = serde_json::from_str(&data)
         .map_err(|e| format!("Failed to parse manifest: {e}"))?;
 
+    let project_canonical = project_root.canonicalize().unwrap_or(project_root.to_path_buf());
+
     let mut restored = Vec::new();
     for file in &manifest.files {
+        // Prevent restoring files outside project root
+        let dest_normalized = {
+            let mut p = project_root.to_path_buf();
+            for component in std::path::Path::new(file).components() {
+                match component {
+                    std::path::Component::ParentDir => { p.pop(); }
+                    std::path::Component::Normal(c) => p.push(c),
+                    _ => {}
+                }
+            }
+            p
+        };
+        if !dest_normalized.starts_with(&project_canonical) {
+            return Err(format!("Refusing to restore '{}': path escapes project root", file));
+        }
+
         let src = checkpoint_dir.join(file);
         let dest = project_root.join(file);
         if src.exists() {
@@ -290,6 +318,16 @@ fn diff_checkpoint(
     checkpoint_id: &str,
 ) -> Result<String, String> {
     let checkpoint_dir = checkpoints_dir(project_root).join(checkpoint_id);
+
+    // Prevent path traversal
+    let base = checkpoints_dir(project_root);
+    let _ = std::fs::create_dir_all(&base);
+    let resolved = checkpoint_dir.canonicalize().unwrap_or(checkpoint_dir.clone());
+    let base_resolved = base.canonicalize().unwrap_or(base.clone());
+    if !resolved.starts_with(&base_resolved) {
+        return Err("Invalid checkpoint id: path traversal detected".to_string());
+    }
+
     let manifest_path = checkpoint_dir.join("manifest.json");
     if !manifest_path.exists() {
         return Err(format!("Checkpoint '{checkpoint_id}' not found."));

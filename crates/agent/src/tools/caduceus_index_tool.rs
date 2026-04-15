@@ -93,6 +93,21 @@ impl AgentTool for CaduceusIndexTool {
             })?;
 
             let path = PathBuf::from(&input.path);
+
+            // Validate path is within project root (prevent indexing arbitrary filesystem paths)
+            let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+            let canonical_root = engine.project_root.canonicalize()
+                .unwrap_or_else(|_| engine.project_root.clone());
+            if !canonical_path.starts_with(&canonical_root) {
+                return Err(CaduceusIndexToolOutput::Error {
+                    error: format!(
+                        "Path '{}' is outside the project root '{}'",
+                        path.display(),
+                        engine.project_root.display()
+                    ),
+                });
+            }
+
             let result = if path.is_file() {
                 engine.reindex_file(&path).await
             } else {

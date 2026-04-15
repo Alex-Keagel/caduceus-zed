@@ -95,7 +95,7 @@ impl AgentTool for CaduceusSemanticSearchTool {
         _cx: &mut App,
     ) -> SharedString {
         if let Ok(input) = input {
-            format!("Semantic search: \"{}\"", &input.query[..input.query.len().min(50)]).into()
+            format!("Semantic search: \"{}\"", crate::tools::truncate_str(&input.query, 50)).into()
         } else {
             "Semantic search".into()
         }

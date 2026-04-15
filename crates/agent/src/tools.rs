@@ -54,6 +54,14 @@ mod web_search_tool;
 use crate::AgentTool;
 use language_model::{LanguageModelRequestTool, LanguageModelToolSchemaFormat};
 
+/// Truncate a string to at most `max_chars` characters on a char boundary.
+pub(crate) fn truncate_str(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 pub use caduceus_automations_tool::*;
 pub use caduceus_background_agent_tool::*;
 pub use caduceus_checkpoint_tool::*;

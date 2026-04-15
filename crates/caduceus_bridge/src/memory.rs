@@ -3,6 +3,9 @@
 use std::path::Path;
 
 pub fn store(project_root: &Path, key: &str, value: &str) -> Result<(), String> {
+    if key.contains('\n') || key.contains('\r') || key.is_empty() {
+        return Err("Invalid memory key: must not contain newlines or be empty".to_string());
+    }
     let dir = project_root.join(".caduceus");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join("memory.md");

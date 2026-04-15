@@ -154,7 +154,7 @@ impl AgentTool for CaduceusGitReadTool {
                 GitReadOperation::Log => engine.git_log(input.count).map(|commits| {
                     commits
                         .iter()
-                        .map(|c| format!("{} {} — {}", &c.sha[..7.min(c.sha.len())], c.message, c.author))
+                        .map(|c| format!("{} {} — {}", crate::tools::truncate_str(&c.sha, 7), c.message, c.author))
                         .collect::<Vec<_>>()
                         .join("\n")
                 }),

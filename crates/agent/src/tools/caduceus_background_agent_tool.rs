@@ -127,6 +127,13 @@ impl AgentConfigStore {
     }
 }
 
+fn validate_agent_id(id: &str) -> Result<(), String> {
+    if id.contains('/') || id.contains('\\') || id.contains("..") || id.is_empty() {
+        return Err(format!("Invalid agent id: '{id}' — must not contain path separators"));
+    }
+    Ok(())
+}
+
 pub struct CaduceusBackgroundAgentTool {
     project_root: PathBuf,
 }
@@ -212,7 +219,7 @@ impl AgentTool for CaduceusBackgroundAgentTool {
                             out.push_str(&format!(
                                 "  [{}] {} — {} (mode: {}, auto-commit: {})\n",
                                 a.status,
-                                &a.id[..8.min(a.id.len())],
+                                crate::tools::truncate_str(&a.id, 8),
                                 a.task,
                                 a.mode,
                                 a.auto_commit,
@@ -221,8 +228,11 @@ impl AgentTool for CaduceusBackgroundAgentTool {
                         out
                     }
                 }
-                BackgroundAgentOperation::Status { agent_id } => {
-                    let config = store.load(&agent_id).map_err(|e| {
+                BackgroundAgentOperation::Status { ref agent_id } => {
+                    validate_agent_id(agent_id).map_err(|e| {
+                        CaduceusBackgroundAgentToolOutput::Error { error: e }
+                    })?;
+                    let config = store.load(agent_id).map_err(|e| {
                         CaduceusBackgroundAgentToolOutput::Error { error: e }
                     })?;
                     format!(
@@ -235,8 +245,11 @@ impl AgentTool for CaduceusBackgroundAgentTool {
                         config.completed_at.as_deref().unwrap_or("—"),
                     )
                 }
-                BackgroundAgentOperation::Stop { agent_id } => {
-                    let mut config = store.load(&agent_id).map_err(|e| {
+                BackgroundAgentOperation::Stop { ref agent_id } => {
+                    validate_agent_id(agent_id).map_err(|e| {
+                        CaduceusBackgroundAgentToolOutput::Error { error: e }
+                    })?;
+                    let mut config = store.load(agent_id).map_err(|e| {
                         CaduceusBackgroundAgentToolOutput::Error { error: e }
                     })?;
                     config.status = "stopped".to_string();

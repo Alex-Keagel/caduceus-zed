@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 
 use caduceus_bridge::security::PermissionsBridge;
-use caduceus_permissions::Capability;
 
-/// Policy engine: check permissions, manage capabilities, audit, and generate compliance reports.
+/// Policy engine: check permissions, audit, and generate compliance reports.
+/// Grant/Revoke operations are intentionally excluded to prevent LLM self-escalation.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CaduceusPolicyToolInput {
     /// The policy operation to perform.
@@ -26,16 +26,6 @@ pub enum PolicyOperation {
     Check {
         /// The tool name to check (e.g. "bash", "read", "write").
         tool_name: String,
-    },
-    /// Grant a capability to the permission enforcer.
-    Grant {
-        /// Capability: "read_file", "write_file", "execute", "network", "git_mutate", "fs_escape"
-        capability: String,
-    },
-    /// Revoke a capability from the permission enforcer.
-    Revoke {
-        /// Capability to revoke (same values as grant).
-        capability: String,
     },
     /// Generate a full OWASP security/compliance report.
     Report,
@@ -61,20 +51,6 @@ impl From<CaduceusPolicyToolOutput> for LanguageModelToolResultContent {
                 format!("Policy error: {error}").into()
             }
         }
-    }
-}
-
-fn parse_capability(s: &str) -> Result<Capability, String> {
-    match s {
-        "read_file" | "fs_read" => Ok(Capability::FsRead),
-        "write_file" | "fs_write" => Ok(Capability::FsWrite),
-        "execute" | "process_exec" => Ok(Capability::ProcessExec),
-        "network" | "network_http" => Ok(Capability::NetworkHttp),
-        "git_mutate" => Ok(Capability::GitMutate),
-        "fs_escape" => Ok(Capability::FsEscape),
-        other => Err(format!(
-            "Unknown capability '{other}'. Valid: read_file, write_file, execute, network, git_mutate, fs_escape"
-        )),
     }
 }
 
@@ -108,8 +84,6 @@ impl AgentTool for CaduceusPolicyTool {
         if let Ok(input) = input {
             let op = match &input.operation {
                 PolicyOperation::Check { tool_name } => format!("check {tool_name}"),
-                PolicyOperation::Grant { capability } => format!("grant {capability}"),
-                PolicyOperation::Revoke { capability } => format!("revoke {capability}"),
                 PolicyOperation::Report => "report".to_string(),
                 PolicyOperation::Audit { .. } => "audit".to_string(),
             };
@@ -131,7 +105,7 @@ impl AgentTool for CaduceusPolicyTool {
                 error: format!("Failed to receive input: {e}"),
             })?;
 
-            let mut guard = bridge.lock().map_err(|e| CaduceusPolicyToolOutput::Error {
+            let guard = bridge.lock().map_err(|e| CaduceusPolicyToolOutput::Error {
                 error: format!("Lock poisoned: {e}"),
             })?;
 
@@ -141,20 +115,6 @@ impl AgentTool for CaduceusPolicyTool {
                         Ok(()) => format!("✅ Tool '{tool_name}' is ALLOWED under current privilege ring."),
                         Err(reason) => format!("❌ Tool '{tool_name}' is DENIED: {reason}"),
                     }
-                }
-                PolicyOperation::Grant { capability } => {
-                    let cap = parse_capability(&capability).map_err(|e| {
-                        CaduceusPolicyToolOutput::Error { error: e }
-                    })?;
-                    guard.grant_capability(cap.clone());
-                    format!("✅ Granted capability: {cap}")
-                }
-                PolicyOperation::Revoke { capability } => {
-                    let cap = parse_capability(&capability).map_err(|e| {
-                        CaduceusPolicyToolOutput::Error { error: e }
-                    })?;
-                    guard.revoke_capability(&cap);
-                    format!("✅ Revoked capability: {cap}")
                 }
                 PolicyOperation::Report => {
                     let report = guard.generate_security_report();

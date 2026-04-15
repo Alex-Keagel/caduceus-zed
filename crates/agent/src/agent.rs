@@ -72,6 +72,7 @@ struct ProjectState {
     project_context_needs_refresh: watch::Sender<()>,
     _maintain_project_context: Task<Result<()>>,
     context_server_registry: Entity<ContextServerRegistry>,
+    caduceus_engine: Option<Arc<caduceus_bridge::engine::CaduceusEngine>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -83,6 +84,7 @@ struct Session {
     acp_thread: Entity<acp_thread::AcpThread>,
     project_id: EntityId,
     pending_save: Task<Result<()>>,
+    caduceus_modes: Rc<CaduceusSessionModes>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -399,6 +401,7 @@ impl NativeAgent {
                 project_id,
                 _subscriptions: subscriptions,
                 pending_save: Task::ready(Ok(())),
+                caduceus_modes: Rc::new(CaduceusSessionModes::new()),
             },
         );
 
@@ -456,6 +459,13 @@ impl NativeAgent {
         let (project_context_needs_refresh_tx, project_context_needs_refresh_rx) =
             watch::channel(());
 
+        // Create shared Caduceus engine for this project
+        let caduceus_engine = project.read(cx).worktrees(cx).next().map(|wt| {
+            Arc::new(caduceus_bridge::engine::CaduceusEngine::new(
+                &wt.read(cx).abs_path().to_path_buf(),
+            ))
+        });
+
         self.projects.insert(
             project_id,
             ProjectState {
@@ -472,73 +482,76 @@ impl NativeAgent {
                     .await
                 }),
                 context_server_registry,
+                caduceus_engine: caduceus_engine.clone(),
                 _subscriptions: subscriptions,
             },
         );
 
         // Caduceus: auto-index project on open and populate wiki
-        let project_for_index = project.clone();
-        cx.spawn(async move |_this, mut cx| {
-            let project_root = cx.update(|cx| {
-                project_for_index
-                    .read(cx)
-                    .worktrees(cx)
-                    .next()
-                    .map(|wt| wt.read(cx).abs_path().to_path_buf())
-            });
+        if let Some(engine) = caduceus_engine {
+            let project_for_index = project.clone();
+            let engine_clone = engine.clone();
+            cx.spawn(async move |_this, cx| {
+                let project_root = cx.update(|cx| {
+                    project_for_index
+                        .read(cx)
+                        .worktrees(cx)
+                        .next()
+                        .map(|wt| wt.read(cx).abs_path().to_path_buf())
+                });
 
-            if let Some(root) = project_root {
-                log::info!("[caduceus] Auto-indexing project: {}", root.display());
-                let ignore_patterns = load_caduceuignore(&root);
-                if !ignore_patterns.is_empty() {
-                    log::info!("[caduceus] Loaded {} .caduceuignore patterns", ignore_patterns.len());
-                }
-                let engine = caduceus_bridge::engine::CaduceusEngine::new(&root);
-
-                // Index project files in background
-                match engine.index_directory(&root).await {
-                    Ok(chunks) => log::info!("[caduceus] Indexed {} chunks", chunks),
-                    Err(e) => log::warn!("[caduceus] Index failed: {e}"),
-                }
-
-                // Populate wiki with project overview
-                let wiki_root = root.clone();
-                let readme_path = root.join("README.md");
-                let readme = std::fs::read_to_string(&readme_path).unwrap_or_default();
-
-                // Build project structure page
-                let mut structure = String::from("# Project Structure\n\n");
-                if let Ok(entries) = std::fs::read_dir(&root) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with('.') { continue; }
-                        if !should_index_path(&entry.path(), &ignore_patterns) { continue; }
-                        let kind = if entry.path().is_dir() { "📁" } else { "📄" };
-                        structure.push_str(&format!("- {kind} {name}\n"));
+                if let Some(root) = project_root {
+                    log::info!("[caduceus] Auto-indexing project: {}", root.display());
+                    let ignore_patterns = load_caduceuignore(&root);
+                    if !ignore_patterns.is_empty() {
+                        log::info!("[caduceus] Loaded {} .caduceuignore patterns", ignore_patterns.len());
                     }
-                }
 
-                // Write wiki pages
-                let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:project-overview", &structure);
-                if !readme.is_empty() {
-                    let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:readme", &readme);
-                }
+                    // Index project files in background using the shared engine
+                    match engine_clone.index_directory(&root).await {
+                        Ok(chunks) => log::info!("[caduceus] Indexed {} chunks", chunks),
+                        Err(e) => log::warn!("[caduceus] Index failed: {e}"),
+                    }
 
-                // Git context
-                if let Ok(branch) = engine.git_branch() {
-                    let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:git-branch", &branch);
-                }
-                if let Ok(log) = engine.git_log(10) {
-                    let log_text: String = log.iter()
-                        .map(|c| format!("{} — {}", &c.sha[..7.min(c.sha.len())], c.message))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:recent-commits", &log_text);
-                }
+                    // Populate wiki with project overview
+                    let wiki_root = root.clone();
+                    let readme_path = root.join("README.md");
+                    let readme = std::fs::read_to_string(&readme_path).unwrap_or_default();
 
-                log::info!("[caduceus] Wiki populated for {}", root.display());
-            }
-        }).detach();
+                    // Build project structure page
+                    let mut structure = String::from("# Project Structure\n\n");
+                    if let Ok(entries) = std::fs::read_dir(&root) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name.starts_with('.') { continue; }
+                            if !should_index_path(&entry.path(), &ignore_patterns) { continue; }
+                            let kind = if entry.path().is_dir() { "📁" } else { "📄" };
+                            structure.push_str(&format!("- {kind} {name}\n"));
+                        }
+                    }
+
+                    // Write wiki pages
+                    let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:project-overview", &structure);
+                    if !readme.is_empty() {
+                        let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:readme", &readme);
+                    }
+
+                    // Git context
+                    if let Ok(branch) = engine_clone.git_branch() {
+                        let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:git-branch", &branch);
+                    }
+                    if let Ok(log) = engine_clone.git_log(10) {
+                        let log_text: String = log.iter()
+                            .map(|c| format!("{} — {}", crate::tools::truncate_str(&c.sha, 7), c.message))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:recent-commits", &log_text);
+                    }
+
+                    log::info!("[caduceus] Wiki populated for {}", root.display());
+                }
+            }).detach();
+        }
     }
 
     fn session_project_state(&self, session_id: &acp::SessionId) -> Option<&ProjectState> {
@@ -779,16 +792,17 @@ impl NativeAgent {
         match event {
             project::Event::WorktreeAdded(_) | project::Event::WorktreeRemoved(_) => {
                 state.project_context_needs_refresh.send(()).ok();
-                // Caduceus: re-index on worktree changes
-                if let Some(wt) = project.read(_cx).worktrees(_cx).next() {
-                    let root = wt.read(_cx).abs_path().to_path_buf();
-                    _cx.background_executor()
-                        .spawn(async move {
-                            let engine = caduceus_bridge::engine::CaduceusEngine::new(&root);
-                            let _ = engine.index_directory(&root).await;
-                            log::info!("[caduceus] Re-indexed after worktree change");
-                        })
-                        .detach();
+                // Caduceus: re-index on worktree changes using shared engine
+                if let Some(engine) = state.caduceus_engine.clone() {
+                    if let Some(wt) = project.read(_cx).worktrees(_cx).next() {
+                        let root = wt.read(_cx).abs_path().to_path_buf();
+                        _cx.background_executor()
+                            .spawn(async move {
+                                let _ = engine.index_directory(&root).await;
+                                log::info!("[caduceus] Re-indexed after worktree change");
+                            })
+                            .detach();
+                    }
                 }
             }
             project::Event::WorktreeUpdatedEntries(_, items) => {
@@ -1627,10 +1641,11 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
     fn session_modes(
         &self,
-        _session_id: &acp::SessionId,
-        _cx: &App,
+        session_id: &acp::SessionId,
+        cx: &App,
     ) -> Option<Rc<dyn acp_thread::AgentSessionModes>> {
-        Some(Rc::new(CaduceusSessionModes::new()))
+        self.0.read(cx).sessions.get(session_id)
+            .map(|session| session.caduceus_modes.clone() as Rc<dyn acp_thread::AgentSessionModes>)
     }
 
     fn prompt(

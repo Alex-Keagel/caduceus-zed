@@ -4528,6 +4528,8 @@ impl AgentPanel {
             .child(toolbar_content)
     }
 
+    // NOTE: Synchronous FS read. Acceptable for local filesystems.
+    // TODO: Cache for network-mounted workspaces.
     fn automations_count(&self, cx: &Context<Self>) -> usize {
         if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
             let root = worktree.read(cx).abs_path();
@@ -4543,6 +4545,8 @@ impl AgentPanel {
         0
     }
 
+    // NOTE: Synchronous FS read. Acceptable for local filesystems.
+    // TODO: Cache for network-mounted workspaces.
     fn background_agents_count(&self, cx: &Context<Self>) -> usize {
         if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
             let root = worktree.read(cx).abs_path();
@@ -4563,6 +4567,8 @@ impl AgentPanel {
         0
     }
 
+    // NOTE: Synchronous FS read. Acceptable for local filesystems.
+    // TODO: Cache for network-mounted workspaces.
     fn evolved_skills_count(&self, cx: &Context<Self>) -> usize {
         if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
             let root = worktree.read(cx).abs_path();
@@ -4578,6 +4584,8 @@ impl AgentPanel {
         0
     }
 
+    // NOTE: Synchronous FS read. Acceptable for local filesystems.
+    // TODO: Cache for network-mounted workspaces.
     fn security_compliance_score(&self, cx: &Context<Self>) -> f64 {
         if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
             let root = worktree.read(cx).abs_path();

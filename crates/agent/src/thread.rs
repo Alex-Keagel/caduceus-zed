@@ -1460,6 +1460,11 @@ impl Thread {
                 "caduceus_memory_write",
                 "caduceus_kanban",
                 "caduceus_storage",
+                "caduceus_policy",
+                "caduceus_checkpoint",
+                "caduceus_automations",
+                "caduceus_background_agent",
+                "caduceus_kill_switch",
             ];
             !write_tools.contains(&tool_name)
         } else {
@@ -1494,8 +1499,8 @@ impl Thread {
                     for content in &u.content {
                         match content {
                             UserMessageContent::Text(t) => {
-                                let truncated = if t.len() > 200 { &t[..200] } else { t };
-                                summary.push_str(truncated);
+                                let truncated: String = t.chars().take(200).collect();
+                                summary.push_str(&truncated);
                             }
                             _ => summary.push_str("[attachment]"),
                         }
@@ -1505,8 +1510,8 @@ impl Thread {
                 Message::Agent(a) => {
                     summary.push_str("**Assistant:** ");
                     let text = a.to_markdown();
-                    let truncated = if text.len() > 300 { &text[..300] } else { &text };
-                    summary.push_str(truncated);
+                    let truncated: String = text.chars().take(300).collect();
+                    summary.push_str(&truncated);
                     summary.push('\n');
                 }
                 Message::Resume => {
@@ -1515,21 +1520,39 @@ impl Thread {
             }
         }
 
-        // Save context summary to project
+        // Save context summary to project in background (avoid blocking UI thread)
         if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
             let root = worktree.read(cx).abs_path().to_path_buf();
-            let context_dir = root.join(".caduceus").join("context");
-            let _ = std::fs::create_dir_all(&context_dir);
             let session_id = self.id.0.to_string();
-            let filename = format!("compact-{}.md", &session_id[..8.min(session_id.len())]);
-            let path = context_dir.join(&filename);
-            if std::fs::write(&path, &summary).is_ok() {
-                log::info!("[caduceus] Context saved to {}", path.display());
-            }
+            let summary_clone = summary.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    let context_dir = root.join(".caduceus").join("context");
+                    let _ = std::fs::create_dir_all(&context_dir);
+                    let filename = format!("compact-{}.md", crate::tools::truncate_str(&session_id, 8));
+                    let path = context_dir.join(&filename);
+                    if std::fs::write(&path, &summary_clone).is_ok() {
+                        log::info!("[caduceus] Context saved to {}", path.display());
+                    }
+                })
+                .detach();
         }
 
         // Remove older messages, keep recent
         self.messages.drain(..messages_to_compact);
+
+        // Reinject compacted summary as first message so model retains context
+        self.messages.insert(
+            0,
+            Message::User(UserMessage {
+                id: acp_thread::UserMessageId::new(),
+                content: vec![UserMessageContent::Text(format!(
+                    "[Context compacted — {} older messages summarized]\n\n{}",
+                    messages_to_compact, summary
+                ))],
+            }),
+        );
+
         log::info!(
             "[caduceus] Compacted: {} messages remain",
             self.messages.len()

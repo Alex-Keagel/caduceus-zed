@@ -102,10 +102,10 @@ impl AgentTool for CaduceusGitWriteTool {
                     format!("Stage {} file(s)", paths.len())
                 }
                 GitWriteOperation::Commit { message } => {
-                    format!("Commit: {}", &message[..message.len().min(40)])
+                    format!("Commit: {}", crate::tools::truncate_str(message, 40))
                 }
                 GitWriteOperation::CommitAll { message } => {
-                    format!("Commit all: {}", &message[..message.len().min(40)])
+                    format!("Commit all: {}", crate::tools::truncate_str(message, 40))
                 }
                 GitWriteOperation::CreateTaskBranch { task_name } => {
                     format!("Create branch for: {task_name}")
@@ -143,7 +143,7 @@ impl AgentTool for CaduceusGitWriteTool {
                     .map(|_| format!("Staged {} file(s)", paths.len())),
                 GitWriteOperation::Commit { message } => engine
                     .git_commit(&message)
-                    .map(|r| format!("Committed: ({})", &r.sha[..7.min(r.sha.len())])),
+                    .map(|r| format!("Committed: ({})", crate::tools::truncate_str(&r.sha, 7))),
                 GitWriteOperation::CommitAll { message } => engine
                     .git_commit_all(&message)
                     .map(|sha| format!("Committed all changes: {sha}")),

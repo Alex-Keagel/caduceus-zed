@@ -92,7 +92,7 @@ impl AgentTool for CaduceusScaffoldTool {
                 ScaffoldOperation::Generate { description } => {
                     format!(
                         "Scaffold: {}",
-                        &description[..description.len().min(40)]
+                        crate::tools::truncate_str(description, 40)
                     )
                     .into()
                 }
