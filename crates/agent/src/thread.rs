@@ -1,9 +1,12 @@
 use crate::{
-    CaduceusCodeGraphTool, CaduceusDependencyScanTool, CaduceusErrorAnalysisTool,
-    CaduceusGitReadTool, CaduceusGitWriteTool, CaduceusIndexTool,
-    CaduceusMcpSecurityTool, CaduceusMemoryReadTool, CaduceusMemoryWriteTool,
-    CaduceusPrdTool, CaduceusScaffoldTool, CaduceusSecurityScanTool,
-    CaduceusSemanticSearchTool, ContextServerRegistry, CopyPathTool,
+    CaduceusCodeGraphTool, CaduceusConversationTool, CaduceusDependencyScanTool,
+    CaduceusErrorAnalysisTool, CaduceusGitReadTool, CaduceusGitWriteTool,
+    CaduceusIndexTool, CaduceusKanbanTool, CaduceusMarketplaceTool, CaduceusMcpSecurityTool,
+    CaduceusMemoryReadTool, CaduceusMemoryWriteTool, CaduceusPrdTool,
+    CaduceusProgressTool, CaduceusScaffoldTool, CaduceusSecurityScanTool,
+    CaduceusSemanticSearchTool, CaduceusStorageTool, CaduceusTaskTreeTool,
+    CaduceusTelemetryTool, CaduceusTimeTrackingTool, CaduceusWikiTool,
+    ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, GrepTool,
     ListDirectoryTool, MovePathTool, NowTool, OpenTool, ProjectSnapshot, ReadFileTool,
@@ -1597,11 +1600,20 @@ impl Thread {
             self.add_tool(CaduceusGitReadTool::new(engine.clone()));
             self.add_tool(CaduceusGitWriteTool::new(engine));
             self.add_tool(CaduceusMemoryReadTool::new(project_root.clone()));
-            self.add_tool(CaduceusMemoryWriteTool::new(project_root));
+            self.add_tool(CaduceusMemoryWriteTool::new(project_root.clone()));
+            self.add_tool(CaduceusStorageTool::new(project_root.clone()));
+            self.add_tool(CaduceusWikiTool::new(project_root.clone()));
+            self.add_tool(CaduceusKanbanTool::new(project_root));
         }
         self.add_tool(CaduceusDependencyScanTool::new());
         self.add_tool(CaduceusScaffoldTool::new());
         self.add_tool(CaduceusPrdTool::new());
+        self.add_tool(CaduceusConversationTool::new());
+        self.add_tool(CaduceusMarketplaceTool::new());
+        self.add_tool(CaduceusProgressTool::new());
+        self.add_tool(CaduceusTelemetryTool::new());
+        self.add_tool(CaduceusTimeTrackingTool::new());
+        self.add_tool(CaduceusTaskTreeTool::new());
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
             self.add_tool(SpawnAgentTool::new(environment));

@@ -1,16 +1,25 @@
 mod caduceus_code_graph_tool;
+mod caduceus_conversation_tool;
 mod caduceus_dependency_scan_tool;
 mod caduceus_error_analysis_tool;
 mod caduceus_git_read_tool;
 mod caduceus_git_write_tool;
 mod caduceus_index_tool;
+mod caduceus_kanban_tool;
+mod caduceus_marketplace_tool;
 mod caduceus_mcp_security_tool;
 mod caduceus_memory_read_tool;
 mod caduceus_memory_write_tool;
 mod caduceus_prd_tool;
+mod caduceus_progress_tool;
 mod caduceus_scaffold_tool;
 mod caduceus_security_scan_tool;
 mod caduceus_semantic_search_tool;
+mod caduceus_storage_tool;
+mod caduceus_task_tree_tool;
+mod caduceus_telemetry_tool;
+mod caduceus_time_tracking_tool;
+mod caduceus_wiki_tool;
 mod context_server_registry;
 mod copy_path_tool;
 mod create_directory_tool;
@@ -41,18 +50,27 @@ use crate::AgentTool;
 use language_model::{LanguageModelRequestTool, LanguageModelToolSchemaFormat};
 
 pub use caduceus_code_graph_tool::*;
+pub use caduceus_conversation_tool::*;
 pub use caduceus_dependency_scan_tool::*;
 pub use caduceus_error_analysis_tool::*;
 pub use caduceus_git_read_tool::*;
 pub use caduceus_git_write_tool::*;
 pub use caduceus_index_tool::*;
+pub use caduceus_kanban_tool::*;
+pub use caduceus_marketplace_tool::*;
 pub use caduceus_mcp_security_tool::*;
 pub use caduceus_memory_read_tool::*;
 pub use caduceus_memory_write_tool::*;
 pub use caduceus_prd_tool::*;
+pub use caduceus_progress_tool::*;
 pub use caduceus_scaffold_tool::*;
 pub use caduceus_security_scan_tool::*;
 pub use caduceus_semantic_search_tool::*;
+pub use caduceus_storage_tool::*;
+pub use caduceus_task_tree_tool::*;
+pub use caduceus_telemetry_tool::*;
+pub use caduceus_time_tracking_tool::*;
+pub use caduceus_wiki_tool::*;
 pub use context_server_registry::*;
 pub use copy_path_tool::*;
 pub use create_directory_tool::*;
@@ -146,18 +164,27 @@ macro_rules! tools {
 
 tools! {
     CaduceusCodeGraphTool,
+    CaduceusConversationTool,
     CaduceusDependencyScanTool,
     CaduceusErrorAnalysisTool,
     CaduceusGitReadTool,
     CaduceusGitWriteTool,
     CaduceusIndexTool,
+    CaduceusKanbanTool,
+    CaduceusMarketplaceTool,
     CaduceusMcpSecurityTool,
     CaduceusMemoryReadTool,
     CaduceusMemoryWriteTool,
     CaduceusPrdTool,
+    CaduceusProgressTool,
     CaduceusScaffoldTool,
     CaduceusSecurityScanTool,
     CaduceusSemanticSearchTool,
+    CaduceusStorageTool,
+    CaduceusTaskTreeTool,
+    CaduceusTelemetryTool,
+    CaduceusTimeTrackingTool,
+    CaduceusWikiTool,
     CopyPathTool,
     CreateDirectoryTool,
     DeletePathTool,

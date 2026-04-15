@@ -28,6 +28,7 @@ pub use caduceus_orchestrator::{
     TimeEntry as BridgeTimeEntry,
     TaskTree as BridgeTaskTree,
     HierarchicalTask as BridgeHierarchicalTask,
+    kanban::{KanbanBoard, KanbanCard, KanbanColumn, CardStatus},
 };
 
 /// Wrapper around the AgentHarness for the bridge.
