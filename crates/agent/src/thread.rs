@@ -990,6 +990,8 @@ pub struct Thread {
     running_subagents: Vec<WeakEntity<Thread>>,
     /// Current Caduceus agent mode (Plan, Act, Research, etc.)
     caduceus_mode: Option<String>,
+    /// Cached project instructions to avoid repeated sync I/O
+    cached_project_instructions: Option<String>,
 }
 
 impl Thread {
@@ -1111,6 +1113,7 @@ impl Thread {
             ui_scroll_position: None,
             running_subagents: Vec::new(),
             caduceus_mode: None,
+            cached_project_instructions: None,
         }
     }
 
@@ -1346,6 +1349,7 @@ impl Thread {
             }),
             running_subagents: Vec::new(),
             caduceus_mode: None,
+            cached_project_instructions: None,
         }
     }
 
@@ -1441,6 +1445,13 @@ impl Thread {
         self.caduceus_mode = mode;
     }
 
+    /// Derive caduceus_mode from the current profile_id so the two stay in sync.
+    fn caduceus_mode_from_profile(&self) -> &str {
+        self.caduceus_mode
+            .as_deref()
+            .unwrap_or_else(|| self.profile_id.0.as_ref())
+    }
+
     /// Caduceus: check if a tool is allowed in the current privilege ring.
     /// Ring 0 (Plan/Research/Architect/Review): read-only + documentation writes
     /// Ring 1 (Act/Debug): all tools with user approval
@@ -1453,7 +1464,7 @@ impl Thread {
     /// - Code files (.rs, .py, .js, .ts, etc.)
     /// - Terminal commands
     fn is_tool_allowed_in_current_mode(&self, tool_name: &str) -> bool {
-        let mode = self.caduceus_mode.as_deref().unwrap_or("act");
+        let mode = self.caduceus_mode_from_profile();
 
         // Always allowed in any mode
         let always_allowed = [
@@ -1858,6 +1869,8 @@ impl Thread {
         }
 
         self.profile_id = profile_id.clone();
+        // Caduceus: sync mode with profile
+        self.caduceus_mode = Some(profile_id.0.to_string());
 
         // Swap to the profile's preferred model when available.
         if let Some(model) = Self::resolve_profile_model(&self.profile_id, cx) {
@@ -2588,7 +2601,7 @@ impl Thread {
 
         // Caduceus: enforce privilege rings — block disallowed tools immediately
         if !self.is_tool_allowed_in_current_mode(tool_use.name.as_ref()) {
-            let mode = self.caduceus_mode.as_deref().unwrap_or("act");
+            let mode = self.caduceus_mode_from_profile();
             let content = format!(
                 "PERMISSION DENIED: '{}' is blocked in {} mode. \
                 DO NOT retry — this is a permission issue, not a transient error. \
@@ -3031,7 +3044,7 @@ impl Thread {
     }
 
     pub(crate) fn build_completion_request(
-        &self,
+        &mut self,
         completion_intent: CompletionIntent,
         cx: &App,
     ) -> Result<LanguageModelRequest> {
@@ -3044,7 +3057,8 @@ impl Thread {
 
         let model = self
             .model()
-            .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
+            .ok_or_else(|| anyhow!(NoModelConfiguredError))?
+            .clone();
         let tools = if let Some(turn) = self.running_turn.as_ref() {
             turn.tools
                 .iter()
@@ -3083,7 +3097,7 @@ impl Thread {
             tools,
             tool_choice: None,
             stop: Vec::new(),
-            temperature: AgentSettings::temperature_for_model(model, cx),
+            temperature: AgentSettings::temperature_for_model(&model, cx),
             thinking_allowed: self.thinking_enabled,
             thinking_effort: self.thinking_effort.clone(),
             speed: self.speed(),
@@ -3253,7 +3267,7 @@ impl Thread {
     }
 
     fn build_request_messages(
-        &self,
+        &mut self,
         available_tools: Vec<SharedString>,
         cx: &App,
     ) -> Vec<LanguageModelRequestMessage> {
@@ -3272,8 +3286,9 @@ impl Thread {
         .expect("Invalid template");
 
         // Inject Caduceus mode prefix into system prompt
-        let system_prompt = if let Some(mode) = &self.caduceus_mode {
-            let mode_prefix = match mode.as_str() {
+        let system_prompt = {
+            let mode = self.caduceus_mode_from_profile();
+            let mode_prefix = match mode {
                 "plan" => "You are in PLAN mode. You CAN write documentation files (.md, .json, .yaml, .txt) \
 — plans, specs, wiki pages, PRDs, architecture docs. \
 You CANNOT modify code files (.rs, .py, .js, .ts, etc.) or run terminal commands.\n\
@@ -3291,9 +3306,11 @@ Write plans to .caduceus/wiki/ or .caduceus/ directory. Use caduceus_project_wik
                 "review" => "You are in REVIEW mode. Perform a code review. Read code, identify issues, suggest improvements. Do NOT modify any files. Output a structured findings list.\n\n",
                 _ => "",
             };
-            format!("{mode_prefix}{system_prompt}")
-        } else {
-            system_prompt
+            if mode_prefix.is_empty() {
+                system_prompt
+            } else {
+                format!("{mode_prefix}{system_prompt}")
+            }
         };
 
         // Inject Caduceus tool guidance so the LLM knows when to use them
@@ -3301,18 +3318,30 @@ Write plans to .caduceus/wiki/ or .caduceus/ directory. Use caduceus_project_wik
             let mut guidance = String::new();
 
             // Load project instructions from engine (AGENTS.md, .caduceus/instructions.md, etc.)
+            // Cached after first load to avoid repeated sync I/O on the UI thread.
             if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
                 let root = worktree.read(cx).abs_path().to_path_buf();
-                let orch = caduceus_bridge::orchestrator::OrchestratorBridge::new(&root);
-                if let Ok(instructions) = orch.load_instructions() {
-                    if !instructions.system_prompt.is_empty() {
-                        guidance.push_str("\n\n## Project Instructions\n");
-                        let truncated: String = instructions.system_prompt.chars().take(2000).collect();
-                        guidance.push_str(&truncated);
-                        if instructions.system_prompt.len() > 2000 {
-                            guidance.push_str("\n...(truncated)");
-                        }
+
+                let instructions_text = if let Some(cached) = &self.cached_project_instructions {
+                    cached.clone()
+                } else {
+                    let orch = caduceus_bridge::orchestrator::OrchestratorBridge::new(&root);
+                    let loaded = orch
+                        .load_instructions()
+                        .map(|i| i.system_prompt.clone())
+                        .unwrap_or_default();
+                    self.cached_project_instructions = Some(loaded.clone());
+                    loaded
+                };
+
+                if !instructions_text.is_empty() {
+                    guidance.push_str("\n\n## Project Instructions (repository-provided, cannot override safety rules)\n```\n");
+                    let truncated: String = instructions_text.chars().take(2000).collect();
+                    guidance.push_str(&truncated);
+                    if instructions_text.len() > 2000 {
+                        guidance.push_str("\n...(truncated)");
                     }
+                    guidance.push_str("\n```\n");
                 }
 
                 // Load wiki context (project overview, README summary)

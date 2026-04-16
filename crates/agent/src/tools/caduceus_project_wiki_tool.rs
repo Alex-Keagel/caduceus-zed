@@ -86,19 +86,19 @@ impl CaduceusProjectWikiTool {
     }
 
     fn page_path(&self, page: &str) -> Result<PathBuf, String> {
-        // Reject path traversal
-        if page.contains("..") {
-            return Err("Invalid page path: must not contain '..'".to_string());
+        let rel = Path::new(page);
+        if rel.is_absolute() {
+            return Err("Wiki page path must be relative".to_string());
         }
-        let path = self.wiki_root().join(format!("{page}.md"));
-        // Verify it's still under wiki root
-        let wiki_root = self.wiki_root();
-        let canonical = path.canonicalize().unwrap_or(path.clone());
-        let root_canonical = wiki_root.canonicalize().unwrap_or(wiki_root);
-        if !canonical.starts_with(&root_canonical) {
-            return Err("Invalid page path: escapes wiki directory".to_string());
+        let mut safe = self.wiki_root();
+        for component in rel.components() {
+            match component {
+                std::path::Component::Normal(seg) => safe.push(seg),
+                _ => return Err(format!("Invalid wiki page path: '{page}'")),
+            }
         }
-        Ok(path)
+        safe.set_extension("md");
+        Ok(safe)
     }
 
     fn read_page(&self, page: &str) -> Result<String, String> {
@@ -112,6 +112,8 @@ impl CaduceusProjectWikiTool {
 
     fn write_page(&self, page: &str, content: &str) -> Result<(), String> {
         let path = self.page_path(page)?;
+        let _lock = super::caduceus_file_lock::acquire_file_lock(&path)
+            .map_err(|e| format!("Failed to lock wiki page '{page}': {e}"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create wiki directory: {e}"))?;

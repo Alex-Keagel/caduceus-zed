@@ -143,14 +143,16 @@ impl CaduceusProjectTool {
     }
 
     fn save_config(&self, config: &ProjectConfig) -> Result<(), String> {
-        let path = self.config_path();
-        if let Some(parent) = path.parent() {
+        let config_path = self.config_path();
+        let _lock = super::caduceus_file_lock::acquire_file_lock(&config_path)
+            .map_err(|e| format!("Failed to lock project.json: {e}"))?;
+        if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create .caduceus dir: {e}"))?;
         }
         let data = serde_json::to_string_pretty(config)
             .map_err(|e| format!("Failed to serialize config: {e}"))?;
-        std::fs::write(&path, data)
+        std::fs::write(&config_path, data)
             .map_err(|e| format!("Failed to write project.json: {e}"))
     }
 }

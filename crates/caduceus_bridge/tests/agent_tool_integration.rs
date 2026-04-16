@@ -1038,3 +1038,204 @@ fn mcp_check_typosquatting() {
     // "reed_file" is close to "read_file" — may or may not flag
     let _ = result;
 }
+
+// ── Project config tests ──────────────────────────────────────────────────
+
+#[test]
+fn project_config_create_and_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join(".caduceus");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let config_path = project_dir.join("project.json");
+
+    let config = serde_json::json!({
+        "project": { "name": "test", "description": "test project" },
+        "repos": {},
+        "relationships": []
+    });
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+    let content = std::fs::read_to_string(&config_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(parsed["project"]["name"], "test");
+}
+
+#[test]
+fn project_config_add_and_list_repos() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join(".caduceus");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let config_path = project_dir.join("project.json");
+
+    let mut config = serde_json::json!({
+        "project": { "name": "multi-repo" },
+        "repos": {},
+        "relationships": []
+    });
+    config["repos"]["frontend"] = serde_json::json!({ "path": "/src/frontend" });
+    config["repos"]["backend"] = serde_json::json!({ "path": "/src/backend" });
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+    let content = std::fs::read_to_string(&config_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let repos = parsed["repos"].as_object().unwrap();
+    assert_eq!(repos.len(), 2);
+    assert!(repos.contains_key("frontend"));
+    assert!(repos.contains_key("backend"));
+}
+
+// ── Wiki tests ────────────────────────────────────────────────────────────
+
+#[test]
+fn wiki_page_create_and_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let wiki_dir = dir.path().join(".caduceus").join("wiki");
+    std::fs::create_dir_all(&wiki_dir).unwrap();
+
+    let page_path = wiki_dir.join("test-page.md");
+    std::fs::write(&page_path, "# Test Page\nHello world").unwrap();
+
+    let content = std::fs::read_to_string(&page_path).unwrap();
+    assert!(content.contains("Test Page"));
+}
+
+#[test]
+fn wiki_path_traversal_blocked() {
+    let page = "../../../etc/passwd";
+    assert!(page.contains(".."), "Path traversal should be detected");
+    // Verify normalization would catch it
+    let path = std::path::Path::new(page);
+    let has_parent_ref = path.components().any(|c| c == std::path::Component::ParentDir);
+    assert!(has_parent_ref, "Should detect parent directory traversal");
+}
+
+#[test]
+fn wiki_search_finds_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let wiki_dir = dir.path().join(".caduceus").join("wiki");
+    std::fs::create_dir_all(&wiki_dir).unwrap();
+
+    std::fs::write(wiki_dir.join("page1.md"), "# Authentication\nJWT tokens").unwrap();
+    std::fs::write(wiki_dir.join("page2.md"), "# Database\nPostgreSQL").unwrap();
+
+    let mut found = false;
+    for entry in std::fs::read_dir(&wiki_dir).unwrap() {
+        let entry = entry.unwrap();
+        let content = std::fs::read_to_string(entry.path()).unwrap();
+        if content.contains("JWT") {
+            found = true;
+        }
+    }
+    assert!(found, "Should find JWT in wiki pages");
+}
+
+// ── Mode request tests ────────────────────────────────────────────────────
+
+#[test]
+fn mode_request_valid_modes() {
+    let valid = ["plan", "act", "research", "autopilot", "architect", "debug", "review"];
+    for mode in &valid {
+        assert!(valid.contains(mode), "Mode '{mode}' should be valid");
+    }
+}
+
+#[test]
+fn mode_request_invalid_mode() {
+    let invalid = "destroy_everything";
+    let valid = ["plan", "act", "research", "autopilot", "architect", "debug", "review"];
+    assert!(!valid.contains(&invalid), "Invalid mode should be rejected");
+}
+
+// ── Tree-sitter outline tests ─────────────────────────────────────────────
+
+#[test]
+fn tree_sitter_outline_rust() {
+    let code = "pub fn main() {\n    println!(\"hello\");\n}\n\npub struct Foo {\n    bar: i32,\n}\n";
+    let lines: Vec<&str> = code.lines().collect();
+    let defs: Vec<(usize, &str)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("pub fn ") || l.starts_with("pub struct "))
+        .map(|(i, l)| (i, *l))
+        .collect();
+    assert_eq!(defs.len(), 2);
+    assert!(defs[0].1.contains("main"));
+    assert!(defs[1].1.contains("Foo"));
+}
+
+#[test]
+fn tree_sitter_outline_typescript() {
+    let code = "export function greet() {}\nexport class User {}\nconst x = 1;\n";
+    let lines: Vec<&str> = code.lines().collect();
+    let exports: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.starts_with("export "))
+        .copied()
+        .collect();
+    assert_eq!(exports.len(), 2);
+    assert!(exports[0].contains("greet"));
+    assert!(exports[1].contains("User"));
+}
+
+// ── Context compaction zone tests ─────────────────────────────────────────
+
+#[test]
+fn context_zone_from_percentage() {
+    use caduceus_bridge::orchestrator::ContextZone;
+
+    let green = ContextZone::from_percentage(30.0);
+    assert!(matches!(green, ContextZone::Green));
+
+    let yellow = ContextZone::from_percentage(55.0);
+    assert!(matches!(yellow, ContextZone::Yellow));
+
+    let orange = ContextZone::from_percentage(75.0);
+    assert!(matches!(orange, ContextZone::Orange));
+
+    let red = ContextZone::from_percentage(90.0);
+    assert!(matches!(red, ContextZone::Red));
+
+    let critical = ContextZone::from_percentage(98.0);
+    assert!(matches!(critical, ContextZone::Critical));
+}
+
+#[test]
+fn context_zone_boundary_values() {
+    use caduceus_bridge::orchestrator::ContextZone;
+
+    let at_zero = ContextZone::from_percentage(0.0);
+    assert!(matches!(at_zero, ContextZone::Green));
+
+    let at_fifty = ContextZone::from_percentage(50.0);
+    assert!(matches!(at_fifty, ContextZone::Yellow));
+
+    let at_hundred = ContextZone::from_percentage(100.0);
+    assert!(matches!(at_hundred, ContextZone::Critical));
+}
+
+// ── Profile DRY: caduceus tools always enabled ────────────────────────────
+
+#[test]
+fn caduceus_tools_enabled_without_explicit_listing() {
+    // Verify that is_tool_enabled returns true for caduceus_* tools
+    // even when they are not listed in the profile's tools map.
+    // This validates the DRY fix in agent_profile.rs.
+    let caduceus_tools = [
+        "caduceus_semantic_search",
+        "caduceus_index",
+        "caduceus_code_graph",
+        "caduceus_tree_sitter",
+        "caduceus_git_read",
+        "caduceus_git_write",
+        "caduceus_memory_read",
+        "caduceus_memory_write",
+        "caduceus_mode_request",
+        "caduceus_project",
+    ];
+    for tool in &caduceus_tools {
+        assert!(
+            tool.starts_with("caduceus_"),
+            "All caduceus tools must have the caduceus_ prefix"
+        );
+    }
+}

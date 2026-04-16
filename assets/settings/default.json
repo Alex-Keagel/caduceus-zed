@@ -1108,23 +1108,7 @@
           "list_directory": true, "move_path": true, "now": true,
           "find_path": true, "read_file": true, "restore_file_from_disk": true,
           "save_file": true, "open": true, "grep": true, "spawn_agent": true,
-          "terminal": true, "thinking": true, "update_plan": true, "search_web": true,
-          "caduceus_semantic_search": true, "caduceus_index": true,
-          "caduceus_code_graph": true, "caduceus_tree_sitter": true,
-          "caduceus_git_read": true, "caduceus_git_write": true,
-          "caduceus_memory_read": true, "caduceus_memory_write": true,
-          "caduceus_dependency_scan": true, "caduceus_security_scan": true,
-          "caduceus_error_analysis": true, "caduceus_mcp_security": true,
-          "caduceus_prd": true, "caduceus_progress": true,
-          "caduceus_kanban": true, "caduceus_checkpoint": true,
-          "caduceus_scaffold": true, "caduceus_storage": true,
-          "caduceus_wiki": true, "caduceus_telemetry": true,
-          "caduceus_task_tree": true, "caduceus_time_tracking": true,
-          "caduceus_automations": true, "caduceus_background_agent": true,
-          "caduceus_policy": true, "caduceus_conversation": true,
-          "caduceus_marketplace": true, "caduceus_kill_switch": true,
-          "caduceus_mode_request": true,
-          "caduceus_project": true
+          "terminal": true, "thinking": true, "update_plan": true, "search_web": true
         }
       },
       "plan": {
@@ -1133,17 +1117,7 @@
         "tools": {
           "diagnostics": true, "fetch": true, "list_directory": true,
           "now": true, "find_path": true, "read_file": true, "open": true,
-          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true,
-          "caduceus_semantic_search": true, "caduceus_index": true,
-          "caduceus_code_graph": true, "caduceus_tree_sitter": true,
-          "caduceus_git_read": true, "caduceus_memory_read": true,
-          "caduceus_dependency_scan": true, "caduceus_security_scan": true,
-          "caduceus_error_analysis": true, "caduceus_prd": true,
-          "caduceus_progress": true, "caduceus_wiki": true,
-          "caduceus_telemetry": true, "caduceus_task_tree": true,
-          "caduceus_conversation": true, "caduceus_marketplace": true,
-          "caduceus_policy": true, "caduceus_mode_request": true,
-          "caduceus_project": true
+          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true
         }
       },
       "research": {
@@ -1152,13 +1126,7 @@
         "tools": {
           "diagnostics": true, "fetch": true, "list_directory": true,
           "now": true, "find_path": true, "read_file": true, "open": true,
-          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true,
-          "caduceus_semantic_search": true, "caduceus_index": true,
-          "caduceus_code_graph": true, "caduceus_tree_sitter": true,
-          "caduceus_git_read": true, "caduceus_memory_read": true,
-          "caduceus_dependency_scan": true, "caduceus_wiki": true,
-          "caduceus_conversation": true, "caduceus_mode_request": true,
-          "caduceus_project": true
+          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true
         }
       },
       "autopilot": {
@@ -1170,23 +1138,7 @@
           "list_directory": true, "move_path": true, "now": true,
           "find_path": true, "read_file": true, "restore_file_from_disk": true,
           "save_file": true, "open": true, "grep": true, "spawn_agent": true,
-          "terminal": true, "thinking": true, "update_plan": true, "search_web": true,
-          "caduceus_semantic_search": true, "caduceus_index": true,
-          "caduceus_code_graph": true, "caduceus_tree_sitter": true,
-          "caduceus_git_read": true, "caduceus_git_write": true,
-          "caduceus_memory_read": true, "caduceus_memory_write": true,
-          "caduceus_dependency_scan": true, "caduceus_security_scan": true,
-          "caduceus_error_analysis": true, "caduceus_mcp_security": true,
-          "caduceus_prd": true, "caduceus_progress": true,
-          "caduceus_kanban": true, "caduceus_checkpoint": true,
-          "caduceus_scaffold": true, "caduceus_storage": true,
-          "caduceus_wiki": true, "caduceus_telemetry": true,
-          "caduceus_task_tree": true, "caduceus_time_tracking": true,
-          "caduceus_automations": true, "caduceus_background_agent": true,
-          "caduceus_policy": true, "caduceus_conversation": true,
-          "caduceus_marketplace": true, "caduceus_kill_switch": true,
-          "caduceus_mode_request": true,
-          "caduceus_project": true
+          "terminal": true, "thinking": true, "update_plan": true, "search_web": true
         }
       },
       "architect": {
@@ -1195,17 +1147,7 @@
         "tools": {
           "diagnostics": true, "fetch": true, "list_directory": true,
           "now": true, "find_path": true, "read_file": true, "open": true,
-          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true,
-          "caduceus_semantic_search": true, "caduceus_index": true,
-          "caduceus_code_graph": true, "caduceus_tree_sitter": true,
-          "caduceus_git_read": true, "caduceus_memory_read": true,
-          "caduceus_dependency_scan": true, "caduceus_security_scan": true,
-          "caduceus_prd": true, "caduceus_progress": true,
-          "caduceus_wiki": true, "caduceus_telemetry": true,
-          "caduceus_task_tree": true, "caduceus_conversation": true,
-          "caduceus_marketplace": true, "caduceus_policy": true,
-          "caduceus_mode_request": true,
-          "caduceus_project": true
+          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true
         }
       },
       "debug": {
@@ -1217,16 +1159,7 @@
           "list_directory": true, "move_path": true, "now": true,
           "find_path": true, "read_file": true, "restore_file_from_disk": true,
           "save_file": true, "open": true, "grep": true, "spawn_agent": true,
-          "terminal": true, "thinking": true, "search_web": true,
-          "caduceus_semantic_search": true, "caduceus_index": true,
-          "caduceus_code_graph": true, "caduceus_tree_sitter": true,
-          "caduceus_git_read": true, "caduceus_git_write": true,
-          "caduceus_memory_read": true, "caduceus_memory_write": true,
-          "caduceus_error_analysis": true, "caduceus_security_scan": true,
-          "caduceus_checkpoint": true, "caduceus_wiki": true,
-          "caduceus_telemetry": true, "caduceus_policy": true,
-          "caduceus_mode_request": true,
-          "caduceus_project": true
+          "terminal": true, "thinking": true, "search_web": true
         }
       },
       "review": {
@@ -1235,15 +1168,7 @@
         "tools": {
           "diagnostics": true, "fetch": true, "list_directory": true,
           "now": true, "find_path": true, "read_file": true, "open": true,
-          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true,
-          "caduceus_semantic_search": true, "caduceus_index": true,
-          "caduceus_code_graph": true, "caduceus_tree_sitter": true,
-          "caduceus_git_read": true, "caduceus_memory_read": true,
-          "caduceus_dependency_scan": true, "caduceus_security_scan": true,
-          "caduceus_error_analysis": true, "caduceus_prd": true,
-          "caduceus_wiki": true, "caduceus_conversation": true,
-          "caduceus_policy": true, "caduceus_mode_request": true,
-          "caduceus_project": true
+          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true
         }
       }
     },

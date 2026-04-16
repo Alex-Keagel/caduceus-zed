@@ -1713,10 +1713,10 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
         let path_style = project_state.project.read(cx).path_style(cx);
 
-        // Capture current Caduceus mode before entering the closure
+        // Derive Caduceus mode from thread's profile_id instead of session_modes
         let current_mode = self
-            .session_modes(&session_id, cx)
-            .map(|modes| modes.current_mode().0.to_string());
+            .thread(&session_id, cx)
+            .map(|t| t.read(cx).profile().0.to_string());
 
         self.run_turn(session_id.clone(), cx, move |thread, cx| {
             let content: Vec<UserMessageContent> = params

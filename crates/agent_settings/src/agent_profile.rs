@@ -113,6 +113,11 @@ pub struct AgentProfileSettings {
 
 impl AgentProfileSettings {
     pub fn is_tool_enabled(&self, tool_name: &str) -> bool {
+        // Caduceus tools are always enabled — Ring 0 enforcement in thread.rs
+        // handles per-mode blocking, so profiles don't need to list them.
+        if tool_name.starts_with("caduceus_") {
+            return true;
+        }
         self.tools.get(tool_name) == Some(&true)
     }
 
