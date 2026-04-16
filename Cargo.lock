@@ -2629,6 +2629,7 @@ dependencies = [
  "caduceus-telemetry",
  "caduceus-tools",
  "chrono",
+ "log",
  "serde",
  "serde_json",
  "tempfile",

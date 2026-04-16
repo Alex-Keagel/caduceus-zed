@@ -4373,49 +4373,13 @@ impl AgentPanel {
                                 cx,
                             ))
                         })
-                        .when(automation_count > 0, |this| {
-                            this.child(
-                                Label::new(format!("⚡ {automation_count}"))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                        })
-                        .when(background_agent_count > 0, |this| {
-                            this.child(
-                                Label::new(format!("🤖 {background_agent_count}"))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                        })
-                        .when(evolved_skill_count > 0, |this| {
-                            this.child(
-                                Label::new(format!("🧬 {evolved_skill_count}"))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                        })
-                        .child(
-                            Label::new(format!("🛡️ {:.0}%", security_score * 100.0))
-                                .size(LabelSize::Small)
-                                .color(if security_score >= 0.8 { Color::Success } else if security_score >= 0.5 { Color::Warning } else { Color::Error }),
-                        )
-                        .when(self.active_thread_has_messages(cx), |this| {
-                            this.child(
-                                IconButton::new("caduceus-kill-switch", IconName::XCircle)
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Error)
-                                    .tooltip(Tooltip::text("Emergency Stop All Agents"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        log::warn!("[caduceus] Kill switch activated from UI");
-                                        if let Some(view) = this.active_conversation_view().cloned()
-                                        {
-                                            view.update(cx, |view, cx| {
-                                                view.cancel_generation(cx);
-                                            });
-                                        }
-                                    })),
-                            )
-                        })
+                        .child(self.render_caduceus_indicators(
+                            automation_count,
+                            background_agent_count,
+                            evolved_skill_count,
+                            security_score,
+                            cx,
+                        ))
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
                 )
@@ -4468,49 +4432,13 @@ impl AgentPanel {
                                 cx,
                             ))
                         })
-                        .when(automation_count > 0, |this| {
-                            this.child(
-                                Label::new(format!("⚡ {automation_count}"))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                        })
-                        .when(background_agent_count > 0, |this| {
-                            this.child(
-                                Label::new(format!("🤖 {background_agent_count}"))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                        })
-                        .when(evolved_skill_count > 0, |this| {
-                            this.child(
-                                Label::new(format!("🧬 {evolved_skill_count}"))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                        })
-                        .child(
-                            Label::new(format!("🛡️ {:.0}%", security_score * 100.0))
-                                .size(LabelSize::Small)
-                                .color(if security_score >= 0.8 { Color::Success } else if security_score >= 0.5 { Color::Warning } else { Color::Error }),
-                        )
-                        .when(self.active_thread_has_messages(cx), |this| {
-                            this.child(
-                                IconButton::new("caduceus-kill-switch", IconName::XCircle)
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Error)
-                                    .tooltip(Tooltip::text("Emergency Stop All Agents"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        log::warn!("[caduceus] Kill switch activated from UI");
-                                        if let Some(view) = this.active_conversation_view().cloned()
-                                        {
-                                            view.update(cx, |view, cx| {
-                                                view.cancel_generation(cx);
-                                            });
-                                        }
-                                    })),
-                            )
-                        })
+                        .child(self.render_caduceus_indicators(
+                            automation_count,
+                            background_agent_count,
+                            evolved_skill_count,
+                            security_score,
+                            cx,
+                        ))
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
                 )
@@ -4526,6 +4454,66 @@ impl AgentPanel {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(toolbar_content)
+    }
+
+    fn render_caduceus_indicators(
+        &self,
+        automation_count: usize,
+        background_agent_count: usize,
+        evolved_skill_count: usize,
+        security_score: f64,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        h_flex()
+            .gap_1()
+            .when(automation_count > 0, |this| {
+                this.child(
+                    Label::new(format!("⚡ {automation_count}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .when(background_agent_count > 0, |this| {
+                this.child(
+                    Label::new(format!("🤖 {background_agent_count}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .when(evolved_skill_count > 0, |this| {
+                this.child(
+                    Label::new(format!("🧬 {evolved_skill_count}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .child(
+                Label::new(format!("🛡️ {:.0}%", security_score * 100.0))
+                    .size(LabelSize::Small)
+                    .color(if security_score >= 0.8 {
+                        Color::Success
+                    } else if security_score >= 0.5 {
+                        Color::Warning
+                    } else {
+                        Color::Error
+                    }),
+            )
+            .when(self.active_thread_has_messages(cx), |this| {
+                this.child(
+                    IconButton::new("caduceus-kill-switch", IconName::XCircle)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Error)
+                        .tooltip(Tooltip::text("Emergency Stop All Agents"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            log::warn!("[caduceus] Kill switch activated from UI");
+                            if let Some(view) = this.active_conversation_view().cloned() {
+                                view.update(cx, |view, cx| {
+                                    view.cancel_generation(cx);
+                                });
+                            }
+                        })),
+                )
+            })
     }
 
     // NOTE: Synchronous FS read. Acceptable for local filesystems.

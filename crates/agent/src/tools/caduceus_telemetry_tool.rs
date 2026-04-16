@@ -30,6 +30,11 @@ pub enum TelemetryOperation {
     IsDrifting,
     /// Generate a full telemetry report with usage, budget, SLOs, drift, and degradation.
     ExportReport,
+    /// Configure OTLP endpoint and trigger a batch export.
+    ExportOtlp {
+        /// The OTLP HTTP endpoint, e.g. "http://localhost:4318"
+        endpoint: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,6 +92,7 @@ impl AgentTool for CaduceusTelemetryTool {
                 TelemetryOperation::BudgetRemaining => "budget remaining",
                 TelemetryOperation::IsDrifting => "drift check",
                 TelemetryOperation::ExportReport => "report",
+                TelemetryOperation::ExportOtlp { .. } => "OTLP export",
             };
             format!("Telemetry {op}").into()
         } else {
@@ -141,6 +147,16 @@ impl AgentTool for CaduceusTelemetryTool {
                     format!("Drifting: {drifting} (score: {score:.4})")
                 }
                 TelemetryOperation::ExportReport => guard.generate_report(),
+                TelemetryOperation::ExportOtlp { endpoint } => {
+                    drop(guard);
+                    let mut guard = bridge.lock().map_err(|e| {
+                        CaduceusTelemetryToolOutput::Error {
+                            error: format!("Lock poisoned: {e}"),
+                        }
+                    })?;
+                    guard.configure_otlp_endpoint(&endpoint);
+                    format!("OTLP exporter configured for {endpoint}")
+                }
             };
 
             Ok(CaduceusTelemetryToolOutput::Text { text })

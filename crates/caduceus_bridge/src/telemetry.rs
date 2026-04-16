@@ -4,7 +4,7 @@
 use caduceus_telemetry::{
     BudgetEnforcer, CognitiveDegradationBreaker, BehavioralDriftDetector,
     CostCalculator, CostLogger, CostRecord, DegradationIndicators, DegradationStage,
-    ModelPricing, OtelExporter, Slo, SloMetric, SloMonitor,
+    ModelPricing, OtelExporter, OtelExporterConfig, Slo, SloMetric, SloMonitor,
     SloStatus, TelemetryEvent, TokenCounter,
 };
 use caduceus_core::{ModelId, ProviderId};
@@ -203,6 +203,20 @@ impl TelemetryBridge {
             .export_batch(events)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Reconfigure the OTLP exporter to point at a specific endpoint.
+    pub fn configure_otlp_endpoint(&mut self, endpoint: &str) {
+        self.exporter = OtelExporter::new(OtelExporterConfig {
+            endpoint: endpoint.to_string(),
+            enabled: true,
+            ..OtelExporterConfig::default()
+        });
+    }
+
+    /// Returns the current OTLP endpoint URL.
+    pub fn otlp_endpoint(&self) -> &str {
+        &self.exporter.endpoint
     }
 
     // ── Turn recording ───────────────────────────────────────────────────

@@ -14,6 +14,8 @@ use caduceus_bridge::orchestrator::{
     BridgeAgentMode, BridgeModelId,
 };
 
+use crate::tools::caduceus_file_lock::acquire_file_lock;
+
 /// Manages trigger-based automations: cron, file-watch, webhook, manual, etc.
 /// Each automation defines a trigger and a prompt template that fires an agent session.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -189,6 +191,9 @@ impl AgentTool for CaduceusAutomationsTool {
             })?;
 
             let store = AutomationStore::new(&self.project_root);
+            let _lock = acquire_file_lock(&store.path).map_err(|e| {
+                CaduceusAutomationsToolOutput::Error { error: e }
+            })?;
 
             let result = match input.operation {
                 AutomationOperation::List => {

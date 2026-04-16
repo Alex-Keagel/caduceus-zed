@@ -5,6 +5,7 @@ mod caduceus_code_graph_tool;
 mod caduceus_conversation_tool;
 mod caduceus_dependency_scan_tool;
 mod caduceus_error_analysis_tool;
+pub mod caduceus_file_lock;
 mod caduceus_git_read_tool;
 mod caduceus_git_write_tool;
 mod caduceus_index_tool;

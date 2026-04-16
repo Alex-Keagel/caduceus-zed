@@ -5,8 +5,9 @@
 
 use caduceus_core::{ToolResult, ToolSpec};
 use caduceus_omniscience::{
-    AstOverlay, CodePropertyGraph, DummyEmbedder, EmbeddingModelConfig, EmbeddingSelector,
-    FederatedIndex, ParseErrorDownRanker, ProjectIndex, ScoredChunk, SemanticIndex, VectorSpaceMap,
+    AstOverlay, CodePropertyGraph, DummyEmbedder, EmbeddingBackend, EmbeddingModelConfig,
+    EmbeddingSelector, FederatedIndex, OpenAiEmbedder, ParseErrorDownRanker, ProjectIndex,
+    ScoredChunk, SemanticIndex, VectorSpaceMap,
 };
 use caduceus_permissions::SecretScanner;
 use caduceus_tools::{SastScanner, ToolRegistry};
@@ -45,7 +46,16 @@ impl CaduceusEngine {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let root = project_root.into();
         let tools = Self::build_tool_registry(&root);
-        let embedder = Box::new(DummyEmbedder::new(384));
+        let embedder: Box<dyn EmbeddingBackend> = if let Ok(api_key) =
+            std::env::var("CADUCEUS_EMBEDDING_API_KEY")
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+        {
+            log::info!("[caduceus] Using OpenAI embeddings");
+            Box::new(OpenAiEmbedder::new(api_key))
+        } else {
+            log::info!("[caduceus] Using dummy embeddings (set CADUCEUS_EMBEDDING_API_KEY for real semantic search)");
+            Box::new(DummyEmbedder::new(384))
+        };
         let search_index = Arc::new(RwLock::new(SemanticIndex::new(embedder)));
         let code_graph = CodePropertyGraph::new();
         let security_scanner = SastScanner::new();

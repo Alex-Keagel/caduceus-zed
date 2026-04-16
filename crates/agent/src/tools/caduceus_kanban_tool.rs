@@ -12,6 +12,8 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use caduceus_bridge::engine::CaduceusEngine;
 use caduceus_bridge::orchestrator::{KanbanBoard, KanbanCard};
 
+use crate::tools::caduceus_file_lock::acquire_file_lock;
+
 /// Manages a Kanban board for multi-agent task orchestration. Each card represents
 /// a task that can be assigned to an agent with its own git worktree branch.
 /// Cards have dependency chains — downstream cards auto-start when dependencies complete.
@@ -206,6 +208,11 @@ impl AgentTool for CaduceusKanbanTool {
                 CaduceusKanbanToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
                 }
+            })?;
+
+            let lock_path = self.project_root.join(".caduceus/kanban.json");
+            let _lock = acquire_file_lock(&lock_path).map_err(|e| {
+                CaduceusKanbanToolOutput::Error { error: e }
             })?;
 
             let mut board = self.load_or_create_board().map_err(|e| {
