@@ -2587,14 +2587,18 @@ impl Thread {
 
         self.send_or_update_tool_use(&tool_use, title, kind, event_stream);
 
-        // Caduceus: enforce privilege rings — block write tools in read-only modes
+        // Caduceus: enforce privilege rings — block disallowed tools immediately
         if !self.is_tool_allowed_in_current_mode(tool_use.name.as_ref()) {
             let mode = self.caduceus_mode.as_deref().unwrap_or("act");
             let content = format!(
-                "Tool '{}' is not available in {} mode (read-only ring). Switch to act or autopilot mode to use write tools.",
-                tool_use.name, mode
+                "PERMISSION DENIED: '{}' is blocked in {} mode. \
+                DO NOT retry — this is a permission issue, not a transient error. \
+                Ask the user: \"I need {} to complete this task. \
+                Shall I switch to Act mode?\" \
+                Then use caduceus_mode_request to request the change.",
+                tool_use.name, mode, tool_use.name
             );
-            log::warn!("[caduceus] Blocked tool '{}' in {} mode", tool_use.name, mode);
+            log::warn!("[caduceus] PERMISSION DENIED '{}' in {} mode", tool_use.name, mode);
             return Some(Task::ready(LanguageModelToolResult {
                 content: LanguageModelToolResultContent::Text(Arc::from(content)),
                 tool_use_id: tool_use.id,
@@ -3336,9 +3340,16 @@ You have access to powerful Caduceus tools. USE THEM proactively:\n\
 - `caduceus_prd` — parse requirements into structured tasks\n\
 \n\
 ## Mode Escalation\n\
-If you need to write files but are in a read-only mode (Plan/Research/Architect/Review), \
-use `caduceus_mode_request` to ask the user for permission. Explain WHY you need the \
-mode change. The user must approve it.\n\
+If you need to write code but are in Plan/Research/Architect/Review mode, \
+use `caduceus_mode_request` to ask the user for permission. Explain WHY.\n\
+Note: Plan mode CAN write .md/.json/.yaml files (docs, plans, wiki). Only code is blocked.\n\
+\n\
+## Error Handling\n\
+When a tool returns an error, check the type:\n\
+- **PERMISSION DENIED**: Do NOT retry. Ask the user to switch modes or grant permission.\n\
+- **Transient/API error**: Retry up to 2 times with a brief pause.\n\
+- **File not found**: Check the path and try alternatives.\n\
+- **Tool not found**: Use a different tool or explain what you need.\n\
 \n\
 ## Spawning Sub-Agents\n\
 Before spawning sub-agents with `spawn_agent`, ALWAYS:\n\
