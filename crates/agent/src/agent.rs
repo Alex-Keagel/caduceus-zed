@@ -375,12 +375,15 @@ impl NativeAgent {
         let weak_thread = thread_handle.downgrade();
         thread_handle.update(cx, |thread, cx| {
             thread.set_summarization_model(summarization_model, cx);
+            let engine = self.projects.get(&project.entity_id())
+                .and_then(|ps| ps.caduceus_engine.clone());
             thread.add_default_tools(
                 Rc::new(NativeThreadEnvironment {
                     acp_thread: acp_thread.downgrade(),
                     thread: weak_thread,
                     agent: weak,
                 }) as _,
+                engine,
                 cx,
             )
         });
@@ -501,7 +504,12 @@ impl NativeAgent {
                 });
 
                 if let Some(root) = project_root {
-                    log::info!("[caduceus] Auto-indexing project: {}", root.display());
+                    // Skip if already indexed
+                    let already_indexed = engine_clone.index_chunk_count().await > 0;
+                    if already_indexed {
+                        log::info!("[caduceus] Project already indexed, skipping");
+                    } else {
+                        log::info!("[caduceus] Auto-indexing project: {}", root.display());
                     let ignore_patterns = load_caduceuignore(&root);
                     if !ignore_patterns.is_empty() {
                         log::info!("[caduceus] Loaded {} .caduceuignore patterns", ignore_patterns.len());
@@ -549,6 +557,7 @@ impl NativeAgent {
                     }
 
                     log::info!("[caduceus] Wiki populated for {}", root.display());
+                    } // end if !already_indexed
                 }
             }).detach();
         }

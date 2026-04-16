@@ -3303,7 +3303,7 @@ impl ThreadView {
                                         Some(config_view) => this.child(config_view),
                                         None => this
                                             .children(self.render_mode_safety_indicator(cx))
-                                            .children(self.mode_selector.clone())
+                                            // Caduceus: mode_selector removed — profiles ARE modes now
                                             .children(self.model_selector.clone()),
                                     })
                                     .child(self.render_send_button(cx)),

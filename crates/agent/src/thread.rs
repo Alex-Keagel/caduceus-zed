@@ -1737,6 +1737,7 @@ impl Thread {
     pub fn add_default_tools(
         &mut self,
         environment: Rc<dyn ThreadEnvironment>,
+        caduceus_engine: Option<Arc<caduceus_bridge::engine::CaduceusEngine>>,
         cx: &mut Context<Self>,
     ) {
         // Only update the agent location for the root thread, not for subagents.
@@ -1782,10 +1783,13 @@ impl Thread {
         self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
         self.add_tool(WebSearchTool);
 
-        // Caduceus engine tools — derive project root from first worktree
+        // Caduceus engine tools — use shared engine from ProjectState
         if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
             let project_root = worktree.read(cx).abs_path().to_path_buf();
-            let engine = Arc::new(caduceus_bridge::engine::CaduceusEngine::new(&project_root));
+            // Use shared engine if provided, otherwise create one (fallback for tests)
+            let engine = caduceus_engine.unwrap_or_else(|| {
+                Arc::new(caduceus_bridge::engine::CaduceusEngine::new(&project_root))
+            });
 
             self.add_tool(CaduceusSemanticSearchTool::new(engine.clone()));
             self.add_tool(CaduceusIndexTool::new(engine.clone()));
