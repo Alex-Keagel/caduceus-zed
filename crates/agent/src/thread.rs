@@ -5,7 +5,7 @@ use crate::{
     CaduceusMemoryReadTool, CaduceusMemoryWriteTool, CaduceusPolicyTool, CaduceusPrdTool,
     CaduceusProgressTool, CaduceusScaffoldTool, CaduceusSecurityScanTool,
     CaduceusSemanticSearchTool, CaduceusStorageTool, CaduceusTaskTreeTool,
-    CaduceusTelemetryTool, CaduceusTimeTrackingTool, CaduceusWikiTool,
+    CaduceusTelemetryTool, CaduceusTimeTrackingTool, CaduceusTreeSitterTool, CaduceusWikiTool,
     ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, GrepTool,
@@ -1738,6 +1738,7 @@ impl Thread {
         self.add_tool(CaduceusProgressTool::new());
         self.add_tool(CaduceusTelemetryTool::new());
         self.add_tool(CaduceusTimeTrackingTool::new());
+        self.add_tool(CaduceusTreeSitterTool::new(self.project.clone()));
         self.add_tool(CaduceusTaskTreeTool::new());
         self.add_tool(CaduceusKillSwitchTool::new());
 

@@ -25,6 +25,7 @@ mod caduceus_storage_tool;
 mod caduceus_task_tree_tool;
 mod caduceus_telemetry_tool;
 mod caduceus_time_tracking_tool;
+mod caduceus_tree_sitter_tool;
 mod caduceus_wiki_tool;
 mod context_server_registry;
 mod copy_path_tool;
@@ -89,6 +90,7 @@ pub use caduceus_storage_tool::*;
 pub use caduceus_task_tree_tool::*;
 pub use caduceus_telemetry_tool::*;
 pub use caduceus_time_tracking_tool::*;
+pub use caduceus_tree_sitter_tool::*;
 pub use caduceus_wiki_tool::*;
 pub use context_server_registry::*;
 pub use copy_path_tool::*;
@@ -208,6 +210,7 @@ tools! {
     CaduceusTaskTreeTool,
     CaduceusTelemetryTool,
     CaduceusTimeTrackingTool,
+    CaduceusTreeSitterTool,
     CaduceusWikiTool,
     CopyPathTool,
     CreateDirectoryTool,
