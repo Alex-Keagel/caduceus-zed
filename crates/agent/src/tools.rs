@@ -1,7 +1,10 @@
+mod caduceus_api_registry_tool;
+mod caduceus_architect_tool;
 mod caduceus_automations_tool;
 mod caduceus_background_agent_tool;
 mod caduceus_checkpoint_tool;
 mod caduceus_code_graph_tool;
+mod caduceus_cross_search_tool;
 mod caduceus_conversation_tool;
 mod caduceus_dependency_scan_tool;
 mod caduceus_error_analysis_tool;
@@ -18,6 +21,7 @@ mod caduceus_mode_request_tool;
 mod caduceus_memory_write_tool;
 mod caduceus_policy_tool;
 mod caduceus_prd_tool;
+mod caduceus_product_tool;
 mod caduceus_project_tool;
 mod caduceus_project_wiki_tool;
 mod caduceus_progress_tool;
@@ -67,11 +71,14 @@ pub(crate) fn truncate_str(s: &str, max_chars: usize) -> &str {
     }
 }
 
+pub use caduceus_api_registry_tool::*;
+pub use caduceus_architect_tool::*;
 pub use caduceus_automations_tool::*;
 pub use caduceus_background_agent_tool::*;
 pub use caduceus_checkpoint_tool::*;
 pub use caduceus_code_graph_tool::*;
 pub use caduceus_conversation_tool::*;
+pub use caduceus_cross_search_tool::*;
 pub use caduceus_dependency_scan_tool::*;
 pub use caduceus_error_analysis_tool::*;
 pub use caduceus_git_read_tool::*;
@@ -86,6 +93,7 @@ pub use caduceus_mode_request_tool::*;
 pub use caduceus_memory_write_tool::*;
 pub use caduceus_policy_tool::*;
 pub use caduceus_prd_tool::*;
+pub use caduceus_product_tool::*;
 pub use caduceus_project_tool::*;
 pub use caduceus_project_wiki_tool::*;
 pub use caduceus_progress_tool::*;
@@ -190,11 +198,14 @@ macro_rules! tools {
 }
 
 tools! {
+    CaduceusApiRegistryTool,
+    CaduceusArchitectTool,
     CaduceusAutomationsTool,
     CaduceusBackgroundAgentTool,
     CaduceusCheckpointTool,
     CaduceusCodeGraphTool,
     CaduceusConversationTool,
+    CaduceusCrossSearchTool,
     CaduceusDependencyScanTool,
     CaduceusErrorAnalysisTool,
     CaduceusGitReadTool,
@@ -209,6 +220,7 @@ tools! {
     CaduceusMemoryWriteTool,
     CaduceusPolicyTool,
     CaduceusPrdTool,
+    CaduceusProductTool,
     CaduceusProjectTool,
     CaduceusProjectWikiTool,
     CaduceusProgressTool,

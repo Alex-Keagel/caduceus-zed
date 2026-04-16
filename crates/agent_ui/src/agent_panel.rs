@@ -775,6 +775,10 @@ struct CaduceusStatsCache {
     background_agent_count: usize,
     evolved_skill_count: usize,
     security_score: f64,
+    project_name: Option<String>,
+    project_repo_count: usize,
+    api_count: usize,
+    health_score: Option<f64>,
     last_refresh: Instant,
 }
 
@@ -785,6 +789,10 @@ impl Default for CaduceusStatsCache {
             background_agent_count: 0,
             evolved_skill_count: 0,
             security_score: 0.0,
+            project_name: None,
+            project_repo_count: 0,
+            api_count: 0,
+            health_score: None,
             last_refresh: Instant::now() - Duration::from_secs(60),
         }
     }
@@ -4288,6 +4296,10 @@ impl AgentPanel {
         let background_agent_count = self.caduceus_stats_cache.background_agent_count;
         let evolved_skill_count = self.caduceus_stats_cache.evolved_skill_count;
         let security_score = self.caduceus_stats_cache.security_score;
+        let project_name = self.caduceus_stats_cache.project_name.clone();
+        let project_repo_count = self.caduceus_stats_cache.project_repo_count;
+        let api_count = self.caduceus_stats_cache.api_count;
+        let health_score = self.caduceus_stats_cache.health_score;
         let is_empty_state = !self.active_thread_has_messages(cx);
 
         let is_in_history_or_config = self.is_history_or_configuration_visible();
@@ -4404,6 +4416,10 @@ impl AgentPanel {
                             background_agent_count,
                             evolved_skill_count,
                             security_score,
+                            project_name.clone(),
+                            project_repo_count,
+                            api_count,
+                            health_score,
                             cx,
                         ))
                         .child(full_screen_button)
@@ -4463,6 +4479,10 @@ impl AgentPanel {
                             background_agent_count,
                             evolved_skill_count,
                             security_score,
+                            project_name,
+                            project_repo_count,
+                            api_count,
+                            health_score,
                             cx,
                         ))
                         .child(full_screen_button)
@@ -4488,10 +4508,27 @@ impl AgentPanel {
         background_agent_count: usize,
         evolved_skill_count: usize,
         security_score: f64,
+        project_name: Option<String>,
+        project_repo_count: usize,
+        api_count: usize,
+        health_score: Option<f64>,
         cx: &mut Context<Self>,
     ) -> Div {
         h_flex()
             .gap_1()
+            .when(project_repo_count > 0, |this| {
+                let label = if let Some(ref name) = project_name {
+                    let truncated: String = name.chars().take(12).collect();
+                    format!("📦 {} ({})", truncated, project_repo_count)
+                } else {
+                    format!("📦 {}", project_repo_count)
+                };
+                this.child(
+                    Label::new(label)
+                        .size(LabelSize::Small)
+                        .color(Color::Accent),
+                )
+            })
             .when(automation_count > 0, |this| {
                 this.child(
                     Label::new(format!("⚡ {automation_count}"))
@@ -4524,6 +4561,27 @@ impl AgentPanel {
                         Color::Error
                     }),
             )
+            .when(api_count > 0, |this| {
+                this.child(
+                    Label::new(format!("🔌 {} APIs", api_count))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .when(health_score.is_some(), |this| {
+                let score = health_score.unwrap_or(0.0);
+                this.child(
+                    Label::new(format!("❤️ {:.0}%", score * 100.0))
+                        .size(LabelSize::Small)
+                        .color(if score >= 0.8 {
+                            Color::Success
+                        } else if score >= 0.5 {
+                            Color::Warning
+                        } else {
+                            Color::Error
+                        }),
+                )
+            })
             .when(self.active_thread_has_messages(cx), |this| {
                 this.child(
                     IconButton::new("caduceus-kill-switch", IconName::XCircle)
@@ -4597,11 +4655,59 @@ impl AgentPanel {
             // Security compliance score
             let bridge = caduceus_bridge::security::PermissionsBridge::new(root.as_ref());
             self.caduceus_stats_cache.security_score = bridge.compliance_score();
+
+            // Multi-repo project info
+            let project_path = root.join(".caduceus/project.json");
+            if project_path.exists() {
+                if let Some(config) = std::fs::read_to_string(&project_path)
+                    .ok()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                {
+                    self.caduceus_stats_cache.project_name = config["project"]["name"]
+                        .as_str()
+                        .map(|s| s.to_string());
+                    self.caduceus_stats_cache.project_repo_count = config["repos"]
+                        .as_object()
+                        .map_or(0, |r| r.len());
+                } else {
+                    self.caduceus_stats_cache.project_name = None;
+                    self.caduceus_stats_cache.project_repo_count = 0;
+                }
+            } else {
+                self.caduceus_stats_cache.project_name = None;
+                self.caduceus_stats_cache.project_repo_count = 0;
+            }
+
+            // API registry count
+            let apis_path = root.join(".caduceus/apis.json");
+            self.caduceus_stats_cache.api_count = if apis_path.exists() {
+                std::fs::read_to_string(&apis_path)
+                    .ok()
+                    .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(&json).ok())
+                    .map_or(0, |v| v.len())
+            } else {
+                0
+            };
+
+            // Architecture health score
+            let health_path = root.join(".caduceus/health.json");
+            self.caduceus_stats_cache.health_score = if health_path.exists() {
+                std::fs::read_to_string(&health_path)
+                    .ok()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                    .and_then(|v| v["score"].as_f64())
+            } else {
+                None
+            };
         } else {
             self.caduceus_stats_cache.automation_count = 0;
             self.caduceus_stats_cache.background_agent_count = 0;
             self.caduceus_stats_cache.evolved_skill_count = 0;
             self.caduceus_stats_cache.security_score = 0.0;
+            self.caduceus_stats_cache.project_name = None;
+            self.caduceus_stats_cache.project_repo_count = 0;
+            self.caduceus_stats_cache.api_count = 0;
+            self.caduceus_stats_cache.health_score = None;
         }
 
         self.caduceus_stats_cache.last_refresh = Instant::now();

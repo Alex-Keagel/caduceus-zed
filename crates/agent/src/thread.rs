@@ -1,9 +1,10 @@
 use crate::{
-    CaduceusAutomationsTool, CaduceusBackgroundAgentTool, CaduceusCheckpointTool, CaduceusCodeGraphTool, CaduceusConversationTool, CaduceusDependencyScanTool,
+    CaduceusApiRegistryTool, CaduceusArchitectTool,
+    CaduceusAutomationsTool, CaduceusBackgroundAgentTool, CaduceusCheckpointTool, CaduceusCodeGraphTool, CaduceusConversationTool, CaduceusCrossSearchTool, CaduceusDependencyScanTool,
     CaduceusErrorAnalysisTool, CaduceusGitReadTool, CaduceusGitWriteTool,
     CaduceusIndexTool, CaduceusKanbanTool, CaduceusKillSwitchTool, CaduceusMarketplaceTool, CaduceusMcpSecurityTool,
     CaduceusMemoryReadTool, CaduceusMemoryWriteTool, CaduceusModeRequestTool,
-    CaduceusPolicyTool, CaduceusPrdTool, CaduceusProjectTool, CaduceusProjectWikiTool,
+    CaduceusPolicyTool, CaduceusPrdTool, CaduceusProductTool, CaduceusProjectTool, CaduceusProjectWikiTool,
     CaduceusProgressTool, CaduceusScaffoldTool, CaduceusSecurityScanTool,
     CaduceusSemanticSearchTool, CaduceusStorageTool, CaduceusTaskTreeTool,
     CaduceusTelemetryTool, CaduceusTimeTrackingTool, CaduceusTreeSitterTool, CaduceusWikiTool,
@@ -1498,6 +1499,8 @@ impl Thread {
                 "caduceus_checkpoint", "caduceus_storage",
                 "caduceus_automations", "caduceus_background_agent",
                 "caduceus_scaffold",
+                "caduceus_cross_search", "caduceus_api_registry",
+                "caduceus_architect", "caduceus_product",
             ];
             let allowed = allowed_tools.contains(&tool_name);
             if !allowed {
@@ -1822,6 +1825,10 @@ impl Thread {
             self.add_tool(CaduceusWikiTool::new(project_root.clone()));
             self.add_tool(CaduceusProjectTool::new(project_root.clone()));
             self.add_tool(CaduceusProjectWikiTool::new(project_root.clone()));
+            self.add_tool(CaduceusCrossSearchTool::new(project_root.clone()));
+            self.add_tool(CaduceusApiRegistryTool::new(project_root.clone()));
+            self.add_tool(CaduceusArchitectTool::new(project_root.clone()));
+            self.add_tool(CaduceusProductTool::new(project_root.clone()));
             self.add_tool(CaduceusKanbanTool::new(project_root.clone(), engine));
             self.add_tool(CaduceusAutomationsTool::new(project_root.clone()));
             self.add_tool(CaduceusPolicyTool::new(project_root.clone()));
@@ -3359,6 +3366,43 @@ Write plans to .caduceus/wiki/ or .caduceus/ directory. Use caduceus_project_wik
                     let truncated: String = overview.chars().take(500).collect();
                     guidance.push_str(&truncated);
                 }
+
+                // Load project config for cross-repo context
+                let project_config_path = root.join(".caduceus").join("project.json");
+                if project_config_path.exists() {
+                    if let Ok(config_str) = std::fs::read_to_string(&project_config_path) {
+                        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                            let mut context = String::from("\n\n## Multi-Repo Project Context\n");
+                            if let Some(name) = config["project"]["name"].as_str() {
+                                context.push_str(&format!("Project: **{}**\n", name));
+                            }
+                            if let Some(desc) = config["project"]["description"].as_str() {
+                                context.push_str(&format!("{}\n\n", desc));
+                            }
+                            if let Some(repos) = config["repos"].as_object() {
+                                context.push_str("### Repositories\n");
+                                for (name, repo) in repos {
+                                    let role = repo["role"].as_str().unwrap_or("unknown");
+                                    let lang = repo["language"].as_str().unwrap_or("unknown");
+                                    let desc = repo["description"].as_str().unwrap_or("");
+                                    context.push_str(&format!("- **{}** ({}, {}) — {}\n", name, role, lang, desc));
+                                }
+                            }
+                            if let Some(rels) = config["relationships"].as_array() {
+                                if !rels.is_empty() {
+                                    context.push_str("\n### Relationships\n");
+                                    for rel in rels {
+                                        let from = rel["from"].as_str().unwrap_or("?");
+                                        let to = rel["to"].as_str().unwrap_or("?");
+                                        let rel_type = rel["type"].as_str().unwrap_or("relates_to");
+                                        context.push_str(&format!("- {} → {} ({})\n", from, to, rel_type));
+                                    }
+                                }
+                            }
+                            guidance.push_str(&context);
+                        }
+                    }
+                }
             }
 
             // Caduceus tool usage guidance
@@ -3375,6 +3419,10 @@ You have access to powerful Caduceus tools. USE THEM proactively:\n\
 - `caduceus_security_scan` — check for secrets/vulnerabilities before committing\n\
 - `caduceus_memory_read/write` — persist decisions across sessions\n\
 - `caduceus_prd` — parse requirements into structured tasks\n\
+- `caduceus_cross_search` — federated semantic search across all project repos\n\
+- `caduceus_api_registry` — discover and catalog API schemas across repos\n\
+- `caduceus_architect` — architecture diagrams, health scores, impact analysis\n\
+- `caduceus_product` — project status, features, milestones, next-work recommendations\n\
 \n\
 ## Mode Escalation\n\
 If you need to write code but are in Plan/Research/Architect/Review mode, \
