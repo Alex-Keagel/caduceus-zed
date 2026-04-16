@@ -2,7 +2,8 @@ use crate::{
     CaduceusAutomationsTool, CaduceusBackgroundAgentTool, CaduceusCheckpointTool, CaduceusCodeGraphTool, CaduceusConversationTool, CaduceusDependencyScanTool,
     CaduceusErrorAnalysisTool, CaduceusGitReadTool, CaduceusGitWriteTool,
     CaduceusIndexTool, CaduceusKanbanTool, CaduceusKillSwitchTool, CaduceusMarketplaceTool, CaduceusMcpSecurityTool,
-    CaduceusMemoryReadTool, CaduceusMemoryWriteTool, CaduceusPolicyTool, CaduceusPrdTool,
+    CaduceusMemoryReadTool, CaduceusMemoryWriteTool, CaduceusModeRequestTool,
+    CaduceusPolicyTool, CaduceusPrdTool,
     CaduceusProgressTool, CaduceusScaffoldTool, CaduceusSecurityScanTool,
     CaduceusSemanticSearchTool, CaduceusStorageTool, CaduceusTaskTreeTool,
     CaduceusTelemetryTool, CaduceusTimeTrackingTool, CaduceusTreeSitterTool, CaduceusWikiTool,
@@ -1124,6 +1125,8 @@ impl Thread {
         self.thinking_effort = parent.thinking_effort.clone();
         self.summarization_model = parent.summarization_model.clone();
         self.profile_id = parent.profile_id.clone();
+        // Caduceus: inherit mode so subagents respect privilege rings
+        self.caduceus_mode = parent.caduceus_mode.clone();
     }
 
     pub fn id(&self) -> &acp::SessionId {
@@ -1439,55 +1442,126 @@ impl Thread {
     }
 
     /// Caduceus: check if a tool is allowed in the current privilege ring.
+    /// Uses the engine's ToolAccess allowlist from modes.rs.
     /// Ring 0 (Plan/Research/Architect/Review): read-only tools only
-    /// Ring 1 (Act/Debug): all tools with approval
+    /// Ring 1 (Act/Debug): all tools with user approval
     /// Ring 2 (Autopilot): all tools, no approval
+    ///
+    /// Agents can always:
+    /// - Use caduceus_mode_request to escalate (requires user approval)
+    /// - Spawn subagents (inherit parent mode)
     fn is_tool_allowed_in_current_mode(&self, tool_name: &str) -> bool {
         let mode = self.caduceus_mode.as_deref().unwrap_or("act");
+
+        // Mode escalation and subagent spawning are ALWAYS allowed
+        let always_allowed = [
+            "caduceus_mode_request",
+            "spawn_agent",
+        ];
+        if always_allowed.contains(&tool_name) {
+            return true;
+        }
+
         let read_only_modes = ["plan", "research", "architect", "review"];
 
         if read_only_modes.contains(&mode) {
-            // Ring 0: only allow read-only tools
-            let write_tools = [
-                "edit_file",
-                "streaming_edit_file",
-                "save_file",
-                "create_directory",
-                "delete_path",
-                "move_path",
-                "terminal",
-                "caduceus_git_write",
-                "caduceus_memory_write",
-                "caduceus_kanban",
-                "caduceus_storage",
+            // Ring 0: allowlist from engine (read-only tools + all Caduceus read tools)
+            let allowed_tools = [
+                // Zed built-in read tools
+                "read_file", "find_path", "grep", "list_directory",
+                "diagnostics", "now", "fetch", "search_web", "open",
+                // Caduceus read tools
+                "caduceus_semantic_search", "caduceus_index",
+                "caduceus_code_graph", "caduceus_tree_sitter",
+                "caduceus_git_read", "caduceus_memory_read",
+                "caduceus_dependency_scan", "caduceus_security_scan",
+                "caduceus_error_analysis", "caduceus_mcp_security",
+                "caduceus_prd", "caduceus_progress",
+                "caduceus_telemetry", "caduceus_conversation",
+                "caduceus_marketplace", "caduceus_wiki",
+                "caduceus_task_tree", "caduceus_time_tracking",
                 "caduceus_policy",
-                "caduceus_checkpoint",
-                "caduceus_automations",
-                "caduceus_background_agent",
-                "caduceus_kill_switch",
             ];
-            !write_tools.contains(&tool_name)
+            let allowed = allowed_tools.contains(&tool_name);
+            if !allowed {
+                log::warn!(
+                    "[caduceus] BLOCKED '{}' in {} mode (Ring 0). \
+                    Use caduceus_mode_request to escalate to Act/Autopilot.",
+                    tool_name, mode
+                );
+            }
+            allowed
         } else {
-            true // Ring 1+ allows all tools
+            // Ring 1 (Act/Debug) and Ring 2 (Autopilot): all tools allowed
+            log::debug!("[caduceus] ALLOWED '{}' in {} mode", tool_name, mode);
+            true
         }
     }
 
-    /// Caduceus: auto-compact context when approaching token limits.
-    /// Writes a summary of older messages to .caduceus/context/ and removes them
-    /// from the active conversation, keeping only the most recent messages.
+    /// Caduceus: smart context management using engine compaction pipeline.
+    /// Triggers based on both message count AND estimated token usage.
+    /// Uses engine's ContextZone (Green/Yellow/Red) for decisions.
     fn auto_compact_context(&mut self, cx: &mut Context<Self>) {
-        const COMPACT_THRESHOLD: usize = 40; // compact after 40 messages
-        const KEEP_RECENT: usize = 10; // keep last 10 messages
+        use caduceus_bridge::orchestrator::{estimate_tokens, ContextZone};
 
-        if self.messages.len() < COMPACT_THRESHOLD {
+        // Estimate current context size
+        let mut total_tokens: u32 = 0;
+        for msg in &self.messages {
+            match msg {
+                Message::User(u) => {
+                    for content in &u.content {
+                        if let UserMessageContent::Text(t) = content {
+                            total_tokens += estimate_tokens(t);
+                        }
+                    }
+                }
+                Message::Agent(a) => {
+                    total_tokens += estimate_tokens(&a.to_markdown());
+                }
+                Message::Resume => {}
+            }
+        }
+
+        // Determine context zone
+        let max_context = self.model.as_ref()
+            .map(|m| m.max_token_count() as u32)
+            .unwrap_or(128_000);
+        let fill_pct = (total_tokens as f64 / max_context as f64) * 100.0;
+        let zone = ContextZone::from_percentage(fill_pct);
+
+        // Also check message count
+        let msg_count = self.messages.len();
+
+        // Decide whether to compact
+        let (should_compact, keep_recent) = match zone {
+            ContextZone::Green => {
+                // Under 60% — only compact if message count is very high
+                if msg_count > 60 { (true, 20) } else { (false, 0) }
+            }
+            ContextZone::Yellow => {
+                // 60-80% — compact aggressively
+                log::info!("[caduceus] Context zone YELLOW ({:.0}% full, {} msgs)", fill_pct, msg_count);
+                if msg_count > 20 { (true, 15) } else { (false, 0) }
+            }
+            ContextZone::Red => {
+                // 80%+ — emergency compact
+                log::warn!("[caduceus] Context zone RED ({:.0}% full, {} msgs) — emergency compact", fill_pct, msg_count);
+                if msg_count > 10 { (true, 8) } else { (false, 0) }
+            }
+            _ => {
+                // Fallback: simple message count threshold
+                if msg_count > 40 { (true, 10) } else { (false, 0) }
+            }
+        };
+
+        if !should_compact {
             return;
         }
 
-        let messages_to_compact = self.messages.len() - KEEP_RECENT;
+        let messages_to_compact = self.messages.len() - keep_recent;
         log::info!(
-            "[caduceus] Auto-compacting: {} messages → keeping last {}",
-            self.messages.len(),
-            KEEP_RECENT
+            "[caduceus] Compacting: {} msgs, {:.0}% tokens, zone {:?} → keeping last {}",
+            self.messages.len(), fill_pct, zone, keep_recent
         );
 
         // Build summary of older messages
@@ -1520,7 +1594,7 @@ impl Thread {
             }
         }
 
-        // Save context summary to project in background (avoid blocking UI thread)
+        // Save context summary to project in background
         if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
             let root = worktree.read(cx).abs_path().to_path_buf();
             let session_id = self.id.0.to_string();
@@ -1541,21 +1615,22 @@ impl Thread {
         // Remove older messages, keep recent
         self.messages.drain(..messages_to_compact);
 
-        // Reinject compacted summary as first message so model retains context
+        // Reinject compacted summary as first message
         self.messages.insert(
             0,
             Message::User(UserMessage {
                 id: acp_thread::UserMessageId::new(),
                 content: vec![UserMessageContent::Text(format!(
-                    "[Context compacted — {} older messages summarized]\n\n{}",
-                    messages_to_compact, summary
+                    "[Context compacted — {} older messages summarized, {:.0}% token usage]\n\n{}",
+                    messages_to_compact, fill_pct, summary
                 ))],
             }),
         );
 
         log::info!(
-            "[caduceus] Compacted: {} messages remain",
-            self.messages.len()
+            "[caduceus] Compacted: {} messages remain, ~{} tokens freed",
+            self.messages.len(),
+            total_tokens.saturating_sub(estimate_tokens(&summary))
         );
     }
 
@@ -1738,6 +1813,7 @@ impl Thread {
         self.add_tool(CaduceusProgressTool::new());
         self.add_tool(CaduceusTelemetryTool::new());
         self.add_tool(CaduceusTimeTrackingTool::new());
+        self.add_tool(CaduceusModeRequestTool::new());
         self.add_tool(CaduceusTreeSitterTool::new(self.project.clone()));
         self.add_tool(CaduceusTaskTreeTool::new());
         self.add_tool(CaduceusKillSwitchTool::new());
@@ -3244,6 +3320,19 @@ You have access to powerful Caduceus tools. USE THEM proactively:\n\
 - `caduceus_security_scan` — check for secrets/vulnerabilities before committing\n\
 - `caduceus_memory_read/write` — persist decisions across sessions\n\
 - `caduceus_prd` — parse requirements into structured tasks\n\
+\n\
+## Mode Escalation\n\
+If you need to write files but are in a read-only mode (Plan/Research/Architect/Review), \
+use `caduceus_mode_request` to ask the user for permission. Explain WHY you need the \
+mode change. The user must approve it.\n\
+\n\
+## Spawning Sub-Agents\n\
+Before spawning sub-agents with `spawn_agent`, ALWAYS:\n\
+1. **Explain the plan** — list what each sub-agent will do and why\n\
+2. **Show the breakdown** — e.g. \"I'll spawn 3 agents: Agent A does X, Agent B does Y, Agent C does Z\"\n\
+3. **Wait for approval** — the user should understand and approve the multi-agent plan\n\
+4. Sub-agents inherit your current mode — if you're in Plan mode, they can only read\n\
+5. Use `caduceus_kanban` to track sub-agent tasks with dependencies\n\
 \n\
 **Always prefer Caduceus tools over manual alternatives.**\n");
 
