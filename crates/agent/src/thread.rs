@@ -3326,12 +3326,21 @@ Write plans to .caduceus/wiki/ or .caduceus/ directory. Use caduceus_project_wik
                     cached.clone()
                 } else {
                     let orch = caduceus_bridge::orchestrator::OrchestratorBridge::new(&root);
-                    let loaded = orch
-                        .load_instructions()
-                        .map(|i| i.system_prompt.clone())
-                        .unwrap_or_default();
-                    self.cached_project_instructions = Some(loaded.clone());
-                    loaded
+                    match orch.load_instructions() {
+                        Ok(i) if !i.system_prompt.is_empty() => {
+                            self.cached_project_instructions = Some(i.system_prompt.clone());
+                            i.system_prompt
+                        }
+                        Ok(_) => {
+                            self.cached_project_instructions = Some(String::new());
+                            String::new()
+                        }
+                        Err(e) => {
+                            // Don't cache errors — retry next turn
+                            log::warn!("[caduceus] Failed to load instructions: {e}");
+                            String::new()
+                        }
+                    }
                 };
 
                 if !instructions_text.is_empty() {

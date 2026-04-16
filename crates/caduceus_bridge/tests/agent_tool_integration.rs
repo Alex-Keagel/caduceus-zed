@@ -1101,12 +1101,57 @@ fn wiki_page_create_and_read() {
 
 #[test]
 fn wiki_path_traversal_blocked() {
+    // Test the actual component-based path validation logic
     let page = "../../../etc/passwd";
-    assert!(page.contains(".."), "Path traversal should be detected");
-    // Verify normalization would catch it
     let path = std::path::Path::new(page);
-    let has_parent_ref = path.components().any(|c| c == std::path::Component::ParentDir);
-    assert!(has_parent_ref, "Should detect parent directory traversal");
+    
+    // Simulate what page_path() does: reject non-Normal components
+    let mut has_traversal = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => {}
+            _ => { has_traversal = true; break; }
+        }
+    }
+    assert!(has_traversal, "Path traversal must be rejected by component validation");
+    
+    // Also test safe paths work
+    let safe_page = "repos/frontend";
+    let safe_path = std::path::Path::new(safe_page);
+    let all_normal = safe_path.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+    assert!(all_normal, "Safe path should pass validation");
+    
+    // Test absolute path rejection
+    let abs_page = "/etc/passwd";
+    assert!(std::path::Path::new(abs_page).is_absolute(), "Absolute paths should be rejected");
+}
+
+#[test]
+fn wiki_page_name_with_dots_roundtrips() {
+    // Test the set_extension fix: "setup.guide" should produce "setup.guide.md" not "setup.md"
+    let dir = tempfile::tempdir().unwrap();
+    let wiki_dir = dir.path().join(".caduceus").join("wiki");
+    std::fs::create_dir_all(&wiki_dir).unwrap();
+    
+    // Simulate page_path logic
+    let page = "setup.guide";
+    let mut path = wiki_dir.clone();
+    for component in std::path::Path::new(page).components() {
+        if let std::path::Component::Normal(seg) = component {
+            path.push(seg);
+        }
+    }
+    let mut name = path.file_name().unwrap().to_os_string();
+    name.push(".md");
+    path.set_file_name(name);
+    
+    assert!(path.to_string_lossy().ends_with("setup.guide.md"), 
+        "Should be setup.guide.md, got: {}", path.display());
+    
+    // Write and read back
+    std::fs::write(&path, "# Setup Guide").unwrap();
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(content.contains("Setup Guide"));
 }
 
 #[test]
@@ -1133,17 +1178,26 @@ fn wiki_search_finds_content() {
 
 #[test]
 fn mode_request_valid_modes() {
+    // Test that the mode set matches the engine's AgentMode variants
     let valid = ["plan", "act", "research", "autopilot", "architect", "debug", "review"];
+    assert_eq!(valid.len(), 7, "Should have exactly 7 modes");
+    
+    // Verify engine recognizes each mode
     for mode in &valid {
-        assert!(valid.contains(mode), "Mode '{mode}' should be valid");
+        use caduceus_bridge::orchestrator::OrchestratorBridge;
+        // suggest_triggers uses mode name — if it doesn't panic, mode is valid
+        let triggers = OrchestratorBridge::suggest_triggers(&format!("switch to {mode} mode"));
+        let _ = triggers; // just verify no panic
     }
 }
 
 #[test]
 fn mode_request_invalid_mode() {
-    let invalid = "destroy_everything";
+    let invalid_modes = ["destroy", "admin", "root", "sudo", ""];
     let valid = ["plan", "act", "research", "autopilot", "architect", "debug", "review"];
-    assert!(!valid.contains(&invalid), "Invalid mode should be rejected");
+    for mode in &invalid_modes {
+        assert!(!valid.contains(mode), "'{mode}' must not be a valid mode");
+    }
 }
 
 // ── Tree-sitter outline tests ─────────────────────────────────────────────

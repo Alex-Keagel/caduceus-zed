@@ -97,7 +97,10 @@ impl CaduceusProjectWikiTool {
                 _ => return Err(format!("Invalid wiki page path: '{page}'")),
             }
         }
-        safe.set_extension("md");
+        // Append .md without replacing existing extensions (e.g., "setup.guide" → "setup.guide.md")
+        let mut name = safe.file_name().unwrap_or_default().to_os_string();
+        name.push(".md");
+        safe.set_file_name(name);
         Ok(safe)
     }
 
