@@ -422,7 +422,8 @@
   "allow_rewrap": "in_comments",
   // Controls whether edit predictions are shown immediately (true)
   // or manually by triggering `editor::ShowEditPrediction` (false).
-  "show_edit_predictions": true,
+  // Caduceus: edit predictions disabled (uses Copilot for agent, not inline predictions)
+  "show_edit_predictions": false,
   // Controls whether edit predictions are shown in a given language scope.
   // Example: ["string", "comment"]
   "edit_predictions_disabled_in": [],
@@ -737,7 +738,7 @@
     // Default width of the project panel.
     "default_width": 240,
     // Where to dock the project panel. Can be 'left' or 'right'.
-    "dock": "right",
+    "dock": "left",
     // Spacing between worktree entries in the project panel. Can be 'comfortable' or 'standard'.
     "entry_spacing": "comfortable",
     // Whether to show file icons in the project panel.
@@ -979,7 +980,7 @@
     // Whether to show the agent panel button in the status bar.
     "button": true,
     // Where to dock the agent panel. Can be 'left', 'right' or 'bottom'.
-    "dock": "left",
+    "dock": "right",
     // Whether the agent panel should use flexible (proportional) sizing.
     //
     // Default: true
@@ -1036,34 +1037,61 @@
     // patterns are matched independently against each path (source and
     // destination).
     "tool_permissions": {
-      // Global default permission when no tool-specific rules match.
-      // "allow" - Auto-approve without prompting
-      // "deny" - Auto-reject
-      // "confirm" - Always prompt (default)
+      // Caduceus: read-only tools auto-approve, write tools confirm
       "default": "confirm",
-      // Per-tool permission rules. Regex patterns match against tool input text.
-      // The per-tool "default" also applies to MCP tools.
-      // Each tool can have its own default and regex patterns.
       "tools": {
-        // "terminal": {
-        //   "default": "confirm",
-        //   "always_confirm": [
-        //     // Destructive git operations
-        //     { "pattern": "git\\s+(reset|clean)\\s+--hard" },
-        //     { "pattern": "git\\s+push\\s+(-f|--force)" },
-        //   ],
-        // },
-        // "edit_file": {
-        //   "default": "confirm",
-        //   "always_deny": [
-        //     // Secrets and credentials
-        //     { "pattern": "\\.env($|\\.)" },
-        //     { "pattern": "secrets?/" },
-        //     { "pattern": "\\.pem$" },
-        //     { "pattern": "\\.key$" },
-        //   ],
-        // },
-      },
+        "read_file": { "default": "allow" },
+        "find_path": { "default": "allow" },
+        "grep": { "default": "allow" },
+        "list_directory": { "default": "allow" },
+        "diagnostics": { "default": "allow" },
+        "now": { "default": "allow" },
+        "fetch": { "default": "allow" },
+        "search_web": { "default": "allow" },
+        "edit_file": {
+          "default": "confirm",
+          "always_allow": [
+            { "pattern": "\\.md$" },
+            { "pattern": "\\.txt$" },
+            { "pattern": "\\.json$" }
+          ]
+        },
+        "save_file": {
+          "default": "confirm",
+          "always_allow": [
+            { "pattern": "\\.md$" },
+            { "pattern": "\\.txt$" },
+            { "pattern": "\\.json$" }
+          ]
+        },
+        "create_directory": { "default": "allow" },
+        "caduceus_semantic_search": { "default": "allow" },
+        "caduceus_index": { "default": "allow" },
+        "caduceus_code_graph": { "default": "allow" },
+        "caduceus_git_read": { "default": "allow" },
+        "caduceus_memory_read": { "default": "allow" },
+        "caduceus_memory_write": { "default": "allow" },
+        "caduceus_dependency_scan": { "default": "allow" },
+        "caduceus_security_scan": { "default": "allow" },
+        "caduceus_error_analysis": { "default": "allow" },
+        "caduceus_mcp_security": { "default": "allow" },
+        "caduceus_prd": { "default": "allow" },
+        "caduceus_progress": { "default": "allow" },
+        "caduceus_telemetry": { "default": "allow" },
+        "caduceus_tree_sitter": { "default": "allow" },
+        "caduceus_conversation": { "default": "allow" },
+        "caduceus_marketplace": { "default": "allow" },
+        "caduceus_wiki": { "default": "allow" },
+        "caduceus_kanban": { "default": "allow" },
+        "caduceus_storage": { "default": "allow" },
+        "caduceus_checkpoint": { "default": "allow" },
+        "caduceus_task_tree": { "default": "allow" },
+        "caduceus_time_tracking": { "default": "allow" },
+        "caduceus_automations": { "default": "allow" },
+        "caduceus_background_agent": { "default": "allow" },
+        "caduceus_scaffold": { "default": "allow" },
+        "caduceus_policy": { "default": "allow" }
+      }
     },
     // When enabled, agent edits will be displayed in single-file editors for review
     "single_file_review": false,
