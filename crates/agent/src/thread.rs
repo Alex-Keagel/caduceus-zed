@@ -3,7 +3,7 @@ use crate::{
     CaduceusErrorAnalysisTool, CaduceusGitReadTool, CaduceusGitWriteTool,
     CaduceusIndexTool, CaduceusKanbanTool, CaduceusKillSwitchTool, CaduceusMarketplaceTool, CaduceusMcpSecurityTool,
     CaduceusMemoryReadTool, CaduceusMemoryWriteTool, CaduceusModeRequestTool,
-    CaduceusPolicyTool, CaduceusPrdTool,
+    CaduceusPolicyTool, CaduceusPrdTool, CaduceusProjectTool, CaduceusProjectWikiTool,
     CaduceusProgressTool, CaduceusScaffoldTool, CaduceusSecurityScanTool,
     CaduceusSemanticSearchTool, CaduceusStorageTool, CaduceusTaskTreeTool,
     CaduceusTelemetryTool, CaduceusTimeTrackingTool, CaduceusTreeSitterTool, CaduceusWikiTool,
@@ -1442,18 +1442,20 @@ impl Thread {
     }
 
     /// Caduceus: check if a tool is allowed in the current privilege ring.
-    /// Uses the engine's ToolAccess allowlist from modes.rs.
-    /// Ring 0 (Plan/Research/Architect/Review): read-only tools only
+    /// Ring 0 (Plan/Research/Architect/Review): read-only + documentation writes
     /// Ring 1 (Act/Debug): all tools with user approval
     /// Ring 2 (Autopilot): all tools, no approval
     ///
-    /// Agents can always:
-    /// - Use caduceus_mode_request to escalate (requires user approval)
-    /// - Spawn subagents (inherit parent mode)
+    /// Plan mode CAN write:
+    /// - .md, .json, .yaml, .txt files (plans, specs, wiki, configs)
+    /// - Caduceus wiki, memory, project, kanban, checkpoint tools
+    /// Plan mode CANNOT write:
+    /// - Code files (.rs, .py, .js, .ts, etc.)
+    /// - Terminal commands
     fn is_tool_allowed_in_current_mode(&self, tool_name: &str) -> bool {
         let mode = self.caduceus_mode.as_deref().unwrap_or("act");
 
-        // Mode escalation and subagent spawning are ALWAYS allowed
+        // Always allowed in any mode
         let always_allowed = [
             "caduceus_mode_request",
             "spawn_agent",
@@ -1465,36 +1467,40 @@ impl Thread {
         let read_only_modes = ["plan", "research", "architect", "review"];
 
         if read_only_modes.contains(&mode) {
-            // Ring 0: allowlist from engine (read-only tools + all Caduceus read tools)
             let allowed_tools = [
                 // Zed built-in read tools
                 "read_file", "find_path", "grep", "list_directory",
                 "diagnostics", "now", "fetch", "search_web", "open",
-                // Caduceus read tools
+                // Plan mode can write documentation via these tools:
+                "edit_file", "save_file", "create_directory",
+                // All Caduceus tools (they manage .caduceus/ state, not code)
                 "caduceus_semantic_search", "caduceus_index",
                 "caduceus_code_graph", "caduceus_tree_sitter",
                 "caduceus_git_read", "caduceus_memory_read",
+                "caduceus_memory_write",
                 "caduceus_dependency_scan", "caduceus_security_scan",
                 "caduceus_error_analysis", "caduceus_mcp_security",
                 "caduceus_prd", "caduceus_progress",
                 "caduceus_telemetry", "caduceus_conversation",
                 "caduceus_marketplace", "caduceus_wiki",
+                "caduceus_project_wiki", "caduceus_project",
                 "caduceus_task_tree", "caduceus_time_tracking",
-                "caduceus_policy",
+                "caduceus_policy", "caduceus_kanban",
+                "caduceus_checkpoint", "caduceus_storage",
+                "caduceus_automations", "caduceus_background_agent",
+                "caduceus_scaffold",
             ];
             let allowed = allowed_tools.contains(&tool_name);
             if !allowed {
                 log::warn!(
-                    "[caduceus] BLOCKED '{}' in {} mode (Ring 0). \
-                    Use caduceus_mode_request to escalate to Act/Autopilot.",
+                    "[caduceus] BLOCKED '{}' in {} mode. \
+                    Use caduceus_mode_request to escalate.",
                     tool_name, mode
                 );
             }
             allowed
         } else {
-            // Ring 1 (Act/Debug) and Ring 2 (Autopilot): all tools allowed
-            log::debug!("[caduceus] ALLOWED '{}' in {} mode", tool_name, mode);
-            true
+            true // Ring 1+ allows everything
         }
     }
 
@@ -1804,6 +1810,8 @@ impl Thread {
             self.add_tool(CaduceusStorageTool::new(project_root.clone()));
             self.add_tool(CaduceusCheckpointTool::new(project_root.clone()));
             self.add_tool(CaduceusWikiTool::new(project_root.clone()));
+            self.add_tool(CaduceusProjectTool::new(project_root.clone()));
+            self.add_tool(CaduceusProjectWikiTool::new(project_root.clone()));
             self.add_tool(CaduceusKanbanTool::new(project_root.clone(), engine));
             self.add_tool(CaduceusAutomationsTool::new(project_root.clone()));
             self.add_tool(CaduceusPolicyTool::new(project_root.clone()));
@@ -3263,13 +3271,15 @@ impl Thread {
         // Inject Caduceus mode prefix into system prompt
         let system_prompt = if let Some(mode) = &self.caduceus_mode {
             let mode_prefix = match mode.as_str() {
-                "plan" => "You are in PLAN mode. Analyze only — do NOT modify any files.\n\
+                "plan" => "You are in PLAN mode. You CAN write documentation files (.md, .json, .yaml, .txt) \
+— plans, specs, wiki pages, PRDs, architecture docs. \
+You CANNOT modify code files (.rs, .py, .js, .ts, etc.) or run terminal commands.\n\
 Output your plan as a numbered list with this format:\n\
 ## Plan\n\
 1. **[Action]** Description (tool: tool_name)\n\
 2. **[Action]** Description (tool: tool_name)\n\
 ...\n\
-Each step should say what you WOULD do, not what you ARE doing.\n\n",
+Write plans to .caduceus/wiki/ or .caduceus/ directory. Use caduceus_project_wiki to update the wiki.\n\n",
                 "act" => "You are in ACT mode. Execute code changes as requested. Each write operation requires user approval before proceeding.\n\n",
                 "research" => "You are in RESEARCH mode. Read-only exploration. Search the codebase, read files, and summarize your findings. Do NOT modify any files.\n\n",
                 "autopilot" => "You are in AUTOPILOT mode. Fully autonomous execution. Plan, implement, test, and commit changes without waiting for approval. Be thorough and verify your changes work before committing.\n\n",

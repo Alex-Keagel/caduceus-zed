@@ -18,6 +18,8 @@ mod caduceus_mode_request_tool;
 mod caduceus_memory_write_tool;
 mod caduceus_policy_tool;
 mod caduceus_prd_tool;
+mod caduceus_project_tool;
+mod caduceus_project_wiki_tool;
 mod caduceus_progress_tool;
 mod caduceus_scaffold_tool;
 mod caduceus_security_scan_tool;
@@ -84,6 +86,8 @@ pub use caduceus_mode_request_tool::*;
 pub use caduceus_memory_write_tool::*;
 pub use caduceus_policy_tool::*;
 pub use caduceus_prd_tool::*;
+pub use caduceus_project_tool::*;
+pub use caduceus_project_wiki_tool::*;
 pub use caduceus_progress_tool::*;
 pub use caduceus_scaffold_tool::*;
 pub use caduceus_security_scan_tool::*;
@@ -205,6 +209,8 @@ tools! {
     CaduceusMemoryWriteTool,
     CaduceusPolicyTool,
     CaduceusPrdTool,
+    CaduceusProjectTool,
+    CaduceusProjectWikiTool,
     CaduceusProgressTool,
     CaduceusScaffoldTool,
     CaduceusSecurityScanTool,
