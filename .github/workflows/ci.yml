@@ -1,0 +1,41 @@
+name: Caduceus CI
+
+on:
+  push:
+    branches: [caduceus-main]
+  pull_request:
+    branches: [caduceus-main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check & Test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check agent crate
+        run: cargo check -p agent -p agent_ui
+
+      - name: Test bridge
+        run: cargo test -p caduceus_bridge --test agent_tool_integration
+
+      - name: Check release build
+        run: cargo check --release -p zed --features gpui_platform/runtime_shaders
