@@ -120,10 +120,10 @@ impl AgentTool for CaduceusModeRequestTool {
 
             Ok(CaduceusModeRequestToolOutput::Success {
                 message: format!(
-                    "✅ Mode changed to **{}**. Reason: {}\n\n\
-                    The new mode takes effect on your next message. \
-                    Tool access has been updated according to the privilege ring.",
-                    input.mode, input.reason
+                    "📋 Mode change to **{}** has been noted. \
+                    To apply it, select '{}' from the profile dropdown in the input bar. \
+                    The mode change is not automatic — the user controls the active profile.",
+                    input.mode, input.mode
                 ),
             })
         })

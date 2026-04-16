@@ -1123,7 +1123,8 @@
           "caduceus_automations": true, "caduceus_background_agent": true,
           "caduceus_policy": true, "caduceus_conversation": true,
           "caduceus_marketplace": true, "caduceus_kill_switch": true,
-          "caduceus_mode_request": true
+          "caduceus_mode_request": true,
+          "caduceus_project": true
         }
       },
       "plan": {
@@ -1141,7 +1142,8 @@
           "caduceus_progress": true, "caduceus_wiki": true,
           "caduceus_telemetry": true, "caduceus_task_tree": true,
           "caduceus_conversation": true, "caduceus_marketplace": true,
-          "caduceus_policy": true, "caduceus_mode_request": true
+          "caduceus_policy": true, "caduceus_mode_request": true,
+          "caduceus_project": true
         }
       },
       "research": {
@@ -1155,7 +1157,8 @@
           "caduceus_code_graph": true, "caduceus_tree_sitter": true,
           "caduceus_git_read": true, "caduceus_memory_read": true,
           "caduceus_dependency_scan": true, "caduceus_wiki": true,
-          "caduceus_conversation": true, "caduceus_mode_request": true
+          "caduceus_conversation": true, "caduceus_mode_request": true,
+          "caduceus_project": true
         }
       },
       "autopilot": {
@@ -1182,7 +1185,8 @@
           "caduceus_automations": true, "caduceus_background_agent": true,
           "caduceus_policy": true, "caduceus_conversation": true,
           "caduceus_marketplace": true, "caduceus_kill_switch": true,
-          "caduceus_mode_request": true
+          "caduceus_mode_request": true,
+          "caduceus_project": true
         }
       },
       "architect": {
@@ -1200,7 +1204,8 @@
           "caduceus_wiki": true, "caduceus_telemetry": true,
           "caduceus_task_tree": true, "caduceus_conversation": true,
           "caduceus_marketplace": true, "caduceus_policy": true,
-          "caduceus_mode_request": true
+          "caduceus_mode_request": true,
+          "caduceus_project": true
         }
       },
       "debug": {
@@ -1220,7 +1225,8 @@
           "caduceus_error_analysis": true, "caduceus_security_scan": true,
           "caduceus_checkpoint": true, "caduceus_wiki": true,
           "caduceus_telemetry": true, "caduceus_policy": true,
-          "caduceus_mode_request": true
+          "caduceus_mode_request": true,
+          "caduceus_project": true
         }
       },
       "review": {
@@ -1236,7 +1242,8 @@
           "caduceus_dependency_scan": true, "caduceus_security_scan": true,
           "caduceus_error_analysis": true, "caduceus_prd": true,
           "caduceus_wiki": true, "caduceus_conversation": true,
-          "caduceus_policy": true, "caduceus_mode_request": true
+          "caduceus_policy": true, "caduceus_mode_request": true,
+          "caduceus_project": true
         }
       }
     },

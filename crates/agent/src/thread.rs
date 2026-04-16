@@ -1471,8 +1471,6 @@ impl Thread {
                 // Zed built-in read tools
                 "read_file", "find_path", "grep", "list_directory",
                 "diagnostics", "now", "fetch", "search_web", "open",
-                // Plan mode can write documentation via these tools:
-                "edit_file", "save_file", "create_directory",
                 // All Caduceus tools (they manage .caduceus/ state, not code)
                 "caduceus_semantic_search", "caduceus_index",
                 "caduceus_code_graph", "caduceus_tree_sitter",
@@ -1506,7 +1504,7 @@ impl Thread {
 
     /// Caduceus: smart context management using engine compaction pipeline.
     /// Triggers based on both message count AND estimated token usage.
-    /// Uses engine's ContextZone (Green/Yellow/Red) for decisions.
+    /// Uses engine's ContextZone (Green/Yellow/Orange/Red/Critical) for decisions.
     fn auto_compact_context(&mut self, cx: &mut Context<Self>) {
         use caduceus_bridge::orchestrator::{estimate_tokens, ContextZone};
 
@@ -1541,22 +1539,23 @@ impl Thread {
         // Decide whether to compact
         let (should_compact, keep_recent) = match zone {
             ContextZone::Green => {
-                // Under 60% — only compact if message count is very high
                 if msg_count > 60 { (true, 20) } else { (false, 0) }
             }
             ContextZone::Yellow => {
-                // 60-80% — compact aggressively
                 log::info!("[caduceus] Context zone YELLOW ({:.0}% full, {} msgs)", fill_pct, msg_count);
-                if msg_count > 20 { (true, 15) } else { (false, 0) }
+                if msg_count > 30 { (true, 15) } else { (false, 0) }
+            }
+            ContextZone::Orange => {
+                log::info!("[caduceus] Context zone ORANGE ({:.0}% full, {} msgs)", fill_pct, msg_count);
+                if msg_count > 15 { (true, 10) } else { (false, 0) }
             }
             ContextZone::Red => {
-                // 80%+ — emergency compact
-                log::warn!("[caduceus] Context zone RED ({:.0}% full, {} msgs) — emergency compact", fill_pct, msg_count);
+                log::warn!("[caduceus] Context zone RED ({:.0}% full, {} msgs)", fill_pct, msg_count);
                 if msg_count > 10 { (true, 8) } else { (false, 0) }
             }
-            _ => {
-                // Fallback: simple message count threshold
-                if msg_count > 40 { (true, 10) } else { (false, 0) }
+            ContextZone::Critical => {
+                log::error!("[caduceus] Context zone CRITICAL ({:.0}% full, {} msgs) — EMERGENCY compact", fill_pct, msg_count);
+                if msg_count > 5 { (true, 5) } else { (false, 0) }
             }
         };
 

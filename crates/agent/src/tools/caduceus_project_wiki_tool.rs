@@ -85,12 +85,24 @@ impl CaduceusProjectWikiTool {
         self.project_root.join(".caduceus/wiki")
     }
 
-    fn page_path(&self, page: &str) -> PathBuf {
-        self.wiki_root().join(format!("{page}.md"))
+    fn page_path(&self, page: &str) -> Result<PathBuf, String> {
+        // Reject path traversal
+        if page.contains("..") {
+            return Err("Invalid page path: must not contain '..'".to_string());
+        }
+        let path = self.wiki_root().join(format!("{page}.md"));
+        // Verify it's still under wiki root
+        let wiki_root = self.wiki_root();
+        let canonical = path.canonicalize().unwrap_or(path.clone());
+        let root_canonical = wiki_root.canonicalize().unwrap_or(wiki_root);
+        if !canonical.starts_with(&root_canonical) {
+            return Err("Invalid page path: escapes wiki directory".to_string());
+        }
+        Ok(path)
     }
 
     fn read_page(&self, page: &str) -> Result<String, String> {
-        let path = self.page_path(page);
+        let path = self.page_path(page)?;
         if !path.exists() {
             return Err(format!("Page '{page}' not found"));
         }
@@ -99,7 +111,7 @@ impl CaduceusProjectWikiTool {
     }
 
     fn write_page(&self, page: &str, content: &str) -> Result<(), String> {
-        let path = self.page_path(page);
+        let path = self.page_path(page)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create wiki directory: {e}"))?;
