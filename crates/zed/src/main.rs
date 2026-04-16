@@ -13,7 +13,8 @@ use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
 use client::{Client, ProxySettings, RefreshLlmTokenListener, UserStore, parse_zed_link};
 use collab_ui::channel_view::ChannelView;
 use collections::HashMap;
-use crashes::InitCrashHandler;
+// CADUCEUS: crashes crate removed
+// use crashes::InitCrashHandler;
 use db::kvp::{GlobalKeyValueStore, KeyValueStore};
 use editor::Editor;
 use extension::ExtensionHostProxy;
@@ -185,17 +186,19 @@ fn main() {
     let args = Args::parse();
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
-    #[cfg(not(target_os = "windows"))]
-    if let Some(socket) = &args.askpass {
-        askpass::main(socket);
-        return;
-    }
+    // CADUCEUS: askpass crate removed
+    // #[cfg(not(target_os = "windows"))]
+    // if let Some(socket) = &args.askpass {
+    //     askpass::main(socket);
+    //     return;
+    // }
 
+    // CADUCEUS: crashes crate removed
     // `zed --crash-handler` Makes zed operate in minidump crash handler mode
-    if let Some(socket) = &args.crash_handler {
-        crashes::crash_server(socket.as_path());
-        return;
-    }
+    // if let Some(socket) = &args.crash_handler {
+    //     crashes::crash_server(socket.as_path());
+    //     return;
+    // }
 
     #[cfg(target_os = "windows")]
     if args.record_etw_trace {
@@ -257,16 +260,17 @@ fn main() {
         paths::set_custom_data_dir(dir);
     }
 
-    #[cfg(target_os = "windows")]
-    match util::get_zed_cli_path() {
-        Ok(path) => askpass::set_askpass_program(path),
-        Err(err) => {
-            eprintln!("Error: {}", err);
-            if std::option_env!("ZED_BUNDLE").is_some() {
-                process::exit(1);
-            }
-        }
-    }
+    // CADUCEUS: askpass crate removed
+    // #[cfg(target_os = "windows")]
+    // match util::get_zed_cli_path() {
+    //     Ok(path) => askpass::set_askpass_program(path),
+    //     Err(err) => {
+    //         eprintln!("Error: {}", err);
+    //         if std::option_env!("ZED_BUNDLE").is_some() {
+    //             process::exit(1);
+    //         }
+    //     }
+    // }
 
     let file_errors = init_paths();
     if !file_errors.is_empty() {
@@ -336,27 +340,27 @@ fn main() {
         KeyValueStore::from_app_db(&app_db),
     ));
 
-    crashes::init(
-        InitCrashHandler {
-            session_id,
-            // strip the build and channel information from the version string, we send them separately
-            zed_version: semver::Version::new(
-                app_version.major,
-                app_version.minor,
-                app_version.patch,
-            )
-            .to_string(),
-            binary: "zed".to_string(),
-            release_channel: release_channel::RELEASE_CHANNEL_NAME.clone(),
-            commit_sha: app_commit_sha
-                .as_ref()
-                .map(|sha| sha.full())
-                .unwrap_or_else(|| "no sha".to_owned()),
-        },
-        |task| {
-            app.background_executor().spawn(task).detach();
-        },
-    );
+    // CADUCEUS: crashes crate removed
+    // crashes::init(
+    //     InitCrashHandler {
+    //         session_id,
+    //         zed_version: semver::Version::new(
+    //             app_version.major,
+    //             app_version.minor,
+    //             app_version.patch,
+    //         )
+    //         .to_string(),
+    //         binary: "zed".to_string(),
+    //         release_channel: release_channel::RELEASE_CHANNEL_NAME.clone(),
+    //         commit_sha: app_commit_sha
+    //             .as_ref()
+    //             .map(|sha| sha.full())
+    //             .unwrap_or_else(|| "no sha".to_owned()),
+    //     },
+    //     |task| {
+    //         app.background_executor().spawn(task).detach();
+    //     },
+    // );
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
@@ -571,10 +575,11 @@ fn main() {
             let telemetry = telemetry.clone();
             move |_, evt: &client::user::Event, _| match evt {
                 client::user::Event::PrivateUserInfoUpdated => {
-                    crashes::set_user_info(crashes::UserInfo {
-                        metrics_id: telemetry.metrics_id().map(|s| s.to_string()),
-                        is_staff: telemetry.is_staff(),
-                    });
+                    // CADUCEUS: crashes crate removed
+                    // crashes::set_user_info(crashes::UserInfo {
+                    //     metrics_id: telemetry.metrics_id().map(|s| s.to_string()),
+                    //     is_staff: telemetry.is_staff(),
+                    // });
                 }
                 _ => {}
             }
@@ -718,7 +723,8 @@ fn main() {
         });
         vim::init(cx);
         terminal_view::init(cx);
-        journal::init(app_state.clone(), cx);
+        // CADUCEUS: journal crate removed
+        // journal::init(app_state.clone(), cx);
         encoding_selector::init(cx);
         language_selector::init(cx);
         line_ending_selector::init(cx);
@@ -731,7 +737,8 @@ fn main() {
         // collab_ui::init(&app_state, cx);
         git_ui::init(cx);
         git_graph::init(cx);
-        feedback::init(cx);
+        // CADUCEUS: feedback crate removed
+        // feedback::init(cx);
         markdown_preview::init(cx);
         csv_preview::init(cx);
         svg_preview::init(cx);

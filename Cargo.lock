@@ -4316,27 +4316,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crashes"
-version = "0.1.0"
-dependencies = [
- "cfg-if",
- "crash-handler",
- "futures 0.3.32",
- "log",
- "mach2 0.5.0",
- "minidumper",
- "parking_lot",
- "paths",
- "release_channel",
- "serde",
- "serde_json",
- "smol",
- "system_specs",
- "windows 0.61.3",
- "zstd",
-]
-
-[[package]]
 name = "crc"
 version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6060,48 +6039,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eval_cli"
-version = "0.1.0"
-dependencies = [
- "acp_thread",
- "agent",
- "agent-client-protocol",
- "agent_ui",
- "anyhow",
- "clap",
- "client",
- "ctrlc",
- "db",
- "debug_adapter_extension",
- "env_logger 0.11.8",
- "extension",
- "feature_flags",
- "fs",
- "futures 0.3.32",
- "gpui",
- "gpui_platform",
- "gpui_tokio",
- "language",
- "language_extension",
- "language_model",
- "language_models",
- "languages",
- "node_runtime",
- "paths",
- "project",
- "prompt_store",
- "release_channel",
- "reqwest_client",
- "serde",
- "serde_json",
- "settings",
- "shellexpand",
- "terminal_view",
- "util",
- "watch",
-]
-
-[[package]]
 name = "eval_utils"
 version = "0.1.0"
 dependencies = [
@@ -6221,33 +6158,6 @@ dependencies = [
  "wasm-encoder 0.221.3",
  "wasmparser 0.221.3",
  "ztracing",
-]
-
-[[package]]
-name = "extension_cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "cloud_api_types",
- "env_logger 0.11.8",
- "extension",
- "fs",
- "gpui_platform",
- "language",
- "log",
- "reqwest_client",
- "serde",
- "serde_json",
- "serde_json_lenient",
- "settings_content",
- "snippet_provider",
- "task",
- "theme_settings",
- "tokio",
- "toml 0.8.23",
- "tree-sitter",
- "wasmtime",
 ]
 
 [[package]]
@@ -6445,18 +6355,6 @@ name = "feature_flags"
 version = "0.1.0"
 dependencies = [
  "gpui",
-]
-
-[[package]]
-name = "feedback"
-version = "0.1.0"
-dependencies = [
- "gpui",
- "system_specs",
- "urlencoding",
- "util",
- "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -9374,21 +9272,6 @@ checksum = "9afb3de4395d6b3e67a780b6de64b51c978ecf11cb9a462c66be7d4ca9039d33"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
-]
-
-[[package]]
-name = "journal"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "editor",
- "gpui",
- "log",
- "serde",
- "settings",
- "shellexpand",
- "workspace",
 ]
 
 [[package]]
@@ -14788,7 +14671,6 @@ dependencies = [
  "clock",
  "collections",
  "crash-handler",
- "crashes",
  "dap_adapters",
  "debug_adapter_extension",
  "editor",
@@ -22543,7 +22425,6 @@ dependencies = [
  "agent_ui",
  "anyhow",
  "ashpd",
- "askpass",
  "assets",
  "audio",
  "auto_update",
@@ -22565,7 +22446,6 @@ dependencies = [
  "copilot",
  "copilot_chat",
  "copilot_ui",
- "crashes",
  "csv_preview",
  "dap_adapters",
  "db",
@@ -22584,7 +22464,6 @@ dependencies = [
  "extension_host",
  "extensions_ui",
  "feature_flags",
- "feedback",
  "file_finder",
  "fs",
  "futures 0.3.32",
@@ -22602,7 +22481,6 @@ dependencies = [
  "inspector_ui",
  "install_cli",
  "itertools 0.14.0",
- "journal",
  "json_schema_store",
  "keymap_editor",
  "language",

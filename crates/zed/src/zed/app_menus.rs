@@ -312,7 +312,8 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                         url: "https://zed.dev/docs".into(),
                     },
                 ),
-                MenuItem::action("Caduceus Repository", feedback::OpenZedRepo),
+                // CADUCEUS: feedback crate removed
+                // MenuItem::action("Caduceus Repository", feedback::OpenZedRepo),
                 MenuItem::action(
                     "Caduceus Twitter",
                     super::OpenBrowser {

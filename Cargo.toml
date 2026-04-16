@@ -40,7 +40,6 @@ members = [
     "crates/context_server",
     "crates/copilot",
     "crates/copilot_chat",
-    "crates/crashes",
     "crates/credentials_provider",
     "crates/csv_preview",
     "crates/dap",
@@ -64,16 +63,12 @@ members = [
     "crates/encoding_selector",
     "crates/env_var",
     "crates/etw_tracing",
-    "crates/eval_cli",
     "crates/eval_utils",
     "crates/explorer_command_injector",
     "crates/extension",
-    "crates/extension_api",
-    "crates/extension_cli",
     "crates/extension_host",
     "crates/extensions_ui",
     "crates/feature_flags",
-    "crates/feedback",
     "crates/file_finder",
     "crates/file_icons",
     "crates/fs",
@@ -105,7 +100,6 @@ members = [
     "crates/image_viewer",
     "crates/inspector_ui",
     "crates/install_cli",
-    "crates/journal",
     "crates/json_schema_store",
     "crates/keymap_editor",
     "crates/language",
@@ -322,7 +316,6 @@ context_server = { path = "crates/context_server" }
 copilot = { path = "crates/copilot" }
 copilot_chat = { path = "crates/copilot_chat" }
 copilot_ui = { path = "crates/copilot_ui" }
-crashes = { path = "crates/crashes" }
 credentials_provider = { path = "crates/credentials_provider" }
 crossbeam = "0.8.4"
 csv_preview = { path = "crates/csv_preview"}
@@ -346,7 +339,6 @@ extension = { path = "crates/extension" }
 extension_host = { path = "crates/extension_host" }
 extensions_ui = { path = "crates/extensions_ui" }
 feature_flags = { path = "crates/feature_flags" }
-feedback = { path = "crates/feedback" }
 file_finder = { path = "crates/file_finder" }
 file_icons = { path = "crates/file_icons" }
 fs = { path = "crates/fs" }
@@ -380,7 +372,6 @@ edit_prediction_ui = { path = "crates/edit_prediction_ui" }
 edit_prediction_context = { path = "crates/edit_prediction_context" }
 inspector_ui = { path = "crates/inspector_ui" }
 install_cli = { path = "crates/install_cli" }
-journal = { path = "crates/journal" }
 json_schema_store = { path = "crates/json_schema_store" }
 keymap_editor = { path = "crates/keymap_editor" }
 language = { path = "crates/language" }
@@ -940,7 +931,6 @@ file_icons = { codegen-units = 1 }
 image_viewer = { codegen-units = 1 }
 edit_prediction_ui = { codegen-units = 1 }
 install_cli = { codegen-units = 1 }
-journal = { codegen-units = 1 }
 json_schema_store = { codegen-units = 1 }
 lmstudio = { codegen-units = 1 }
 menu = { codegen-units = 1 }

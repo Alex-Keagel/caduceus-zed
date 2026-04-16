@@ -29,8 +29,9 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if let Some(socket) = &cli.crash_handler {
-        crashes::crash_server(socket.as_path());
+    if let Some(_socket) = &cli.crash_handler {
+        // CADUCEUS: crashes crate removed
+        // crashes::crash_server(socket.as_path());
         return Ok(());
     }
 

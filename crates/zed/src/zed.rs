@@ -467,7 +467,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         if let Some(specs) = window.gpu_specs() {
             log::info!("Using GPU: {:?}", specs);
             show_software_emulation_warning_if_needed(specs.clone(), window, cx);
-            crashes::set_gpu_info(specs);
+            // CADUCEUS: crashes crate removed
+            // crashes::set_gpu_info(specs);
         }
 
         let edit_prediction_menu_handle = PopoverMenuHandle::default();
@@ -5041,7 +5042,7 @@ mod tests {
                 "edit_prediction",
                 "editor",
                 "encoding_selector",
-                "feedback",
+                // "feedback", // CADUCEUS: removed
                 "file_finder",
                 "git",
                 "git_graph",
@@ -5053,7 +5054,7 @@ mod tests {
                 "icon_theme_selector",
                 "image_viewer",
                 "inline_assistant",
-                "journal",
+                // "journal", // CADUCEUS: removed
                 "keymap_editor",
                 "keystroke_input",
                 "language_selector",

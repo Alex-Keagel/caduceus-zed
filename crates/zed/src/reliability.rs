@@ -19,6 +19,39 @@ use util::ResultExt;
 
 use crate::STARTUP_TIME;
 
+// CADUCEUS: local copies of crashes types (crashes crate removed)
+#[derive(Debug, Deserialize, Clone)]
+struct CrashInfo {
+    init: CrashInitInfo,
+    panic: Option<CrashPanic>,
+    minidump_error: Option<String>,
+    gpus: Vec<system_specs::GpuInfo>,
+    active_gpu: Option<system_specs::GpuSpecs>,
+    user_info: Option<CrashUserInfo>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct CrashInitInfo {
+    #[allow(dead_code)]
+    session_id: String,
+    zed_version: String,
+    binary: String,
+    release_channel: String,
+    commit_sha: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct CrashPanic {
+    message: String,
+    span: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct CrashUserInfo {
+    metrics_id: Option<String>,
+    is_staff: Option<bool>,
+}
+
 const MAX_HANG_TRACES: usize = 3;
 
 pub fn init(client: Arc<Client>, cx: &mut App) {
@@ -264,7 +297,7 @@ async fn upload_minidump(
     client: Arc<Client>,
     endpoint: &str,
     minidump: Vec<u8>,
-    metadata: &crashes::CrashInfo,
+    metadata: &CrashInfo,
 ) -> Result<()> {
     let mut form = Form::new()
         .part(
