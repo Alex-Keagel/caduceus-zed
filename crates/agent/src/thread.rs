@@ -3202,6 +3202,55 @@ Each step should say what you WOULD do, not what you ARE doing.\n\n",
         } else {
             system_prompt
         };
+
+        // Inject Caduceus tool guidance so the LLM knows when to use them
+        let caduceus_guidance = {
+            let mut guidance = String::new();
+
+            // Load project instructions from engine (AGENTS.md, .caduceus/instructions.md, etc.)
+            if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
+                let root = worktree.read(cx).abs_path().to_path_buf();
+                let orch = caduceus_bridge::orchestrator::OrchestratorBridge::new(&root);
+                if let Ok(instructions) = orch.load_instructions() {
+                    if !instructions.system_prompt.is_empty() {
+                        guidance.push_str("\n\n## Project Instructions\n");
+                        let truncated: String = instructions.system_prompt.chars().take(2000).collect();
+                        guidance.push_str(&truncated);
+                        if instructions.system_prompt.len() > 2000 {
+                            guidance.push_str("\n...(truncated)");
+                        }
+                    }
+                }
+
+                // Load wiki context (project overview, README summary)
+                if let Some(overview) = caduceus_bridge::memory::get(&root, "wiki:project-overview") {
+                    guidance.push_str("\n\n## Project Overview (from wiki)\n");
+                    let truncated: String = overview.chars().take(500).collect();
+                    guidance.push_str(&truncated);
+                }
+            }
+
+            // Caduceus tool usage guidance
+            guidance.push_str("\n\n## Caduceus Tools\n\
+You have access to powerful Caduceus tools. USE THEM proactively:\n\
+\n\
+- `caduceus_semantic_search` — find code by meaning (better than grep for concepts)\n\
+- `caduceus_wiki` — read project wiki (auto-generated overview, README, git context)\n\
+- `caduceus_tree_sitter` — get file outline before reading whole files\n\
+- `caduceus_code_graph` — find related code (neighbors, impact analysis)\n\
+- `caduceus_git_read` — branch, status, diff, log (no terminal needed)\n\
+- `caduceus_kanban` — create/track tasks with dependencies\n\
+- `caduceus_checkpoint` — save snapshots before making changes\n\
+- `caduceus_security_scan` — check for secrets/vulnerabilities before committing\n\
+- `caduceus_memory_read/write` — persist decisions across sessions\n\
+- `caduceus_prd` — parse requirements into structured tasks\n\
+\n\
+**Always prefer Caduceus tools over manual alternatives.**\n");
+
+            guidance
+        };
+
+        let system_prompt = format!("{system_prompt}{caduceus_guidance}");
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
             content: vec![system_prompt.into()],
