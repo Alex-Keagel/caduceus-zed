@@ -223,7 +223,7 @@ impl AgentTool for CaduceusTreeSitterTool {
 
                     Ok(CaduceusTreeSitterToolOutput::Outline { path, entries })
                 }
-                TreeSitterOperation::SymbolsAt { path, line, column } => {
+                TreeSitterOperation::SymbolsAt { path, line, column: _ } => {
                     let content = std::fs::read_to_string(&path).map_err(|e| {
                         CaduceusTreeSitterToolOutput::Error {
                             error: format!("Cannot read {path}: {e}"),
@@ -242,7 +242,7 @@ impl AgentTool for CaduceusTreeSitterTool {
                 }
                 TreeSitterOperation::Languages => {
                     let lang_names: Vec<String> = cx
-                        .update(|cx| {
+                        .update(|_cx| {
                             languages
                                 .language_names()
                                 .into_iter()

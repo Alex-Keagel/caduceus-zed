@@ -3,6 +3,7 @@ use crate::{
     agent_configuration::configure_context_server_modal::default_markdown_style,
 };
 use std::cell::RefCell;
+use std::time::Instant;
 
 use acp_thread::{ContentBlock, PlanEntry};
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
@@ -334,6 +335,7 @@ pub struct ThreadView {
     pub generating_indicator_in_list: bool,
     pub history: Option<Entity<ThreadHistory>>,
     pub _history_subscription: Option<Subscription>,
+    checkpoint_count_cache: (Instant, Option<usize>),
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -576,6 +578,7 @@ impl ThreadView {
             show_codex_windows_warning,
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
+            checkpoint_count_cache: (Instant::now() - std::time::Duration::from_secs(60), None),
         };
 
         this.sync_generating_indicator(cx);
@@ -3548,30 +3551,43 @@ impl ThreadView {
         )
     }
 
-    fn render_checkpoint_status(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let project = self.project.upgrade()?;
-        let project_read = project.read(cx);
-        let worktree = project_read.worktrees(cx).next()?;
-        let root = worktree.read(cx).abs_path();
-        let checkpoint_dir = root.join(".caduceus").join("checkpoints");
+    fn render_checkpoint_status(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
-        if checkpoint_dir.exists() {
-            let count = std::fs::read_dir(&checkpoint_dir).ok()?.count();
-            if count > 0 {
-                return Some(
-                    div()
-                        .id("checkpoint-status")
-                        .px_1()
-                        .child(
-                            Label::new(format!("\u{1F4CC} {} checkpoints", count))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .tooltip(Tooltip::text("Caduceus safety checkpoints")),
-                );
-            }
-        }
-        None
+        let count = if self.checkpoint_count_cache.0.elapsed() < CACHE_TTL {
+            self.checkpoint_count_cache.1
+        } else {
+            let project = self.project.upgrade()?;
+            let project_read = project.read(cx);
+            let worktree = project_read.worktrees(cx).next()?;
+            let root = worktree.read(cx).abs_path();
+            let checkpoint_dir = root.join(".caduceus").join("checkpoints");
+
+            let new_count = if checkpoint_dir.exists() {
+                std::fs::read_dir(&checkpoint_dir)
+                    .ok()
+                    .map(|entries| entries.count())
+                    .filter(|&c| c > 0)
+            } else {
+                None
+            };
+
+            self.checkpoint_count_cache = (Instant::now(), new_count);
+            new_count
+        };
+
+        let count = count?;
+        Some(
+            div()
+                .id("checkpoint-status")
+                .px_1()
+                .child(
+                    Label::new(format!("\u{1F4CC} {} checkpoints", count))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .tooltip(Tooltip::text("Caduceus safety checkpoints")),
+        )
     }
 
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {

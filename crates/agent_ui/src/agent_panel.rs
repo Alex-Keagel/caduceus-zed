@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use acp_thread::{AcpThread, MentionUri, ThreadStatus};
@@ -764,6 +764,30 @@ pub struct AgentPanel {
     _worktree_creation_task: Option<Task<()>>,
     show_trust_workspace_message: bool,
     _base_view_observation: Option<Subscription>,
+    caduceus_stats_cache: CaduceusStatsCache,
+}
+
+/// Cached Caduceus stats to avoid synchronous filesystem I/O on every render.
+/// Refreshes at most every 5 seconds.
+#[derive(Clone, Debug)]
+struct CaduceusStatsCache {
+    automation_count: usize,
+    background_agent_count: usize,
+    evolved_skill_count: usize,
+    security_score: f64,
+    last_refresh: Instant,
+}
+
+impl Default for CaduceusStatsCache {
+    fn default() -> Self {
+        Self {
+            automation_count: 0,
+            background_agent_count: 0,
+            evolved_skill_count: 0,
+            security_score: 0.0,
+            last_refresh: Instant::now() - Duration::from_secs(60),
+        }
+    }
 }
 
 impl AgentPanel {
@@ -1105,6 +1129,7 @@ impl AgentPanel {
                 cx,
             )),
             _base_view_observation: None,
+            caduceus_stats_cache: CaduceusStatsCache::default(),
         };
 
         // Initial sync of agent servers from extensions
@@ -4003,7 +4028,7 @@ impl AgentPanel {
             })
     }
 
-    fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_server_store = self.project.read(cx).agent_server_store().clone();
         let has_visible_worktrees = self.project.read(cx).visible_worktrees(cx).next().is_some();
         let focus_handle = self.focus_handle(cx);
@@ -4258,10 +4283,11 @@ impl AgentPanel {
 
         let show_history_menu = self.has_history_for_selected_agent(cx);
         let agent_v2_enabled = agent_v2_enabled(cx);
-        let automation_count = self.automations_count(cx);
-        let background_agent_count = self.background_agents_count(cx);
-        let evolved_skill_count = self.evolved_skills_count(cx);
-        let security_score = self.security_compliance_score(cx);
+        self.refresh_caduceus_stats(cx);
+        let automation_count = self.caduceus_stats_cache.automation_count;
+        let background_agent_count = self.caduceus_stats_cache.background_agent_count;
+        let evolved_skill_count = self.caduceus_stats_cache.evolved_skill_count;
+        let security_score = self.caduceus_stats_cache.security_score;
         let is_empty_state = !self.active_thread_has_messages(cx);
 
         let is_in_history_or_config = self.is_history_or_configuration_visible();
@@ -4516,71 +4542,69 @@ impl AgentPanel {
             })
     }
 
-    // NOTE: Synchronous FS read. Acceptable for local filesystems.
-    // TODO: Cache for network-mounted workspaces.
-    fn automations_count(&self, cx: &Context<Self>) -> usize {
+    /// Refreshes the cached Caduceus stats if the cache is stale (>5 seconds old).
+    /// Avoids synchronous filesystem I/O on every render frame.
+    fn refresh_caduceus_stats(&mut self, cx: &Context<Self>) {
+        const CACHE_TTL: Duration = Duration::from_secs(5);
+        if self.caduceus_stats_cache.last_refresh.elapsed() < CACHE_TTL {
+            return;
+        }
+
         if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
             let root = worktree.read(cx).abs_path();
+
+            // Automations count
             let path = root.join(".caduceus/automations.json");
-            if path.exists() {
-                if let Ok(json) = std::fs::read_to_string(&path) {
-                    if let Ok(autos) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
-                        return autos.len();
-                    }
-                }
-            }
-        }
-        0
-    }
+            self.caduceus_stats_cache.automation_count = if path.exists() {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(&json).ok())
+                    .map_or(0, |v| v.len())
+            } else {
+                0
+            };
 
-    // NOTE: Synchronous FS read. Acceptable for local filesystems.
-    // TODO: Cache for network-mounted workspaces.
-    fn background_agents_count(&self, cx: &Context<Self>) -> usize {
-        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
-            let root = worktree.read(cx).abs_path();
+            // Background agents count
             let dir = root.join(".caduceus/agents");
-            if dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(&dir) {
-                    return entries
-                        .flatten()
-                        .filter(|e| {
-                            e.path()
-                                .extension()
-                                .map_or(false, |ext| ext == "json")
-                        })
-                        .count();
-                }
-            }
-        }
-        0
-    }
+            self.caduceus_stats_cache.background_agent_count = if dir.exists() {
+                std::fs::read_dir(&dir)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .filter(|e| {
+                                e.path()
+                                    .extension()
+                                    .map_or(false, |ext| ext == "json")
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0)
+            } else {
+                0
+            };
 
-    // NOTE: Synchronous FS read. Acceptable for local filesystems.
-    // TODO: Cache for network-mounted workspaces.
-    fn evolved_skills_count(&self, cx: &Context<Self>) -> usize {
-        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
-            let root = worktree.read(cx).abs_path();
+            // Evolved skills count
             let path = root.join(".caduceus/evolved_skills.json");
-            if path.exists() {
-                if let Ok(json) = std::fs::read_to_string(&path) {
-                    if let Ok(skills) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
-                        return skills.len();
-                    }
-                }
-            }
-        }
-        0
-    }
+            self.caduceus_stats_cache.evolved_skill_count = if path.exists() {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(&json).ok())
+                    .map_or(0, |v| v.len())
+            } else {
+                0
+            };
 
-    // NOTE: Synchronous FS read. Acceptable for local filesystems.
-    // TODO: Cache for network-mounted workspaces.
-    fn security_compliance_score(&self, cx: &Context<Self>) -> f64 {
-        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
-            let root = worktree.read(cx).abs_path();
+            // Security compliance score
             let bridge = caduceus_bridge::security::PermissionsBridge::new(root.as_ref());
-            return bridge.compliance_score();
+            self.caduceus_stats_cache.security_score = bridge.compliance_score();
+        } else {
+            self.caduceus_stats_cache.automation_count = 0;
+            self.caduceus_stats_cache.background_agent_count = 0;
+            self.caduceus_stats_cache.evolved_skill_count = 0;
+            self.caduceus_stats_cache.security_score = 0.0;
         }
-        0.0
+
+        self.caduceus_stats_cache.last_refresh = Instant::now();
     }
 
     fn render_worktree_creation_status(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
