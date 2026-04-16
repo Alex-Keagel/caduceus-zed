@@ -4,6 +4,7 @@ mod caduceus_automations_tool;
 mod caduceus_background_agent_tool;
 mod caduceus_checkpoint_tool;
 mod caduceus_code_graph_tool;
+mod caduceus_cross_git_tool;
 mod caduceus_cross_search_tool;
 mod caduceus_conversation_tool;
 mod caduceus_dependency_scan_tool;
@@ -78,6 +79,7 @@ pub use caduceus_background_agent_tool::*;
 pub use caduceus_checkpoint_tool::*;
 pub use caduceus_code_graph_tool::*;
 pub use caduceus_conversation_tool::*;
+pub use caduceus_cross_git_tool::*;
 pub use caduceus_cross_search_tool::*;
 pub use caduceus_dependency_scan_tool::*;
 pub use caduceus_error_analysis_tool::*;
@@ -205,6 +207,7 @@ tools! {
     CaduceusCheckpointTool,
     CaduceusCodeGraphTool,
     CaduceusConversationTool,
+    CaduceusCrossGitTool,
     CaduceusCrossSearchTool,
     CaduceusDependencyScanTool,
     CaduceusErrorAnalysisTool,

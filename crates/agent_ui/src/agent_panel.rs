@@ -4683,8 +4683,9 @@ impl AgentPanel {
             self.caduceus_stats_cache.api_count = if apis_path.exists() {
                 std::fs::read_to_string(&apis_path)
                     .ok()
-                    .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(&json).ok())
-                    .map_or(0, |v| v.len())
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                    .and_then(|v| v["apis"].as_array().map(|a| a.len()))
+                    .unwrap_or(0)
             } else {
                 0
             };

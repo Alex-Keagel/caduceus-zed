@@ -315,3 +315,41 @@ impl AgentTool for CaduceusProjectTool {
         })
     }
 }
+
+/// Shared project config loader — single source of truth.
+/// All tools that need project.json should call this instead of reimplementing.
+pub fn load_project_config(project_root: &std::path::Path) -> Result<ProjectConfig, String> {
+    let path = project_root.join(".caduceus").join("project.json");
+    if !path.exists() {
+        return Err("No project.json found. Use `caduceus_project create` first.".into());
+    }
+    let data = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read project.json: {e}"))?;
+    serde_json::from_str(&data).map_err(|e| format!("Failed to parse project.json: {e}"))
+}
+
+/// Shared repo path resolver with containment check.
+pub fn resolve_repo_path(
+    project_root: &std::path::Path,
+    repo_path: &str,
+) -> Result<std::path::PathBuf, String> {
+    let p = std::path::PathBuf::from(repo_path);
+    let resolved = if p.is_absolute() {
+        p
+    } else {
+        project_root.join(repo_path)
+    };
+    let forbidden_prefixes = [
+        "/etc", "/var", "/usr", "/bin", "/sbin", "/root", "/proc", "/sys", "/dev",
+    ];
+    let path_str = resolved.to_string_lossy();
+    for prefix in &forbidden_prefixes {
+        if path_str.starts_with(prefix) {
+            return Err(format!(
+                "Repo path '{}' points to a system directory",
+                repo_path
+            ));
+        }
+    }
+    Ok(resolved)
+}

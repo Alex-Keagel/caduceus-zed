@@ -64,13 +64,7 @@ impl CaduceusArchitectTool {
     }
 
     fn load_project_config(&self) -> Result<ProjectConfig, String> {
-        let path = self.project_root.join(".caduceus/project.json");
-        if !path.exists() {
-            return Err("No project.json found. Use `caduceus_project create` first.".into());
-        }
-        let data = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read project.json: {e}"))?;
-        serde_json::from_str(&data).map_err(|e| format!("Failed to parse project.json: {e}"))
+        super::caduceus_project_tool::load_project_config(&self.project_root)
     }
 
     fn load_api_registry(&self) -> ApiRegistry {
@@ -84,13 +78,22 @@ impl CaduceusArchitectTool {
             .unwrap_or(ApiRegistry { apis: Vec::new() })
     }
 
-    fn resolve_repo_path(&self, repo_path: &str) -> PathBuf {
-        let p = PathBuf::from(repo_path);
-        if p.is_absolute() {
-            p
-        } else {
-            self.project_root.join(repo_path)
-        }
+    fn resolve_repo_path(&self, repo_path: &str) -> Result<PathBuf, String> {
+        super::caduceus_project_tool::resolve_repo_path(&self.project_root, repo_path)
+    }
+
+    fn sanitize_mermaid_id(s: &str) -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect()
+    }
+
+    fn sanitize_mermaid_label(s: &str) -> String {
+        s.replace('"', "'")
+            .replace('[', "(")
+            .replace(']', ")")
+            .replace(';', ",")
+            .replace('\n', " ")
     }
 
     fn generate_diagram(&self, config: &ProjectConfig) -> String {
@@ -99,28 +102,32 @@ impl CaduceusArchitectTool {
         let mut mermaid = String::from("```mermaid\ngraph LR\n");
 
         for (name, repo) in &config.repos {
-            let label = format!("{} - {}", name, repo.language);
-            mermaid.push_str(&format!("  {name}[\"{label}\"]\n"));
+            let id = Self::sanitize_mermaid_id(name);
+            let label = Self::sanitize_mermaid_label(&format!("{} - {}", name, repo.language));
+            mermaid.push_str(&format!("  {id}[\"{label}\"]\n"));
         }
 
         for rel in &config.relationships {
-            let sanitized_type = rel.relationship_type.replace(' ', "_");
+            let from = Self::sanitize_mermaid_id(&rel.from);
+            let to = Self::sanitize_mermaid_id(&rel.to);
+            let sanitized_type = Self::sanitize_mermaid_label(&rel.relationship_type.replace(' ', "_"));
             mermaid.push_str(&format!(
                 "  {} -->|{}| {}\n",
-                rel.from, sanitized_type, rel.to
+                from, sanitized_type, to
             ));
         }
 
         // Add API nodes
         for api in &registry.apis {
-            let api_node = api.name.replace('/', "_").replace('.', "_");
-            let label = format!(
+            let api_node = Self::sanitize_mermaid_id(&api.name.replace('/', "_").replace('.', "_"));
+            let label = Self::sanitize_mermaid_label(&format!(
                 "{} ({})",
                 api.title.as_deref().unwrap_or(&api.name),
                 api.schema_type
-            );
+            ));
+            let repo_id = Self::sanitize_mermaid_id(&api.repo);
             mermaid.push_str(&format!("  {api_node}((\"{label}\"))\n"));
-            mermaid.push_str(&format!("  {} --- {api_node}\n", api.repo));
+            mermaid.push_str(&format!("  {} --- {api_node}\n", repo_id));
         }
 
         mermaid.push_str("```\n");
@@ -128,10 +135,14 @@ impl CaduceusArchitectTool {
     }
 
     fn compute_health(&self, config: &ProjectConfig) -> String {
+        let registry = self.load_api_registry();
         let mut text = String::from("# Project Health Report\n\n");
 
         for (name, repo) in &config.repos {
-            let repo_path = self.resolve_repo_path(&repo.path);
+            let repo_path = match self.resolve_repo_path(&repo.path) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             let mut score = 0u32;
             let mut checks = Vec::new();
 
@@ -169,7 +180,6 @@ impl CaduceusArchitectTool {
             }
 
             // Check for API docs
-            let registry = self.load_api_registry();
             let has_api = registry.apis.iter().any(|a| a.repo == *name);
             if has_api {
                 score += 20;

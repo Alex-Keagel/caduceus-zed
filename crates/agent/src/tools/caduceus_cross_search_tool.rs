@@ -113,22 +113,11 @@ impl CaduceusCrossSearchTool {
     }
 
     fn load_project_config(&self) -> Result<ProjectConfig, String> {
-        let path = self.project_root.join(".caduceus/project.json");
-        if !path.exists() {
-            return Err("No project.json found. Use `caduceus_project create` first.".into());
-        }
-        let data = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read project.json: {e}"))?;
-        serde_json::from_str(&data).map_err(|e| format!("Failed to parse project.json: {e}"))
+        super::caduceus_project_tool::load_project_config(&self.project_root)
     }
 
-    fn resolve_repo_path(&self, repo_path: &str) -> PathBuf {
-        let p = PathBuf::from(repo_path);
-        if p.is_absolute() {
-            p
-        } else {
-            self.project_root.join(repo_path)
-        }
+    fn resolve_repo_path(&self, repo_path: &str) -> Result<PathBuf, String> {
+        super::caduceus_project_tool::resolve_repo_path(&self.project_root, repo_path)
     }
 
     fn count_index_chunks(&self, repo_path: &PathBuf) -> usize {
@@ -198,7 +187,13 @@ impl AgentTool for CaduceusCrossSearchTool {
                 CrossSearchOperation::Search { query } => {
                     let mut all_results = Vec::new();
                     for (name, repo) in &config.repos {
-                        let repo_path = self.resolve_repo_path(&repo.path);
+                        let repo_path = match self.resolve_repo_path(&repo.path) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::warn!("[caduceus] Skipping repo {name}: {e}");
+                                continue;
+                            }
+                        };
                         let engine =
                             caduceus_bridge::engine::CaduceusEngine::new(&repo_path);
                         match engine.semantic_search(&query, 5).await {
@@ -234,12 +229,17 @@ impl AgentTool for CaduceusCrossSearchTool {
                     let repos: Vec<RepoIndexInfo> = config
                         .repos
                         .iter()
-                        .map(|(name, repo)| {
-                            let repo_path = self.resolve_repo_path(&repo.path);
-                            RepoIndexInfo {
-                                name: name.clone(),
-                                path: repo.path.clone(),
-                                chunk_count: self.count_index_chunks(&repo_path),
+                        .filter_map(|(name, repo)| {
+                            match self.resolve_repo_path(&repo.path) {
+                                Ok(repo_path) => Some(RepoIndexInfo {
+                                    name: name.clone(),
+                                    path: repo.path.clone(),
+                                    chunk_count: self.count_index_chunks(&repo_path),
+                                }),
+                                Err(e) => {
+                                    log::warn!("[caduceus] Skipping repo {name}: {e}");
+                                    None
+                                }
                             }
                         })
                         .collect();
@@ -251,7 +251,9 @@ impl AgentTool for CaduceusCrossSearchTool {
                             error: format!("Repo '{name}' not found in project.json"),
                         }
                     })?;
-                    let repo_path = self.resolve_repo_path(&repo.path);
+                    let repo_path = self.resolve_repo_path(&repo.path).map_err(|e| {
+                        CaduceusCrossSearchToolOutput::Error { error: e }
+                    })?;
                     let engine =
                         caduceus_bridge::engine::CaduceusEngine::new(&repo_path);
                     match engine.index_directory(&repo_path).await {

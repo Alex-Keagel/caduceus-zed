@@ -179,14 +179,7 @@ impl CaduceusProjectWikiTool {
     }
 
     fn load_project_config(&self) -> Result<ProjectConfig, String> {
-        let path = self.project_root.join(".caduceus/project.json");
-        if !path.exists() {
-            return Err("No project.json found. Create a project config first.".into());
-        }
-        let data = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read project.json: {e}"))?;
-        serde_json::from_str(&data)
-            .map_err(|e| format!("Failed to parse project.json: {e}"))
+        super::caduceus_project_tool::load_project_config(&self.project_root)
     }
 
     fn auto_populate(&self) -> Result<String, String> {

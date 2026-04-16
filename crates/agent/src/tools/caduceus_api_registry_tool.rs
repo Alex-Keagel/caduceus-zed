@@ -81,13 +81,7 @@ impl CaduceusApiRegistryTool {
     }
 
     fn load_project_config(&self) -> Result<ProjectConfig, String> {
-        let path = self.project_root.join(".caduceus/project.json");
-        if !path.exists() {
-            return Err("No project.json found. Use `caduceus_project create` first.".into());
-        }
-        let data = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read project.json: {e}"))?;
-        serde_json::from_str(&data).map_err(|e| format!("Failed to parse project.json: {e}"))
+        super::caduceus_project_tool::load_project_config(&self.project_root)
     }
 
     fn load_registry(&self) -> Result<ApiRegistry, String> {
@@ -111,13 +105,8 @@ impl CaduceusApiRegistryTool {
         std::fs::write(&path, data).map_err(|e| format!("Failed to write apis.json: {e}"))
     }
 
-    fn resolve_repo_path(&self, repo_path: &str) -> PathBuf {
-        let p = PathBuf::from(repo_path);
-        if p.is_absolute() {
-            p
-        } else {
-            self.project_root.join(repo_path)
-        }
+    fn resolve_repo_path(&self, repo_path: &str) -> Result<PathBuf, String> {
+        super::caduceus_project_tool::resolve_repo_path(&self.project_root, repo_path)
     }
 
     fn scan_directory_for_apis(dir: &Path, repo_name: &str) -> Vec<ApiEntry> {
@@ -315,7 +304,13 @@ impl AgentTool for CaduceusApiRegistryTool {
 
                     let mut all_apis = Vec::new();
                     for (name, repo) in &config.repos {
-                        let repo_path = self.resolve_repo_path(&repo.path);
+                        let repo_path = match self.resolve_repo_path(&repo.path) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::warn!("[caduceus] Skipping repo {name}: {e}");
+                                continue;
+                            }
+                        };
                         if repo_path.exists() {
                             let apis = Self::scan_directory_for_apis(&repo_path, name);
                             all_apis.extend(apis);

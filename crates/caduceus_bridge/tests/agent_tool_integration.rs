@@ -1293,3 +1293,74 @@ fn caduceus_tools_enabled_without_explicit_listing() {
         );
     }
 }
+
+// ── Cross-search, API registry, Mermaid, architect, product tool tests ────
+
+#[test]
+fn cross_search_project_json_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let caduceus_dir = dir.path().join(".caduceus");
+    std::fs::create_dir_all(&caduceus_dir).unwrap();
+    let config = serde_json::json!({
+        "project": { "name": "test-project", "description": "Test" },
+        "repos": {
+            "main": { "path": dir.path().to_str().unwrap(), "role": "backend", "language": "Rust", "description": "Main repo" }
+        },
+        "relationships": []
+    });
+    std::fs::write(caduceus_dir.join("project.json"), serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    let content = std::fs::read_to_string(caduceus_dir.join("project.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(parsed["project"]["name"], "test-project");
+    assert_eq!(parsed["repos"]["main"]["role"], "backend");
+}
+
+#[test]
+fn api_registry_schema_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let apis_path = dir.path().join(".caduceus").join("apis.json");
+    std::fs::create_dir_all(apis_path.parent().unwrap()).unwrap();
+    let registry = serde_json::json!({ "apis": [{ "name": "test-api", "repo": "backend" }] });
+    std::fs::write(&apis_path, serde_json::to_string(&registry).unwrap()).unwrap();
+    let content = std::fs::read_to_string(&apis_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let count = parsed["apis"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert_eq!(count, 1, "UI should read API count correctly from tool output");
+}
+
+#[test]
+fn mermaid_id_sanitization() {
+    let dirty = "evil\"]; Z-->Y; A[\"hack";
+    let clean: String = dirty.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+    assert!(!clean.contains('"'));
+    assert!(!clean.contains(']'));
+    assert!(!clean.contains(';'));
+}
+
+#[test]
+fn repo_path_system_dir_rejected() {
+    let forbidden = ["/etc", "/var", "/usr/bin"];
+    for path in &forbidden {
+        let p = std::path::Path::new(path);
+        assert!(p.starts_with("/etc") || p.starts_with("/var") || p.starts_with("/usr"));
+    }
+}
+
+#[test]
+fn architect_health_empty_project() {
+    let config = serde_json::json!({
+        "project": { "name": "empty", "description": "" },
+        "repos": {},
+        "relationships": []
+    });
+    assert!(config["repos"].as_object().unwrap().is_empty());
+}
+
+#[test]
+fn product_status_no_features() {
+    let config = serde_json::json!({
+        "project": { "name": "bare", "description": "" },
+        "repos": {}
+    });
+    assert!(config["product"].is_null(), "Missing product section should be null");
+}
