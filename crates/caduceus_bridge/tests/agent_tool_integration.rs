@@ -1696,13 +1696,18 @@ fn compaction_pipeline_runs_on_messages() {
         CompactMessage::new(role, format!("Message content number {}. This is a test of the compaction pipeline to see if it reduces token count.", i))
     }).collect();
     let mut groups = build_message_groups(&messages);
-    let original_tokens: usize = groups.iter().map(|g| g.total_tokens()).sum();
-    assert!(original_tokens > 500, "Precondition: messages must exceed budget for pipeline to act");
+    let before: usize = groups.iter().map(|g| g.total_tokens()).sum();
+    assert!(before > 500, "Precondition: messages ({} tokens) must exceed budget (500)", before);
     let result = pipeline.run(&mut groups);
+    let after: usize = groups.iter().filter(|g| !g.excluded).map(|g| g.total_tokens()).sum();
     assert!(
         !result.strategies_applied.is_empty(),
-        "Pipeline must apply at least one strategy when input ({} tokens) exceeds budget (500)",
-        original_tokens
+        "Pipeline must apply at least one strategy"
+    );
+    assert!(
+        result.total_removed_tokens > 0 || after < before,
+        "Pipeline should reduce tokens: before={}, after={}, removed={}",
+        before, after, result.total_removed_tokens
     );
 }
 
@@ -1789,6 +1794,23 @@ fn context_command_case_insensitive() {
     assert_eq!(ContextCommand::parse("BREAKDOWN"), ContextCommand::Breakdown);
     assert_eq!(ContextCommand::parse("Compact"), ContextCommand::Compact);
     assert_eq!(ContextCommand::parse("ZONE"), ContextCommand::Zone);
+}
+
+#[test]
+fn context_command_edge_cases() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    // "compact --strategy" with no strategy name → falls back to Compact
+    assert_eq!(ContextCommand::parse("compact --strategy"), ContextCommand::Compact);
+    // "unpin" with no label → falls back to Overview
+    assert_eq!(ContextCommand::parse("unpin"), ContextCommand::Overview);
+    // "pin" with spaced content preserves spaces
+    assert_eq!(
+        ContextCommand::parse("pin rule keep this spaced"),
+        ContextCommand::Pin {
+            label: "rule".to_string(),
+            content: "keep this spaced".to_string(),
+        }
+    );
 }
 
 // ── Compaction Strategy Names ──────────────────────────────────────────────────
@@ -2277,15 +2299,25 @@ fn context_zone_negative_percentage() {
 #[test]
 fn estimate_tokens_whitespace_only() {
     use caduceus_bridge::orchestrator::estimate_tokens;
+    // "   \n\t\n   " = 9 bytes → ceil(9 / 3.75 * 1.1) = ceil(2.64) = 3
     let tokens = estimate_tokens("   \n\t\n   ");
-    assert!(tokens > 0, "Whitespace has bytes, should produce tokens");
+    assert_eq!(tokens, 3, "9-byte whitespace should estimate to 3 tokens");
+}
+
+#[test]
+fn estimate_tokens_matches_documented_heuristic() {
+    use caduceus_bridge::orchestrator::estimate_tokens;
+    // Verify all token estimates match the documented heuristic: ceil(len / 3.75 * 1.1)
+    for input in ["", "Hello world", "   \n\t\n   ", "こんにちは世界", "fn main() {}"] {
+        let expected = ((input.len() as f64 / 3.75) * 1.1).ceil() as u32;
+        assert_eq!(estimate_tokens(input), expected, "input={:?} len={}", input, input.len());
+    }
 }
 
 #[test]
 fn dual_model_compactor_zero_original() {
     use caduceus_bridge::orchestrator::compaction::DualModelCompactor;
     let compactor = DualModelCompactor::new("gpt-4", "gpt-3.5");
-    let savings = compactor.estimate_savings(0, 100);
-    // Division by zero protection
-    assert!(savings.is_finite(), "Should handle zero-token original without panic");
+    // Zero original → 0.0 savings (early return, no division by zero)
+    assert_eq!(compactor.estimate_savings(0, 100), 0.0);
 }
