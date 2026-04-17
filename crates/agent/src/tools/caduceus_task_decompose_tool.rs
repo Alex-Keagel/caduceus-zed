@@ -150,7 +150,7 @@ impl AgentTool for CaduceusTaskDecomposeTool {
                         });
                     }
                     let prev_incomplete = dag.tasks().values().any(|t| !t.status.is_terminal());
-                    *dag = TaskDAG::new();
+                    let mut new_dag = TaskDAG::new();
                     let mut errors = Vec::new();
                     for task in &tasks {
                         if task.id.len() > MAX_TASK_ID_LEN || task.title.len() > MAX_TASK_TITLE_LEN {
@@ -169,16 +169,18 @@ impl AgentTool for CaduceusTaskDecomposeTool {
                         if !task.depends_on.is_empty() {
                             td = td.depends_on(task.depends_on.clone());
                         }
-                        if let Err(e) = dag.add_task(td) {
+                        if let Err(e) = new_dag.add_task(td) {
                             errors.push(format!("{}: {}", task.id, e));
                         }
                     }
+                    // Only swap if no errors — preserves old DAG on failure
                     if errors.is_empty() {
+                        *dag = new_dag;
                         let prefix = if prev_incomplete { "⚠️ Previous DAG had incomplete tasks. " } else { "" };
                         format!("{prefix}✅ Created DAG with {} tasks. Use `ready` to see executable tasks.", tasks.len())
                     } else {
-                        format!("⚠️ Created DAG with {} tasks, {} errors:\n{}", 
-                            tasks.len(), errors.len(), errors.join("\n"))
+                        format!("❌ DAG creation failed ({} errors). Previous DAG preserved.\n{}", 
+                            errors.len(), errors.join("\n"))
                     }
                 }
                 TaskDecomposeOperation::Ready => {
