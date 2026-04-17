@@ -16,7 +16,12 @@ impl CrdtBridge {
 
     /// Open or create a CRDT buffer for a file.
     pub fn open_buffer(&mut self, file_path: &str, initial_text: Option<&str>) -> BufferInfo {
-        if !self.buffers.contains_key(file_path) {
+        // Validate path — reject traversal attempts
+        if file_path.contains("..") || std::path::Path::new(file_path).is_absolute() {
+            log::warn!("[caduceus] CRDT open_buffer: rejected unsafe path '{}'", file_path);
+            let buffer = Buffer::new();
+            self.buffers.insert(file_path.to_string(), buffer);
+        } else if !self.buffers.contains_key(file_path) {
             let buffer = match initial_text {
                 Some(text) => Buffer::with_text(text),
                 None => match std::fs::read_to_string(file_path) {

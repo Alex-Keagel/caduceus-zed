@@ -224,7 +224,10 @@ impl AgentTool for CaduceusCrossSearchTool {
                         }
                     }
                     all_results
-                        .sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                        .sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or_else(|| {
+                            // NaN scores pushed to end
+                            if a.score.is_nan() { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
+                        }));
                     all_results.truncate(10);
                     Ok(CaduceusCrossSearchToolOutput::SearchResults {
                         results: all_results,
