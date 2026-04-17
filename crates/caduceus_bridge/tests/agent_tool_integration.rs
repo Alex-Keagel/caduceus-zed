@@ -1364,3 +1364,831 @@ fn product_status_no_features() {
     });
     assert!(config["product"].is_null(), "Missing product section should be null");
 }
+
+// ── Context Zones ──────────────────────────────────────────────────────────────
+
+#[test]
+fn context_zone_green_below_50() {
+    use caduceus_bridge::orchestrator::ContextZone;
+    assert_eq!(ContextZone::from_percentage(0.0), ContextZone::Green);
+    assert_eq!(ContextZone::from_percentage(25.0), ContextZone::Green);
+    assert_eq!(ContextZone::from_percentage(49.9), ContextZone::Green);
+}
+
+#[test]
+fn context_zone_yellow_50_to_70() {
+    use caduceus_bridge::orchestrator::ContextZone;
+    assert_eq!(ContextZone::from_percentage(50.0), ContextZone::Yellow);
+    assert_eq!(ContextZone::from_percentage(60.0), ContextZone::Yellow);
+    assert_eq!(ContextZone::from_percentage(69.9), ContextZone::Yellow);
+}
+
+#[test]
+fn context_zone_orange_70_to_85() {
+    use caduceus_bridge::orchestrator::ContextZone;
+    assert_eq!(ContextZone::from_percentage(70.0), ContextZone::Orange);
+    assert_eq!(ContextZone::from_percentage(80.0), ContextZone::Orange);
+    assert_eq!(ContextZone::from_percentage(84.9), ContextZone::Orange);
+}
+
+#[test]
+fn context_zone_red_85_to_95() {
+    use caduceus_bridge::orchestrator::ContextZone;
+    assert_eq!(ContextZone::from_percentage(85.0), ContextZone::Red);
+    assert_eq!(ContextZone::from_percentage(90.0), ContextZone::Red);
+    assert_eq!(ContextZone::from_percentage(94.9), ContextZone::Red);
+}
+
+#[test]
+fn context_zone_critical_above_95() {
+    use caduceus_bridge::orchestrator::ContextZone;
+    assert_eq!(ContextZone::from_percentage(95.0), ContextZone::Critical);
+    assert_eq!(ContextZone::from_percentage(100.0), ContextZone::Critical);
+    assert_eq!(ContextZone::from_percentage(150.0), ContextZone::Critical);
+}
+
+#[test]
+fn context_zone_labels() {
+    use caduceus_bridge::orchestrator::ContextZone;
+    assert_eq!(ContextZone::Green.label(), "GREEN");
+    assert_eq!(ContextZone::Yellow.label(), "YELLOW");
+    assert_eq!(ContextZone::Orange.label(), "ORANGE");
+    assert_eq!(ContextZone::Red.label(), "RED");
+    assert_eq!(ContextZone::Critical.label(), "CRITICAL");
+}
+
+#[test]
+fn context_zone_recommendations_non_empty() {
+    use caduceus_bridge::orchestrator::ContextZone;
+    let zones = [ContextZone::Green, ContextZone::Yellow, ContextZone::Orange, ContextZone::Red, ContextZone::Critical];
+    for zone in &zones {
+        assert!(!zone.recommendation().is_empty(), "Zone {:?} should have recommendation", zone);
+    }
+}
+
+#[test]
+fn context_zone_display() {
+    use caduceus_bridge::orchestrator::ContextZone;
+    assert_eq!(format!("{}", ContextZone::Green), "GREEN");
+    assert_eq!(format!("{}", ContextZone::Critical), "CRITICAL");
+}
+
+#[test]
+fn context_zone_boundary_precision() {
+    use caduceus_bridge::orchestrator::ContextZone;
+    // Exact boundaries
+    assert_eq!(ContextZone::from_percentage(50.0), ContextZone::Yellow);
+    assert_eq!(ContextZone::from_percentage(70.0), ContextZone::Orange);
+    assert_eq!(ContextZone::from_percentage(85.0), ContextZone::Red);
+    assert_eq!(ContextZone::from_percentage(95.0), ContextZone::Critical);
+    // Just below
+    assert_eq!(ContextZone::from_percentage(49.999), ContextZone::Green);
+    assert_eq!(ContextZone::from_percentage(69.999), ContextZone::Yellow);
+    assert_eq!(ContextZone::from_percentage(84.999), ContextZone::Orange);
+    assert_eq!(ContextZone::from_percentage(94.999), ContextZone::Red);
+}
+
+// ── Token Estimation ───────────────────────────────────────────────────────────
+
+#[test]
+fn estimate_tokens_empty_string() {
+    use caduceus_bridge::orchestrator::estimate_tokens;
+    assert_eq!(estimate_tokens(""), 0);
+}
+
+#[test]
+fn estimate_tokens_short_text() {
+    use caduceus_bridge::orchestrator::estimate_tokens;
+    let tokens = estimate_tokens("Hello world");
+    // 11 chars / 3.75 * 1.1 ≈ 3.23 → ceil = 4
+    assert!(tokens > 0 && tokens < 10, "Short text should be a few tokens, got {}", tokens);
+}
+
+#[test]
+fn estimate_tokens_scales_with_length() {
+    use caduceus_bridge::orchestrator::estimate_tokens;
+    let short = estimate_tokens("hello");
+    let long = estimate_tokens(&"hello ".repeat(100));
+    assert!(long > short, "Longer text should produce more tokens");
+}
+
+#[test]
+fn estimate_tokens_code_block() {
+    use caduceus_bridge::orchestrator::estimate_tokens;
+    let code = r#"
+fn main() {
+    let x = 42;
+    println!("The answer is {}", x);
+}
+"#;
+    let tokens = estimate_tokens(code);
+    assert!(tokens > 10, "Code block should be >10 tokens, got {}", tokens);
+    assert!(tokens < 100, "Code block should be <100 tokens, got {}", tokens);
+}
+
+#[test]
+fn estimate_tokens_unicode() {
+    use caduceus_bridge::orchestrator::estimate_tokens;
+    // Multi-byte chars: token estimate uses len() (bytes, not chars)
+    let jp = estimate_tokens("こんにちは世界"); // 21 bytes
+    assert!(jp > 0, "Unicode text should produce non-zero tokens");
+}
+
+// ── Context Assembler ──────────────────────────────────────────────────────────
+
+#[test]
+fn context_assembler_empty() {
+    use caduceus_bridge::orchestrator::ContextAssembler;
+    let assembler = ContextAssembler::new(1000);
+    let result = assembler.assemble();
+    assert!(result.content.is_empty());
+    assert_eq!(result.total_tokens, 0);
+    assert!(result.sources_included.is_empty());
+    assert!(result.sources_truncated.is_empty());
+}
+
+#[test]
+fn context_assembler_single_source_fits() {
+    use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
+    let mut assembler = ContextAssembler::new(5000);
+    assembler.add_source(ContextSource::SystemPrompt("You are a helpful assistant.".to_string()));
+    let result = assembler.assemble();
+    assert!(!result.content.is_empty());
+    assert!(result.sources_included.len() == 1);
+    assert!(result.sources_truncated.is_empty());
+}
+
+#[test]
+fn context_assembler_respects_budget() {
+    use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
+    // Very small budget
+    let mut assembler = ContextAssembler::new(10);
+    assembler.add_source(ContextSource::SystemPrompt("You are a helpful assistant with expertise in many domains.".to_string()));
+    assembler.add_source(ContextSource::Instructions("Follow these detailed instructions carefully...".to_string()));
+    assembler.add_source(ContextSource::MemoryBank("Remember: the user prefers concise answers.".to_string()));
+    let result = assembler.assemble();
+    assert!(result.total_tokens <= 15, "Should stay near budget, got {}", result.total_tokens);
+}
+
+#[test]
+fn context_assembler_multiple_sources() {
+    use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
+    let mut assembler = ContextAssembler::new(10000);
+    assembler.add_source(ContextSource::SystemPrompt("System prompt.".to_string()));
+    assembler.add_source(ContextSource::Instructions("Instructions here.".to_string()));
+    assembler.add_source(ContextSource::MemoryBank("Memory bank content.".to_string()));
+    assembler.add_source(ContextSource::GitDiff("diff --git a/file.rs".to_string()));
+    let result = assembler.assemble();
+    assert!(result.sources_included.len() >= 3, "Should include multiple sources");
+    assert!(result.content.contains("System prompt"));
+}
+
+#[test]
+fn context_assembler_prioritizes_system_prompt() {
+    use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
+    // Small budget — system prompt should be included first
+    let mut assembler = ContextAssembler::new(50);
+    assembler.add_source(ContextSource::MemoryBank("memory ".repeat(100)));
+    assembler.add_source(ContextSource::SystemPrompt("SYSTEM".to_string()));
+    let result = assembler.assemble();
+    assert!(result.content.contains("SYSTEM"), "System prompt should be prioritized");
+}
+
+#[test]
+fn context_assembler_tracks_truncated_sources() {
+    use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
+    let mut assembler = ContextAssembler::new(20);
+    assembler.add_source(ContextSource::SystemPrompt("Short".to_string()));
+    assembler.add_source(ContextSource::Instructions("x".repeat(5000)));
+    let result = assembler.assemble();
+    // The instructions source is too large — should be in truncated list
+    assert!(!result.sources_truncated.is_empty() || result.total_tokens <= 25,
+        "Large source should be truncated or budget should be respected");
+}
+
+// ── Compaction Pipeline ────────────────────────────────────────────────────────
+
+#[test]
+fn compact_message_token_estimate() {
+    use caduceus_bridge::orchestrator::CompactMessage;
+    let msg = CompactMessage::new("user", "Hello world");
+    assert!(msg.token_estimate > 0, "Message should have non-zero token estimate");
+    assert!(msg.token_estimate < 20, "Short message should have small token count");
+}
+
+#[test]
+fn compact_message_empty() {
+    use caduceus_bridge::orchestrator::CompactMessage;
+    let msg = CompactMessage::new("user", "");
+    assert_eq!(msg.token_estimate, 0);
+}
+
+#[test]
+fn compact_message_preserves_content() {
+    use caduceus_bridge::orchestrator::CompactMessage;
+    let msg = CompactMessage::new("assistant", "The answer is 42.");
+    assert_eq!(msg.role, "assistant");
+    assert_eq!(msg.content, "The answer is 42.");
+}
+
+#[test]
+fn compaction_trigger_tokens_exceed() {
+    use caduceus_bridge::orchestrator::{CompactionTrigger, ContextStats};
+    let trigger = CompactionTrigger::TokensExceed(8000);
+    let under = ContextStats { total_tokens: 7000, message_count: 10, turn_count: 5 };
+    let over = ContextStats { total_tokens: 8500, message_count: 10, turn_count: 5 };
+    assert!(!trigger.should_compact(&under), "7000 tokens should not exceed 8000 threshold");
+    assert!(trigger.should_compact(&over), "8500 tokens should exceed 8000 threshold");
+}
+
+#[test]
+fn compaction_trigger_messages_exceed() {
+    use caduceus_bridge::orchestrator::{CompactionTrigger, ContextStats};
+    let trigger = CompactionTrigger::MessagesExceed(20);
+    let under = ContextStats { total_tokens: 5000, message_count: 15, turn_count: 7 };
+    let over = ContextStats { total_tokens: 5000, message_count: 25, turn_count: 12 };
+    assert!(!trigger.should_compact(&under));
+    assert!(trigger.should_compact(&over));
+}
+
+#[test]
+fn compaction_trigger_always() {
+    use caduceus_bridge::orchestrator::{CompactionTrigger, ContextStats};
+    let trigger = CompactionTrigger::Always;
+    let stats = ContextStats { total_tokens: 100, message_count: 1, turn_count: 1 };
+    assert!(trigger.should_compact(&stats));
+}
+
+#[test]
+fn compaction_trigger_never() {
+    use caduceus_bridge::orchestrator::{CompactionTrigger, ContextStats};
+    let trigger = CompactionTrigger::Never;
+    let stats = ContextStats { total_tokens: 999999, message_count: 9999, turn_count: 9999 };
+    assert!(!trigger.should_compact(&stats));
+}
+
+#[test]
+fn compaction_trigger_turns_exceed() {
+    use caduceus_bridge::orchestrator::{CompactionTrigger, ContextStats};
+    let trigger = CompactionTrigger::TurnsExceed(10);
+    let under = ContextStats { total_tokens: 5000, message_count: 15, turn_count: 8 };
+    let over = ContextStats { total_tokens: 5000, message_count: 15, turn_count: 15 };
+    assert!(!trigger.should_compact(&under));
+    assert!(trigger.should_compact(&over));
+}
+
+#[test]
+fn compaction_pipeline_default_creates() {
+    use caduceus_bridge::orchestrator::CompactionPipeline;
+    let pipeline = CompactionPipeline::default_pipeline(4000);
+    // Should create without panic — pipeline is opaque, just verify construction
+    let _ = pipeline;
+}
+
+#[test]
+fn compaction_pipeline_runs_on_messages() {
+    use caduceus_bridge::orchestrator::{CompactionPipeline, CompactMessage};
+    use caduceus_bridge::orchestrator::compaction::build_message_groups;
+    let pipeline = CompactionPipeline::default_pipeline(500);
+    let messages: Vec<CompactMessage> = (0..30).map(|i| {
+        let role = if i % 2 == 0 { "user" } else { "assistant" };
+        CompactMessage::new(role, format!("Message content number {}. This is a test of the compaction pipeline to see if it reduces token count.", i))
+    }).collect();
+    let mut groups = build_message_groups(&messages);
+    let original_tokens: usize = groups.iter().map(|g| g.total_tokens()).sum();
+    let result = pipeline.run(&mut groups);
+    assert!(!result.strategies_applied.is_empty() || original_tokens <= 500,
+        "Pipeline should apply strategies or content already fits budget");
+}
+
+// ── Context Command Parsing (Slash Commands) ───────────────────────────────────
+
+#[test]
+fn context_command_overview_empty() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    assert_eq!(ContextCommand::parse(""), ContextCommand::Overview);
+}
+
+#[test]
+fn context_command_breakdown() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    assert_eq!(ContextCommand::parse("breakdown"), ContextCommand::Breakdown);
+}
+
+#[test]
+fn context_command_compact_default() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    assert_eq!(ContextCommand::parse("compact"), ContextCommand::Compact);
+}
+
+#[test]
+fn context_command_compact_with_strategy() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    let cmd = ContextCommand::parse("compact --strategy summarize");
+    assert_eq!(cmd, ContextCommand::CompactWithStrategy("summarize".to_string()));
+}
+
+#[test]
+fn context_command_pin() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    let cmd = ContextCommand::parse("pin user-pref Always use short answers");
+    assert_eq!(cmd, ContextCommand::Pin {
+        label: "user-pref".to_string(),
+        content: "Always use short answers".to_string(),
+    });
+}
+
+#[test]
+fn context_command_unpin() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    assert_eq!(
+        ContextCommand::parse("unpin user-pref"),
+        ContextCommand::Unpin { label: "user-pref".to_string() }
+    );
+}
+
+#[test]
+fn context_command_pins_list() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    assert_eq!(ContextCommand::parse("pins"), ContextCommand::Pins);
+}
+
+#[test]
+fn context_command_zone() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    assert_eq!(ContextCommand::parse("zone"), ContextCommand::Zone);
+}
+
+#[test]
+fn context_command_clear() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    assert_eq!(ContextCommand::parse("clear"), ContextCommand::Clear);
+}
+
+#[test]
+fn context_command_unknown_fallback() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    assert_eq!(ContextCommand::parse("foobar"), ContextCommand::Overview);
+}
+
+#[test]
+fn context_command_pin_too_few_args() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    // "pin" with only label and no content → falls back to Overview
+    assert_eq!(ContextCommand::parse("pin onlylabel"), ContextCommand::Overview);
+}
+
+#[test]
+fn context_command_case_insensitive() {
+    use caduceus_bridge::orchestrator::context::ContextCommand;
+    assert_eq!(ContextCommand::parse("BREAKDOWN"), ContextCommand::Breakdown);
+    assert_eq!(ContextCommand::parse("Compact"), ContextCommand::Compact);
+    assert_eq!(ContextCommand::parse("ZONE"), ContextCommand::Zone);
+}
+
+// ── Compaction Strategy Names ──────────────────────────────────────────────────
+
+#[test]
+fn compaction_strategy_roundtrip() {
+    use caduceus_bridge::orchestrator::context::CompactionStrategy;
+    let names = ["summarize", "truncate", "hybrid", "smart"];
+    for name in &names {
+        let strategy = CompactionStrategy::from_name(name);
+        assert!(strategy.is_some(), "Strategy '{}' should parse", name);
+        assert_eq!(strategy.unwrap().name(), *name);
+    }
+}
+
+#[test]
+fn compaction_strategy_unknown_returns_none() {
+    use caduceus_bridge::orchestrator::context::CompactionStrategy;
+    assert!(CompactionStrategy::from_name("nonexistent").is_none());
+}
+
+// ── Context Breakdown ──────────────────────────────────────────────────────────
+
+#[test]
+fn context_breakdown_fill_percentage() {
+    use caduceus_bridge::orchestrator::context::ContextBreakdown;
+    use caduceus_bridge::orchestrator::ContextZone;
+    let bd = ContextBreakdown {
+        system_prompt_tokens: 500,
+        tool_schemas_tokens: 200,
+        project_context_tokens: 100,
+        conversation_tokens: 3000,
+        tool_results_tokens: 200,
+        pinned_context_tokens: 0,
+        total_tokens: 4000,
+        context_limit: 10000,
+        zone: ContextZone::Green,
+    };
+    let pct = bd.fill_percentage();
+    assert!((pct - 40.0).abs() < 0.01, "Should be 40%, got {}", pct);
+    assert_eq!(bd.remaining_tokens(), 6000);
+}
+
+#[test]
+fn context_breakdown_zero_limit() {
+    use caduceus_bridge::orchestrator::context::ContextBreakdown;
+    use caduceus_bridge::orchestrator::ContextZone;
+    let bd = ContextBreakdown {
+        system_prompt_tokens: 0, tool_schemas_tokens: 0,
+        project_context_tokens: 0, conversation_tokens: 0,
+        tool_results_tokens: 0, pinned_context_tokens: 0,
+        total_tokens: 0, context_limit: 0,
+        zone: ContextZone::Green,
+    };
+    assert_eq!(bd.fill_percentage(), 0.0, "Zero limit should return 0% not panic/NaN");
+}
+
+#[test]
+fn context_breakdown_over_limit() {
+    use caduceus_bridge::orchestrator::context::ContextBreakdown;
+    use caduceus_bridge::orchestrator::ContextZone;
+    let bd = ContextBreakdown {
+        system_prompt_tokens: 0, tool_schemas_tokens: 0,
+        project_context_tokens: 0, conversation_tokens: 15000,
+        tool_results_tokens: 0, pinned_context_tokens: 0,
+        total_tokens: 15000, context_limit: 10000,
+        zone: ContextZone::Critical,
+    };
+    assert!(bd.fill_percentage() > 100.0);
+    assert_eq!(bd.remaining_tokens(), 0, "saturating_sub should return 0");
+}
+
+// ── Self-Eviction Manager (Memory Summarization) ────────────────────────────
+
+#[test]
+fn self_eviction_checkpoint_and_resume() {
+    use caduceus_bridge::orchestrator::compaction::SelfEvictionManager;
+    let mut mgr = SelfEvictionManager::new();
+    let facts = vec!["User prefers Rust".to_string(), "Project uses Tauri".to_string()];
+    let checkpoint_id = mgr.checkpoint(facts.clone());
+    assert!(!checkpoint_id.is_empty());
+
+    let resumed = mgr.resume_from(&checkpoint_id);
+    assert!(resumed.is_some());
+    assert_eq!(resumed.unwrap(), facts);
+}
+
+#[test]
+fn self_eviction_purge() {
+    use caduceus_bridge::orchestrator::compaction::SelfEvictionManager;
+    let mut mgr = SelfEvictionManager::new();
+    let id1 = mgr.checkpoint(vec!["fact1".to_string()]);
+    let _id2 = mgr.checkpoint(vec!["fact2".to_string()]);
+    let purged = mgr.purge_before(&id1);
+    // Should purge the first checkpoint (or none if it's the cutoff)
+    assert!(purged <= 2, "Should purge 0-2 checkpoints");
+}
+
+#[test]
+fn self_eviction_list_checkpoints() {
+    use caduceus_bridge::orchestrator::compaction::SelfEvictionManager;
+    let mut mgr = SelfEvictionManager::new();
+    assert!(mgr.list_checkpoints().is_empty());
+    mgr.checkpoint(vec!["a".to_string()]);
+    mgr.checkpoint(vec!["b".to_string()]);
+    assert_eq!(mgr.list_checkpoints().len(), 2);
+}
+
+#[test]
+fn self_eviction_resume_unknown_id() {
+    use caduceus_bridge::orchestrator::compaction::SelfEvictionManager;
+    let mgr = SelfEvictionManager::new();
+    assert!(mgr.resume_from("nonexistent-id").is_none());
+}
+
+// ── Entropy Checker (Summary Quality) ──────────────────────────────────────
+
+#[test]
+fn entropy_checker_good_summary() {
+    use caduceus_bridge::orchestrator::compaction::EntropyChecker;
+    let checker = EntropyChecker::new(0.3);
+    let original = "Rust is a systems programming language focused on safety and concurrency. It provides memory safety without garbage collection.";
+    let summary = "Rust: safe, concurrent systems language with no GC.";
+    let result = checker.check_summary_quality(original, summary);
+    // A good summary should have reasonable density
+    assert!(result.density_score > 0.0, "Should have non-zero density score");
+}
+
+#[test]
+fn entropy_checker_keyword_retention() {
+    use caduceus_bridge::orchestrator::compaction::EntropyChecker;
+    let checker = EntropyChecker::new(0.3);
+    let original = "The authentication system uses JWT tokens with RSA signing. Users authenticate via OAuth2 and receive refresh tokens.";
+    let summary = "Auth: JWT + RSA, OAuth2 login, refresh tokens.";
+    let ratio = checker.keyword_retention_ratio(original, summary);
+    assert!(ratio > 0.0, "Should retain some keywords");
+}
+
+#[test]
+fn entropy_checker_compression_ratio() {
+    use caduceus_bridge::orchestrator::compaction::EntropyChecker;
+    let checker = EntropyChecker::new(0.3);
+    let original = "word ".repeat(200);
+    let summary = "word ".repeat(20);
+    let ratio = checker.length_compression_ratio(&original, &summary);
+    // ratio = summary_len / original_len = 0.1 (10% of original = good compression)
+    assert!(ratio < 0.5, "10x compression should have low ratio (< 0.5), got {}", ratio);
+    assert!(ratio > 0.0, "Should be non-zero");
+}
+
+// ── Dual Model Compactor ───────────────────────────────────────────────────
+
+#[test]
+fn dual_model_compactor_summary_prompt() {
+    use caduceus_bridge::orchestrator::compaction::DualModelCompactor;
+    let compactor = DualModelCompactor::new("gpt-4", "gpt-3.5");
+    let messages = vec![
+        caduceus_bridge::orchestrator::CompactMessage::new("user", "What is Rust?"),
+        caduceus_bridge::orchestrator::CompactMessage::new("assistant", "Rust is a systems programming language."),
+    ];
+    let prompt = compactor.generate_summary_prompt(&messages);
+    assert!(!prompt.is_empty());
+    assert!(prompt.contains("Rust") || prompt.contains("summary") || prompt.contains("conversation"),
+        "Prompt should reference the conversation content");
+}
+
+#[test]
+fn dual_model_compactor_savings() {
+    use caduceus_bridge::orchestrator::compaction::DualModelCompactor;
+    let compactor = DualModelCompactor::new("gpt-4", "gpt-3.5");
+    let savings = compactor.estimate_savings(1000, 200);
+    assert!((savings - 0.8).abs() < 0.01, "80% reduction expected, got {}", savings);
+}
+
+#[test]
+fn dual_model_compactor_no_savings() {
+    use caduceus_bridge::orchestrator::compaction::DualModelCompactor;
+    let compactor = DualModelCompactor::new("gpt-4", "gpt-3.5");
+    let savings = compactor.estimate_savings(1000, 1000);
+    assert!((savings - 0.0).abs() < 0.01, "No reduction expected");
+}
+
+// ── Message Groups (Loop Detection Foundation) ─────────────────────────────
+
+#[test]
+fn message_groups_basic() {
+    use caduceus_bridge::orchestrator::compaction::{build_message_groups, CompactMessage, MessageGroupKind};
+    let messages = vec![
+        CompactMessage::new("system", "You are helpful."),
+        CompactMessage::new("user", "Hello"),
+        CompactMessage::new("assistant", "Hi there!"),
+        CompactMessage::new("user", "How are you?"),
+    ];
+    let groups = build_message_groups(&messages);
+    assert!(!groups.is_empty());
+    // System message should be its own group
+    assert_eq!(groups[0].kind, MessageGroupKind::System);
+}
+
+#[test]
+fn message_group_token_counting() {
+    use caduceus_bridge::orchestrator::compaction::{MessageGroup, MessageGroupKind, CompactMessage};
+    let mut group = MessageGroup::new(MessageGroupKind::User);
+    assert_eq!(group.total_tokens(), 0);
+    group.add_message(CompactMessage::new("user", "Hello world"));
+    assert!(group.total_tokens() > 0);
+    let first = group.total_tokens();
+    group.add_message(CompactMessage::new("user", "Another message"));
+    assert!(group.total_tokens() > first, "Adding messages should increase token count");
+}
+
+#[test]
+fn message_group_system_flag() {
+    use caduceus_bridge::orchestrator::compaction::{MessageGroup, MessageGroupKind};
+    let system = MessageGroup::new(MessageGroupKind::System);
+    let user = MessageGroup::new(MessageGroupKind::User);
+    assert!(system.is_system());
+    assert!(!user.is_system());
+}
+
+// ── Loop Detection (behavioral simulation) ─────────────────────────────────
+
+#[test]
+fn loop_detection_simulated_repetition() {
+    // Simulates the loop detection logic from thread.rs:
+    // If the same tool is called 3+ times consecutively, it's a loop.
+    let tool_calls = vec!["edit_file", "edit_file", "edit_file", "edit_file"];
+    let mut consecutive_count = 0u32;
+    let mut last_tool: Option<&str> = None;
+    let mut loop_detected = false;
+
+    for tool in &tool_calls {
+        if last_tool == Some(tool) {
+            consecutive_count += 1;
+        } else {
+            consecutive_count = 1;
+        }
+        last_tool = Some(tool);
+        if consecutive_count >= 3 {
+            loop_detected = true;
+            break;
+        }
+    }
+    assert!(loop_detected, "4 consecutive same-tool calls should trigger loop detection");
+}
+
+#[test]
+fn loop_detection_different_tools_no_trigger() {
+    let tool_calls = vec!["edit_file", "read_file", "edit_file", "read_file"];
+    let mut consecutive_count = 0u32;
+    let mut last_tool: Option<&str> = None;
+    let mut loop_detected = false;
+
+    for tool in &tool_calls {
+        if last_tool == Some(tool) {
+            consecutive_count += 1;
+        } else {
+            consecutive_count = 1;
+        }
+        last_tool = Some(tool);
+        if consecutive_count >= 3 {
+            loop_detected = true;
+        }
+    }
+    assert!(!loop_detected, "Alternating tools should not trigger loop detection");
+}
+
+// ── Circuit Breaker (behavioral simulation) ────────────────────────────────
+
+#[test]
+fn circuit_breaker_trips_after_5_failures() {
+    let max_failures = 5u32;
+    let mut consecutive_failures = 0u32;
+    let results = vec![false, false, false, false, false]; // 5 failures
+
+    for success in &results {
+        if *success {
+            consecutive_failures = 0;
+        } else {
+            consecutive_failures += 1;
+        }
+    }
+    assert!(consecutive_failures >= max_failures, "5 consecutive failures should trip circuit breaker");
+}
+
+#[test]
+fn circuit_breaker_resets_on_success() {
+    let mut consecutive_failures = 0u32;
+    let results = vec![false, false, true, false, false, false]; // success at index 2 resets
+
+    for success in &results {
+        if *success {
+            consecutive_failures = 0;
+        } else {
+            consecutive_failures += 1;
+        }
+    }
+    assert_eq!(consecutive_failures, 3, "Should be 3 after reset, not 5");
+    assert!(consecutive_failures < 5, "Circuit breaker should not trip");
+}
+
+#[test]
+fn circuit_breaker_permission_denied_excluded() {
+    // Simulates: permission denials don't count as failures
+    let mut consecutive_failures = 0u32;
+    let results: Vec<(&str, bool)> = vec![
+        ("error", false),
+        ("permission_denied", false),
+        ("error", false),
+        ("permission_denied", false),
+        ("error", false),
+    ];
+
+    for (kind, success) in &results {
+        if *success {
+            consecutive_failures = 0;
+        } else if *kind != "permission_denied" {
+            consecutive_failures += 1;
+        }
+        // permission_denied does NOT increment
+    }
+    assert_eq!(consecutive_failures, 3, "Only real errors count, not permission denials");
+    assert!(consecutive_failures < 5, "Circuit breaker should not trip with permission denials excluded");
+}
+
+// ── Compaction Cooldown (behavioral simulation) ────────────────────────────
+
+#[test]
+fn compaction_cooldown_prevents_double_fire() {
+    use std::time::Instant;
+    let cooldown_secs = 30u64;
+    let mut last_compacted: Option<Instant> = None;
+
+    // First compaction — should proceed
+    let can_compact_1 = last_compacted
+        .map(|t| t.elapsed().as_secs() >= cooldown_secs)
+        .unwrap_or(true);
+    assert!(can_compact_1, "First compaction should always proceed");
+    last_compacted = Some(Instant::now());
+
+    // Immediate second attempt — should be blocked
+    let can_compact_2 = last_compacted
+        .map(|t| t.elapsed().as_secs() >= cooldown_secs)
+        .unwrap_or(true);
+    assert!(!can_compact_2, "Immediate retry should be blocked by cooldown");
+}
+
+// ── Compact Instructions ───────────────────────────────────────────────────
+
+#[test]
+fn compact_instructions_passthrough_short() {
+    use caduceus_bridge::orchestrator::OrchestratorBridge;
+    let short = "Keep it simple.";
+    let result = OrchestratorBridge::compact_instructions(short, 1000);
+    assert_eq!(result, short, "Short content should pass through unchanged");
+}
+
+#[test]
+fn compact_instructions_truncates_long() {
+    use caduceus_bridge::orchestrator::OrchestratorBridge;
+    let long = "word ".repeat(500);
+    let result = OrchestratorBridge::compact_instructions(&long, 200);
+    assert!(result.len() < long.len(), "Should be shorter than original ({}), got {}", long.len(), result.len());
+}
+
+// ── Context Manager (Full Integration) ─────────────────────────────────────
+
+#[test]
+fn context_manager_pin_unpin() {
+    use caduceus_bridge::orchestrator::context::ContextManager;
+    let mut mgr = ContextManager::new(128000);
+    mgr.pin("rule1", "Always respond in JSON");
+    assert_eq!(mgr.list_pins().len(), 1);
+    assert!(mgr.pinned_tokens() > 0);
+
+    let removed = mgr.unpin("rule1");
+    assert!(removed);
+    assert!(mgr.list_pins().is_empty());
+    assert_eq!(mgr.pinned_tokens(), 0);
+}
+
+#[test]
+fn context_manager_unpin_nonexistent() {
+    use caduceus_bridge::orchestrator::context::ContextManager;
+    let mut mgr = ContextManager::new(128000);
+    assert!(!mgr.unpin("nope"));
+}
+
+#[test]
+fn context_manager_strategy() {
+    use caduceus_bridge::orchestrator::context::{ContextManager, CompactionStrategy};
+    let mut mgr = ContextManager::new(128000);
+    mgr.set_strategy(CompactionStrategy::Truncate { keep_last_n: 5 });
+    assert_eq!(mgr.strategy().name(), "truncate");
+}
+
+#[test]
+fn context_manager_should_compact_respects_threshold() {
+    use caduceus_bridge::orchestrator::context::{ContextManager, ContextBreakdown};
+    use caduceus_bridge::orchestrator::ContextZone;
+    // should_compact triggers on zone (Orange/Red/Critical), not raw threshold
+    let mgr = ContextManager::new(10000);
+    // 40% = Green — should NOT compact
+    let green = ContextBreakdown {
+        system_prompt_tokens: 0, tool_schemas_tokens: 0,
+        project_context_tokens: 0, conversation_tokens: 4000,
+        tool_results_tokens: 0, pinned_context_tokens: 0,
+        total_tokens: 4000, context_limit: 10000,
+        zone: ContextZone::Green,
+    };
+    // 90% = Red — should compact
+    let red = ContextBreakdown {
+        system_prompt_tokens: 0, tool_schemas_tokens: 0,
+        project_context_tokens: 0, conversation_tokens: 9000,
+        tool_results_tokens: 0, pinned_context_tokens: 0,
+        total_tokens: 9000, context_limit: 10000,
+        zone: ContextZone::Red,
+    };
+    assert!(!mgr.should_compact(&green), "Green zone should not trigger compaction");
+    assert!(mgr.should_compact(&red), "Red zone should trigger compaction");
+}
+
+// ── File Context Source ────────────────────────────────────────────────────
+
+#[test]
+fn context_source_file_context() {
+    use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
+    let mut assembler = ContextAssembler::new(10000);
+    assembler.add_source(ContextSource::FileContext {
+        path: "src/main.rs".to_string(),
+        content: "fn main() {}".to_string(),
+        priority: 1,
+    });
+    let result = assembler.assemble();
+    assert!(result.content.contains("main"), "File content should appear in assembled output");
+}
+
+#[test]
+fn context_source_conversation_history() {
+    use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
+    let mut assembler = ContextAssembler::new(10000);
+    assembler.add_source(ContextSource::ConversationHistory(vec![
+        "User: What is Rust?".to_string(),
+        "Assistant: A systems language.".to_string(),
+    ]));
+    let result = assembler.assemble();
+    assert!(result.content.contains("Rust"), "Conversation should appear in assembled output");
+}

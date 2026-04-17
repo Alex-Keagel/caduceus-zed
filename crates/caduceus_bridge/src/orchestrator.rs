@@ -30,8 +30,8 @@ pub use caduceus_orchestrator::{
     HierarchicalTask as BridgeHierarchicalTask,
     kanban::{KanbanBoard, KanbanCard, KanbanColumn, CardStatus},
     automations::{Automation, AutomationTrigger, AutomationAgentConfig, AutomationRegistry},
-    context::{ContextZone, ContextSource, ContextAssembler, AssembledContext, estimate_tokens},
-    compaction::{CompactMessage, CompactionPipeline, ContextStats, CompactionTrigger},
+    context::{self, ContextZone, ContextSource, ContextAssembler, AssembledContext, estimate_tokens},
+    compaction::{self, CompactMessage, CompactionPipeline, ContextStats, CompactionTrigger},
 };
 
 // Re-export types needed by tools.
