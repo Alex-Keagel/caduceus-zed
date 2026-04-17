@@ -972,7 +972,7 @@ impl NativeAgent {
                 .or_insert(0) += 1;
         }
 
-        registry
+        let mut commands: Vec<acp::AvailableCommand> = registry
             .prompts()
             .flat_map(|context_server_prompt| {
                 let prompt = &context_server_prompt.prompt;
@@ -1011,7 +1011,21 @@ impl NativeAgent {
 
                 Some(command)
             })
-            .collect()
+            .collect::<Vec<_>>();
+
+        // Caduceus: add built-in slash commands
+        let caduceus_commands = vec![
+            acp::AvailableCommand::new("compact", "Compress conversation context to free tokens"),
+            acp::AvailableCommand::new("mode", "Show or switch Caduceus mode")
+                .input(acp::AvailableCommandInput::Unstructured(
+                    acp::UnstructuredCommandInput::new("<plan|act|research|autopilot|architect|debug|review>"),
+                )),
+            acp::AvailableCommand::new("context", "Show context usage and zone status"),
+            acp::AvailableCommand::new("checkpoint", "Create a code checkpoint for rollback"),
+            acp::AvailableCommand::new("help", "Show all Caduceus commands"),
+        ];
+        commands.extend(caduceus_commands);
+        commands
     }
 
     pub fn load_thread(
@@ -1347,8 +1361,14 @@ impl NativeAgentConnection {
             }
             "context" => {
                 if let Some(thread) = self.thread(session_id, cx) {
-                    let msg_count = thread.read(cx).message_count();
-                    format!("📊 Context: {msg_count} messages\nUse `/compact` to free space.")
+                    let t = thread.read(cx);
+                    let msg_count = t.message_count();
+                    let zone = t.context_zone();
+                    let fill_pct = t.context_fill_pct();
+                    format!(
+                        "📊 Context: {} messages | {:.0}% full | Zone: {} — {}\nUse `/compact` to free space.",
+                        msg_count, fill_pct, zone.label(), zone.recommendation()
+                    )
                 } else {
                     "No active session".to_string()
                 }

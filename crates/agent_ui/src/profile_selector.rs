@@ -196,7 +196,7 @@ impl Render for ProfileSelector {
                     .gap_1()
                     .child(
                         container()
-                            .child(Label::new("Change Profile"))
+                            .child(Label::new("Change Caduceus Mode"))
                             .child(KeyBinding::for_action(&ToggleProfileSelector, cx)),
                     )
                     .child(
@@ -204,8 +204,13 @@ impl Render for ProfileSelector {
                             .pt_1()
                             .border_t_1()
                             .border_color(cx.theme().colors().border_variant)
-                            .child(Label::new("Cycle Through Profiles"))
+                            .child(Label::new("Cycle Modes"))
                             .child(KeyBinding::for_action(&CycleModeSelector, cx)),
+                    )
+                    .child(
+                        Label::new("Modes: plan · act · research · autopilot · architect · debug · review")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
                     )
                     .into_any()
             }
