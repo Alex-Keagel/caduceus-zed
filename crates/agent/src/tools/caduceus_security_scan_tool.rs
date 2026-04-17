@@ -140,11 +140,16 @@ impl AgentTool for CaduceusSecurityScanTool {
             let content = match &input.content {
                 Some(c) => c.clone(),
                 None => {
-                    // SEC-17: Validate path is under project root
-                    let path = std::path::Path::new(&input.path);
+                    // SEC-17: Validate path — reject traversal and absolute paths
                     if input.path.contains("..") {
                         return Err(CaduceusSecurityScanToolOutput::Error {
                             error: format!("Path traversal not allowed: {}", input.path),
+                        });
+                    }
+                    let path = std::path::Path::new(&input.path);
+                    if path.is_absolute() {
+                        return Err(CaduceusSecurityScanToolOutput::Error {
+                            error: "Absolute paths not allowed — use relative paths from project root".to_string(),
                         });
                     }
                     if crate::tools::is_sensitive_file(&input.path) {

@@ -150,6 +150,7 @@ dependencies = [
  "agent_settings",
  "anyhow",
  "caduceus-core",
+ "caduceus-git",
  "caduceus-marketplace",
  "caduceus-permissions",
  "caduceus_bridge",

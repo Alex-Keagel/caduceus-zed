@@ -1592,26 +1592,27 @@ impl Thread {
                 // Zed built-in read tools (local only — no network)
                 "read_file", "find_path", "grep", "list_directory",
                 "diagnostics", "now", "open",
-                // fetch and search_web REMOVED — SSRF/exfiltration risk (SEC-12/13)
-                // Caduceus read-only tools (no state mutation)
+                // Caduceus read-only tools (strictly no state mutation)
                 "caduceus_semantic_search", "caduceus_index",
                 "caduceus_code_graph", "caduceus_tree_sitter",
                 "caduceus_git_read", "caduceus_memory_read",
-                // caduceus_memory_write REMOVED — write access is privilege escalation
-                // caduceus_background_agent REMOVED — can spawn autopilot agents
                 "caduceus_dependency_scan", "caduceus_security_scan",
                 "caduceus_error_analysis", "caduceus_mcp_security",
                 "caduceus_prd", "caduceus_progress",
                 "caduceus_telemetry", "caduceus_conversation",
-                "caduceus_marketplace", "caduceus_wiki",
-                "caduceus_project_wiki", "caduceus_project",
+                "caduceus_marketplace",
+                "caduceus_project",
                 "caduceus_task_tree", "caduceus_time_tracking",
-                "caduceus_policy", "caduceus_kanban",
-                "caduceus_checkpoint", "caduceus_storage",
-                "caduceus_automations",
-                "caduceus_scaffold",
+                "caduceus_policy",
                 "caduceus_cross_search", "caduceus_api_registry",
                 "caduceus_architect", "caduceus_product",
+                // REMOVED from read-only: caduceus_wiki (write/delete),
+                // caduceus_project_wiki (write_page/auto_populate),
+                // caduceus_kanban (git worktree mutations),
+                // caduceus_checkpoint (create/restore),
+                // caduceus_storage (save/delete),
+                // caduceus_automations (add/remove/enable/disable),
+                // caduceus_scaffold (creates files)
             ];
             let allowed = allowed_tools.contains(&tool_name);
             if !allowed {

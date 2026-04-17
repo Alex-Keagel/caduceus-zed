@@ -138,15 +138,15 @@ impl AgentTool for CaduceusCrossGitTool {
                 CrossGitOperation::StatusAll => {
                     output.push_str("## Git Status — All Repos\n\n");
                     for (name, path) in &repos {
-                        let engine = caduceus_bridge::engine::CaduceusEngine::new(path);
+                        let git_repo = caduceus_git::GitRepo::discover(path);
                         output.push_str(&format!("### {}\n", name));
-                        match engine.git_status() {
+                        match git_repo.as_ref().map_err(|e| e.to_string()).and_then(|r| r.status().map_err(|e| e.to_string())) {
                             Ok(entries) if entries.is_empty() => {
                                 output.push_str("Clean ✅\n\n");
                             }
                             Ok(entries) => {
                                 for e in &entries {
-                                    output.push_str(&format!("  {} {}\n", e.status, e.path));
+                                    output.push_str(&format!("  {:?} {}\n", e.status, e.path));
                                 }
                                 output.push('\n');
                             }
@@ -157,17 +157,17 @@ impl AgentTool for CaduceusCrossGitTool {
                 CrossGitOperation::BranchAll => {
                     output.push_str("## Branches — All Repos\n\n");
                     for (name, path) in &repos {
-                        let engine = caduceus_bridge::engine::CaduceusEngine::new(path);
-                        let branch = engine.git_branch().unwrap_or_else(|e| format!("error: {e}"));
+                        let git_repo = caduceus_git::GitRepo::discover(path);
+                        let branch = git_repo.as_ref().map_err(|e| e.to_string()).and_then(|r| r.current_branch().map_err(|e| e.to_string())).unwrap_or_else(|e| format!("error: {e}"));
                         output.push_str(&format!("- **{}**: {}\n", name, branch));
                     }
                 }
                 CrossGitOperation::LogAll { count } => {
                     output.push_str(&format!("## Recent Commits — All Repos (last {})\n\n", count));
                     for (name, path) in &repos {
-                        let engine = caduceus_bridge::engine::CaduceusEngine::new(path);
+                        let git_repo = caduceus_git::GitRepo::discover(path);
                         output.push_str(&format!("### {}\n", name));
-                        match engine.git_log(count) {
+                        match git_repo.as_ref().map_err(|e| e.to_string()).and_then(|r| r.log(count).map_err(|e| e.to_string())) {
                             Ok(commits) => {
                                 for c in &commits {
                                     let sha = &c.sha[..7.min(c.sha.len())];
@@ -182,6 +182,7 @@ impl AgentTool for CaduceusCrossGitTool {
                 CrossGitOperation::CreateBranchAll { branch_name } => {
                     output.push_str(&format!("## Create Branch '{}' — All Repos\n\n", branch_name));
                     for (name, path) in &repos {
+                        // Branch creation is rare — use engine for this specific operation
                         let engine = caduceus_bridge::engine::CaduceusEngine::new(path);
                         match engine.git_create_task_branch(&branch_name) {
                             Ok(branch) => output.push_str(&format!("- **{}**: ✅ Created {}\n", name, branch)),
@@ -193,8 +194,8 @@ impl AgentTool for CaduceusCrossGitTool {
                     output.push_str("## Dirty Repos\n\n");
                     let mut dirty_count = 0;
                     for (name, path) in &repos {
-                        let engine = caduceus_bridge::engine::CaduceusEngine::new(path);
-                        match engine.git_status() {
+                        let git_repo = caduceus_git::GitRepo::discover(path);
+                        match git_repo.as_ref().map_err(|e| e.to_string()).and_then(|r| r.status().map_err(|e| e.to_string())) {
                             Ok(entries) if !entries.is_empty() => {
                                 dirty_count += 1;
                                 output.push_str(&format!("- **{}**: {} changes\n", name, entries.len()));
