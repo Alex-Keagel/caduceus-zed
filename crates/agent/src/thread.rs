@@ -2463,8 +2463,17 @@ impl Thread {
             None,
         );
         this.update(cx, |this, _cx| {
-            // Caduceus: track consecutive failures for circuit breaker
-            this.circuit_breaker.record_result(tool_result.is_error);
+            // Caduceus: track consecutive failures for circuit breaker.
+            // Skip synthetic guardrail results (permission denied, circuit breaker,
+            // loop detected) — these are not real tool failures.
+            let is_synthetic_guardrail = if let LanguageModelToolResultContent::Text(t) = &tool_result.content {
+                t.starts_with("PERMISSION DENIED:") || t.starts_with("CIRCUIT BREAKER:") || t.starts_with("LOOP DETECTED:")
+            } else {
+                false
+            };
+            if !is_synthetic_guardrail {
+                this.circuit_breaker.record_result(tool_result.is_error);
+            }
             this.pending_message()
                 .tool_results
                 .insert(tool_result.tool_use_id.clone(), tool_result)

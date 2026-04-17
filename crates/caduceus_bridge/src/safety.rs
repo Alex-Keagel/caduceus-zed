@@ -34,6 +34,7 @@ pub enum LoopCheckResult {
 
 impl LoopDetector {
     pub fn new(threshold: usize) -> Self {
+        assert!(threshold > 0, "LoopDetector threshold must be > 0");
         Self {
             current_tool: None,
             consecutive_count: 0,
@@ -70,8 +71,8 @@ impl LoopDetector {
         LoopCheckResult::Ok
     }
 
-    /// Reset the detector (e.g., after a loop is detected).
-    pub fn reset(&mut self) {
+    /// Reset the detector (called internally after loop detection).
+    fn reset(&mut self) {
         self.current_tool = None;
         self.consecutive_count = 0;
     }
@@ -101,6 +102,7 @@ pub struct CircuitBreaker {
 
 impl CircuitBreaker {
     pub fn new(threshold: u32) -> Self {
+        assert!(threshold > 0, "CircuitBreaker threshold must be > 0");
         Self {
             consecutive_failures: 0,
             threshold,
@@ -253,6 +255,12 @@ mod tests {
         ); // count=1 >= 1 → blocked
     }
 
+    #[test]
+    #[should_panic(expected = "threshold must be > 0")]
+    fn loop_detector_rejects_zero_threshold() {
+        LoopDetector::new(0);
+    }
+
     // ── CircuitBreaker ─────────────────────────────────────────────────────
 
     #[test]
@@ -309,6 +317,12 @@ mod tests {
         assert_eq!(cb.consecutive_failures(), 0);
     }
 
+    #[test]
+    #[should_panic(expected = "threshold must be > 0")]
+    fn circuit_breaker_rejects_zero_threshold() {
+        CircuitBreaker::new(0);
+    }
+
     // ── CompactionCooldown ─────────────────────────────────────────────────
 
     #[test]
@@ -342,5 +356,14 @@ mod tests {
         assert!(cd.last_compacted().is_none());
         cd.record_compaction();
         assert!(cd.last_compacted().is_some());
+    }
+
+    #[test]
+    fn compaction_cooldown_boundary_minus_one() {
+        let mut cd = CompactionCooldown::new(Duration::from_secs(30));
+        let now = Instant::now();
+        cd.record_compaction_at(now);
+        assert!(!cd.can_compact_at(now + Duration::from_millis(29_999)));
+        assert!(cd.can_compact_at(now + Duration::from_millis(30_000)));
     }
 }

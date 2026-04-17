@@ -2034,89 +2034,73 @@ fn message_group_system_flag() {
     assert!(!user.is_system());
 }
 
-// ── Loop Detection (real struct tests) ──────────────────────────────────────
+// ── Safety Guardrails (cross-struct integration) ───────────────────────────
 
 #[test]
-fn loop_detector_blocks_4th_consecutive_same_tool() {
-    use caduceus_bridge::safety::{LoopDetector, LoopCheckResult};
-    let mut ld = LoopDetector::new(3);
-    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
-    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
-    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
-    assert_eq!(
-        ld.record_tool("edit_file"),
-        LoopCheckResult::LoopDetected("edit_file".to_string())
-    );
-}
+fn safety_guardrails_combined_scenario() {
+    use caduceus_bridge::safety::{LoopDetector, CircuitBreaker, CompactionCooldown, LoopCheckResult};
+    use std::time::{Duration, Instant};
 
-#[test]
-fn loop_detector_different_tools_no_trigger() {
-    use caduceus_bridge::safety::{LoopDetector, LoopCheckResult};
-    let mut ld = LoopDetector::new(3);
-    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
-    assert_eq!(ld.record_tool("read_file"), LoopCheckResult::Ok);
-    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
-    assert_eq!(ld.record_tool("read_file"), LoopCheckResult::Ok);
-}
+    // Simulates thread.rs tool dispatch order:
+    // 1. Check permission → CB.record_permission_denied() if denied
+    // 2. Check CB.is_tripped()
+    // 3. Check LD.record_tool()
+    // 4. Run tool → CB.record_result(is_error)
 
-#[test]
-fn loop_detector_resets_after_detection() {
-    use caduceus_bridge::safety::{LoopDetector, LoopCheckResult};
     let mut ld = LoopDetector::new(3);
-    for _ in 0..3 { ld.record_tool("edit_file"); }
-    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::LoopDetected("edit_file".to_string()));
-    // After detection, fresh start
+    let mut cb = CircuitBreaker::new(5);
+
+    // 4 failures, then a permission denial resets CB, preventing trip
+    for _ in 0..4 { cb.record_result(true); }
+    assert!(!cb.is_tripped());
+    cb.record_permission_denied(); // resets to 0
+    cb.record_result(true);        // back to 1
+    assert!(!cb.is_tripped());
+
+    // Meanwhile loop detector tracks independently
+    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
+    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
+    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
+    // 4th triggers loop — CB is irrelevant since LD fires first in dispatch
+    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::LoopDetected("edit_file".into()));
+    // LD auto-resets; CB unaffected
+    assert_eq!(cb.consecutive_failures(), 1);
     assert_eq!(ld.consecutive_count(), 0);
-    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
-}
-
-// ── Circuit Breaker (real struct tests) ────────────────────────────────────
-
-#[test]
-fn circuit_breaker_trips_after_5_failures() {
-    use caduceus_bridge::safety::CircuitBreaker;
-    let mut cb = CircuitBreaker::new(5);
-    for _ in 0..4 {
-        cb.record_result(true);
-        assert!(!cb.is_tripped());
-    }
-    cb.record_result(true);
-    assert!(cb.is_tripped());
 }
 
 #[test]
-fn circuit_breaker_resets_on_success() {
-    use caduceus_bridge::safety::CircuitBreaker;
+fn circuit_breaker_and_loop_detector_are_independent() {
+    use caduceus_bridge::safety::{CircuitBreaker, LoopDetector, LoopCheckResult};
     let mut cb = CircuitBreaker::new(5);
-    for _ in 0..4 { cb.record_result(true); }
-    cb.record_result(false);
-    assert_eq!(cb.consecutive_failures(), 0);
+    let mut ld = LoopDetector::new(3);
+    // 3 failures then loop detection — they don't interfere
+    for _ in 0..3 { cb.record_result(true); }
+    for _ in 0..3 { ld.record_tool("edit_file"); }
+    assert!(matches!(ld.record_tool("edit_file"), LoopCheckResult::LoopDetected(_)));
+    assert_eq!(cb.consecutive_failures(), 3, "Loop detection must not affect circuit breaker");
     assert!(!cb.is_tripped());
 }
 
 #[test]
-fn circuit_breaker_permission_denied_resets() {
-    use caduceus_bridge::safety::CircuitBreaker;
-    let mut cb = CircuitBreaker::new(5);
-    for _ in 0..4 { cb.record_result(true); }
-    cb.record_permission_denied();
-    assert_eq!(cb.consecutive_failures(), 0);
-    assert!(!cb.is_tripped());
-}
-
-// ── Compaction Cooldown (real struct tests) ─────────────────────────────────
-
-#[test]
-fn compaction_cooldown_allows_first_blocks_immediate() {
+fn compaction_cooldown_sliding_window() {
     use caduceus_bridge::safety::CompactionCooldown;
     use std::time::{Duration, Instant};
     let mut cd = CompactionCooldown::new(Duration::from_secs(30));
-    let now = Instant::now();
-    assert!(cd.can_compact_at(now), "First compaction should always proceed");
-    cd.record_compaction_at(now);
-    assert!(!cd.can_compact_at(now), "Immediate retry should be blocked");
-    assert!(!cd.can_compact_at(now + Duration::from_secs(15)), "15s is within cooldown");
-    assert!(cd.can_compact_at(now + Duration::from_secs(30)), "30s should be allowed");
+    let t0 = Instant::now();
+
+    assert!(cd.can_compact_at(t0));
+    cd.record_compaction_at(t0);
+
+    // Boundary: 29s blocked, 30s allowed
+    assert!(!cd.can_compact_at(t0 + Duration::from_secs(29)));
+    assert!(cd.can_compact_at(t0 + Duration::from_secs(30)));
+
+    // Second compaction at t0+30 — window slides
+    let t1 = t0 + Duration::from_secs(30);
+    cd.record_compaction_at(t1);
+    assert!(!cd.can_compact_at(t1 + Duration::from_secs(15)));
+    assert!(cd.can_compact_at(t1 + Duration::from_secs(30)));
+    assert_eq!(cd.last_compacted(), Some(t1));
 }
 
 // ── Compact Instructions ───────────────────────────────────────────────────
