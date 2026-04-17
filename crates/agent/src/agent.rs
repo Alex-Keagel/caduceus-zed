@@ -947,6 +947,7 @@ impl NativeAgent {
             acp::AvailableCommand::new("context", "Show context usage and zone status"),
             acp::AvailableCommand::new("checkpoint", "Create a code checkpoint for rollback"),
             acp::AvailableCommand::new("help", "Show all Caduceus commands"),
+            acp::AvailableCommand::new("review", "Review code for security issues"),
         ];
 
         let Some(state) = project_state else {
@@ -1384,6 +1385,13 @@ impl NativeAgentConnection {
                     "No active session".to_string()
                 }
             }
+            "review" => {
+                "🔍 To review code for issues, use the `caduceus_security_scan` tool:\n\
+                 - Ask: \"Review this file for security issues\"\n\
+                 - Or: \"Scan src/main.rs for vulnerabilities\"\n\
+                 The agent will use the security scanner and dependency checker automatically."
+                    .to_string()
+            }
             "help" => {
                 "## Caduceus Commands\n\
                  - `/compact` — compress conversation context\n\
@@ -1393,6 +1401,7 @@ impl NativeAgentConnection {
                  - `/context unpin <label>` — remove a pin\n\
                  - `/context pins` — list all pins\n\
                  - `/checkpoint [label]` — create a code checkpoint\n\
+                 - `/review` — review code for security issues\n\
                  - `/help` — show this help"
                     .to_string()
             }
