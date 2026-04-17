@@ -785,6 +785,7 @@ struct CaduceusStatsCache {
     lock_tooltip: String,
     bg_agent_tooltip: String,
     security_tooltip: String,
+    memory_tooltip: String,
     last_refresh: Instant,
 }
 
@@ -805,6 +806,7 @@ impl Default for CaduceusStatsCache {
             lock_tooltip: String::new(),
             bg_agent_tooltip: "No background agents".to_string(),
             security_tooltip: "Security score based on last scan".to_string(),
+            memory_tooltip: "No memories stored".to_string(),
             last_refresh: Instant::now() - Duration::from_secs(60),
         }
     }
@@ -4527,19 +4529,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) -> Div {
         let memory_count = self.caduceus_stats_cache.memory_count;
-        let memory_tooltip = if self.caduceus_stats_cache.memory_entries.is_empty() {
-            "No memories stored".to_string()
-        } else {
-            let mut tip = format!("🧠 {} memories:\n", memory_count);
-            for (k, v) in self.caduceus_stats_cache.memory_entries.iter().take(10) {
-                let truncated_v: String = v.chars().take(40).collect();
-                tip.push_str(&format!("  {} → {}\n", k, truncated_v));
-            }
-            if memory_count > 10 {
-                tip.push_str(&format!("  ... and {} more", memory_count - 10));
-            }
-            tip
-        };
+        let memory_tooltip = self.caduceus_stats_cache.memory_tooltip.clone();
 
         h_flex()
             .gap_1()
@@ -4776,6 +4766,20 @@ impl AgentPanel {
             let root = worktree.read(cx).abs_path();
             let entries = caduceus_bridge::memory::list(&root);
             self.caduceus_stats_cache.memory_count = entries.len();
+            // Pre-build memory tooltip (avoid per-frame allocation)
+            self.caduceus_stats_cache.memory_tooltip = if entries.is_empty() {
+                "No memories stored".to_string()
+            } else {
+                let mut tip = format!("🧠 {} memories:\n", entries.len());
+                for (k, v) in entries.iter().take(10) {
+                    let truncated_v: String = v.chars().take(40).collect();
+                    tip.push_str(&format!("  {} → {}\n", k, truncated_v));
+                }
+                if entries.len() > 10 {
+                    tip.push_str(&format!("  ... and {} more", entries.len() - 10));
+                }
+                tip
+            };
             self.caduceus_stats_cache.memory_entries = entries;
 
             // Background agent details for tooltip

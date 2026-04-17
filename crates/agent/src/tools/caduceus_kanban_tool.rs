@@ -115,8 +115,15 @@ impl CaduceusKanbanTool {
         Self { project_root, engine }
     }
 
-    fn worktree_path(branch: &str) -> String {
-        format!(".caduceus/worktrees/{branch}")
+    fn worktree_path(branch: &str) -> Result<String, String> {
+        // SEC-19: Validate branch names to prevent path traversal
+        if branch.is_empty() || branch.contains("..") || branch.contains('/') || branch.contains('\\') || branch.starts_with('-') {
+            return Err(format!("Invalid branch name '{}' — must not contain ../ or path separators", branch));
+        }
+        if branch.len() > 64 {
+            return Err("Branch name too long (max 64 chars)".to_string());
+        }
+        Ok(format!(".caduceus/worktrees/{branch}"))
     }
 
     fn load_or_create_board(&self) -> Result<KanbanBoard, String> {
@@ -253,7 +260,7 @@ impl AgentTool for CaduceusKanbanTool {
                     if column_id == "in-progress" {
                         if let Some(card) = board.cards.iter().find(|c| c.id == card_id) {
                             if let Some(branch) = &card.worktree_branch {
-                                let wt_path = Self::worktree_path(branch);
+                                let wt_path = Self::worktree_path(branch).map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
                                 let _ = self.engine.git_create_worktree(branch, &wt_path);
                             }
                         }
@@ -303,7 +310,7 @@ impl AgentTool for CaduceusKanbanTool {
 
                     // Remove worktree for the completed card
                     if let Some(branch) = &completed_branch {
-                        let wt_path = Self::worktree_path(branch);
+                        let wt_path = Self::worktree_path(branch).map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
                         let _ = self.engine.git_remove_worktree(&wt_path);
                     }
 
@@ -312,7 +319,7 @@ impl AgentTool for CaduceusKanbanTool {
                         let id_part = started_id.split(':').next().unwrap_or(started_id);
                         if let Some(card) = board.cards.iter().find(|c| c.id == id_part) {
                             if let Some(branch) = &card.worktree_branch {
-                                let wt_path = Self::worktree_path(branch);
+                                let wt_path = Self::worktree_path(branch).map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
                                 let _ = self.engine.git_create_worktree(branch, &wt_path);
                             }
                         }

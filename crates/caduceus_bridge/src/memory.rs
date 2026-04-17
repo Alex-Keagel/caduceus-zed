@@ -115,6 +115,10 @@ pub fn list(project_root: &Path) -> Vec<(String, String)> {
 }
 
 pub fn delete(project_root: &Path, key: &str) -> Result<(), String> {
+    // Block deletion of reserved keys from tool/user writes
+    if RESERVED_PREFIXES.iter().any(|p| key.starts_with(p)) {
+        return Err(format!("Cannot delete reserved key '{}' — managed by engine", key));
+    }
     let mut map = read_store(project_root);
     if map.remove(key).is_none() {
         return Err(format!("Key '{}' not found", key));

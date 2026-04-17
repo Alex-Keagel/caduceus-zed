@@ -1014,6 +1014,8 @@ pub struct Thread {
     context_pins: caduceus_bridge::orchestrator::ContextManager,
     /// Task DAG for multi-agent decomposition (per-thread, not global)
     task_dag: std::sync::Arc<std::sync::Mutex<caduceus_bridge::orchestrator::TaskDAG>>,
+    /// Cached total token estimate (invalidated on message changes)
+    cached_token_estimate: Option<u32>,
 }
 
 impl Thread {
@@ -1145,6 +1147,7 @@ impl Thread {
             context_compacted_this_turn: false,
             context_pins: caduceus_bridge::orchestrator::ContextManager::new(128000),
             task_dag: std::sync::Arc::new(std::sync::Mutex::new(caduceus_bridge::orchestrator::TaskDAG::new())),
+            cached_token_estimate: None,
         }
     }
 
@@ -1390,6 +1393,7 @@ impl Thread {
             context_compacted_this_turn: false,
             context_pins: caduceus_bridge::orchestrator::ContextManager::new(128000),
             task_dag: std::sync::Arc::new(std::sync::Mutex::new(caduceus_bridge::orchestrator::TaskDAG::new())),
+            cached_token_estimate: None,
         }
     }
 
@@ -1577,9 +1581,10 @@ impl Thread {
 
         if read_only_modes.contains(&mode) {
             let allowed_tools = [
-                // Zed built-in read tools
+                // Zed built-in read tools (local only — no network)
                 "read_file", "find_path", "grep", "list_directory",
-                "diagnostics", "now", "fetch", "search_web", "open",
+                "diagnostics", "now", "open",
+                // fetch and search_web REMOVED — SSRF/exfiltration risk (SEC-12/13)
                 // Caduceus read-only tools (no state mutation)
                 "caduceus_semantic_search", "caduceus_index",
                 "caduceus_code_graph", "caduceus_tree_sitter",
@@ -1623,6 +1628,9 @@ impl Thread {
 
     /// Caduceus: estimate total tokens across all messages (DRY helper).
     fn estimate_total_tokens(&self) -> u32 {
+        if let Some(cached) = self.cached_token_estimate {
+            return cached;
+        }
         use caduceus_bridge::orchestrator::estimate_tokens;
         self.messages.iter().map(|m| match m {
             Message::User(u) => u.content.iter().map(|c| match c {
@@ -1632,6 +1640,25 @@ impl Thread {
             Message::Agent(a) => estimate_tokens(&a.to_markdown()),
             Message::Resume => 0,
         }).sum()
+    }
+
+    /// Recompute and cache the token estimate (call after message changes)
+    fn refresh_token_cache(&mut self) {
+        use caduceus_bridge::orchestrator::estimate_tokens;
+        let total: u32 = self.messages.iter().map(|m| match m {
+            Message::User(u) => u.content.iter().map(|c| match c {
+                UserMessageContent::Text(t) => estimate_tokens(t),
+                _ => 10,
+            }).sum::<u32>(),
+            Message::Agent(a) => estimate_tokens(&a.to_markdown()),
+            Message::Resume => 0,
+        }).sum();
+        self.cached_token_estimate = Some(total);
+    }
+
+    /// Invalidate cached token estimate (call when messages change)
+    fn invalidate_token_cache(&mut self) {
+        self.cached_token_estimate = None;
     }
 
     /// Caduceus: estimate current context zone based on token usage.
@@ -1814,6 +1841,7 @@ impl Thread {
                 ))],
             }),
         );
+        self.invalidate_token_cache();
 
         log::info!(
             "[caduceus] Compacted: {} messages remain, ~{} tokens freed",
@@ -3299,6 +3327,7 @@ impl Thread {
         self.messages.push(Message::Agent(message));
         self.updated_at = Utc::now();
         self.clear_summary();
+        self.invalidate_token_cache();
 
         // Only extract memories from complete turns (not cancellations)
         if self.running_turn.is_none() {
