@@ -1489,9 +1489,10 @@ fn main() {
 #[test]
 fn estimate_tokens_unicode() {
     use caduceus_bridge::orchestrator::estimate_tokens;
-    // Multi-byte chars: token estimate uses len() (bytes, not chars)
-    let jp = estimate_tokens("こんにちは世界"); // 21 bytes
-    assert!(jp > 0, "Unicode text should produce non-zero tokens");
+    // "こんにちは世界" = 7 chars, 21 UTF-8 bytes.
+    // estimate_tokens uses len() (bytes): ceil(21 / 3.75 * 1.1) = ceil(6.16) = 7
+    let tokens = estimate_tokens("こんにちは世界");
+    assert_eq!(tokens, 7, "21-byte Japanese string should estimate to 7 tokens");
 }
 
 // ── Context Assembler ──────────────────────────────────────────────────────────
@@ -1527,7 +1528,8 @@ fn context_assembler_respects_budget() {
     assembler.add_source(ContextSource::Instructions("Follow these detailed instructions carefully...".to_string()));
     assembler.add_source(ContextSource::MemoryBank("Remember: the user prefers concise answers.".to_string()));
     let result = assembler.assemble();
-    assert!(result.total_tokens <= 15, "Should stay near budget, got {}", result.total_tokens);
+    // Rounding during truncation can add at most 1 token over budget
+    assert!(result.total_tokens <= 11, "Should respect budget of 10 (+1 rounding), got {}", result.total_tokens);
 }
 
 #[test]
@@ -1561,9 +1563,12 @@ fn context_assembler_tracks_truncated_sources() {
     assembler.add_source(ContextSource::SystemPrompt("Short".to_string()));
     assembler.add_source(ContextSource::Instructions("x".repeat(5000)));
     let result = assembler.assemble();
-    // The instructions source is too large — should be in truncated list
-    assert!(!result.sources_truncated.is_empty() || result.total_tokens <= 25,
-        "Large source should be truncated or budget should be respected");
+    assert!(result.total_tokens <= 20, "Budget must be respected, got {}", result.total_tokens);
+    assert!(
+        !result.sources_truncated.is_empty(),
+        "5000-char Instructions source should be in truncated list, got {:?}",
+        result.sources_truncated
+    );
 }
 
 // ── Compaction Pipeline ────────────────────────────────────────────────────────
@@ -1596,8 +1601,10 @@ fn compaction_trigger_tokens_exceed() {
     use caduceus_bridge::orchestrator::{CompactionTrigger, ContextStats};
     let trigger = CompactionTrigger::TokensExceed(8000);
     let under = ContextStats { total_tokens: 7000, message_count: 10, turn_count: 5 };
+    let exact = ContextStats { total_tokens: 8000, message_count: 10, turn_count: 5 };
     let over = ContextStats { total_tokens: 8500, message_count: 10, turn_count: 5 };
     assert!(!trigger.should_compact(&under), "7000 tokens should not exceed 8000 threshold");
+    assert!(!trigger.should_compact(&exact), "8000 tokens must not trigger (strict >)");
     assert!(trigger.should_compact(&over), "8500 tokens should exceed 8000 threshold");
 }
 
@@ -1638,11 +1645,45 @@ fn compaction_trigger_turns_exceed() {
 }
 
 #[test]
+fn compaction_trigger_all_requires_all() {
+    use caduceus_bridge::orchestrator::{CompactionTrigger, ContextStats};
+    let trigger = CompactionTrigger::All(vec![
+        CompactionTrigger::TokensExceed(1000),
+        CompactionTrigger::TurnsExceed(5),
+    ]);
+    let only_tokens = ContextStats { total_tokens: 1500, message_count: 5, turn_count: 3 };
+    let both_met = ContextStats { total_tokens: 1500, message_count: 5, turn_count: 8 };
+    let neither = ContextStats { total_tokens: 100, message_count: 1, turn_count: 1 };
+    assert!(!trigger.should_compact(&only_tokens), "All: must require every trigger");
+    assert!(trigger.should_compact(&both_met), "All: should fire when both conditions met");
+    assert!(!trigger.should_compact(&neither));
+    // Empty All must NOT vacuously fire
+    let empty = CompactionTrigger::All(vec![]);
+    assert!(!empty.should_compact(&both_met), "Empty All must not fire");
+}
+
+#[test]
+fn compaction_trigger_any_requires_one() {
+    use caduceus_bridge::orchestrator::{CompactionTrigger, ContextStats};
+    let trigger = CompactionTrigger::Any(vec![
+        CompactionTrigger::TokensExceed(1000),
+        CompactionTrigger::TurnsExceed(5),
+    ]);
+    let only_tokens = ContextStats { total_tokens: 1500, message_count: 5, turn_count: 3 };
+    let neither = ContextStats { total_tokens: 100, message_count: 1, turn_count: 1 };
+    assert!(trigger.should_compact(&only_tokens), "Any: one satisfied trigger should fire");
+    assert!(!trigger.should_compact(&neither), "Any: no triggers satisfied");
+}
+
+#[test]
 fn compaction_pipeline_default_creates() {
     use caduceus_bridge::orchestrator::CompactionPipeline;
     let pipeline = CompactionPipeline::default_pipeline(4000);
-    // Should create without panic — pipeline is opaque, just verify construction
-    let _ = pipeline;
+    // Verify the pipeline was constructed — run on empty groups for no-op
+    let mut groups = vec![];
+    let result = pipeline.run(&mut groups);
+    assert!(result.strategies_applied.is_empty(), "Empty groups should produce no-op");
+    assert_eq!(result.total_removed_tokens, 0);
 }
 
 #[test]
@@ -1656,9 +1697,13 @@ fn compaction_pipeline_runs_on_messages() {
     }).collect();
     let mut groups = build_message_groups(&messages);
     let original_tokens: usize = groups.iter().map(|g| g.total_tokens()).sum();
+    assert!(original_tokens > 500, "Precondition: messages must exceed budget for pipeline to act");
     let result = pipeline.run(&mut groups);
-    assert!(!result.strategies_applied.is_empty() || original_tokens <= 500,
-        "Pipeline should apply strategies or content already fits budget");
+    assert!(
+        !result.strategies_applied.is_empty(),
+        "Pipeline must apply at least one strategy when input ({} tokens) exceeds budget (500)",
+        original_tokens
+    );
 }
 
 // ── Context Command Parsing (Slash Commands) ───────────────────────────────────
@@ -1835,11 +1880,14 @@ fn self_eviction_checkpoint_and_resume() {
 fn self_eviction_purge() {
     use caduceus_bridge::orchestrator::compaction::SelfEvictionManager;
     let mut mgr = SelfEvictionManager::new();
-    let id1 = mgr.checkpoint(vec!["fact1".to_string()]);
+    let _id1 = mgr.checkpoint(vec!["fact1".to_string()]);
     let _id2 = mgr.checkpoint(vec!["fact2".to_string()]);
-    let purged = mgr.purge_before(&id1);
-    // Should purge the first checkpoint (or none if it's the cutoff)
-    assert!(purged <= 2, "Should purge 0-2 checkpoints");
+    let id3 = mgr.checkpoint(vec!["fact3".to_string()]);
+    // purge_before(id3) removes id1 and id2
+    let freed = mgr.purge_before(&id3);
+    assert!(freed > 0, "Should free bytes from purged checkpoints, got {}", freed);
+    assert_eq!(mgr.list_checkpoints().len(), 1, "Only id3 should remain");
+    assert!(mgr.resume_from(&id3).is_some());
 }
 
 #[test]
@@ -1991,7 +2039,7 @@ fn loop_detection_simulated_repetition() {
 }
 
 #[test]
-fn loop_detection_different_tools_no_trigger() {
+fn loop_detection_spec_different_tools_no_trigger() {
     let tool_calls = vec!["edit_file", "read_file", "edit_file", "read_file"];
     let mut consecutive_count = 0u32;
     let mut last_tool: Option<&str> = None;
@@ -2011,10 +2059,13 @@ fn loop_detection_different_tools_no_trigger() {
     assert!(!loop_detected, "Alternating tools should not trigger loop detection");
 }
 
-// ── Circuit Breaker (behavioral simulation) ────────────────────────────────
+// ── Circuit Breaker (specification tests) ──────────────────────────────
+// These tests document INTENDED circuit breaker behavior as a specification.
+// The actual circuit breaker lives in thread.rs (gpui context, not unit-testable here).
+// TODO: Export CircuitBreaker struct and test it directly.
 
 #[test]
-fn circuit_breaker_trips_after_5_failures() {
+fn circuit_breaker_spec_trips_after_5_failures() {
     let max_failures = 5u32;
     let mut consecutive_failures = 0u32;
     let results = vec![false, false, false, false, false]; // 5 failures
@@ -2030,7 +2081,7 @@ fn circuit_breaker_trips_after_5_failures() {
 }
 
 #[test]
-fn circuit_breaker_resets_on_success() {
+fn circuit_breaker_spec_resets_on_success() {
     let mut consecutive_failures = 0u32;
     let results = vec![false, false, true, false, false, false]; // success at index 2 resets
 
@@ -2046,7 +2097,7 @@ fn circuit_breaker_resets_on_success() {
 }
 
 #[test]
-fn circuit_breaker_permission_denied_excluded() {
+fn circuit_breaker_spec_permission_denied_excluded() {
     // Simulates: permission denials don't count as failures
     let mut consecutive_failures = 0u32;
     let results: Vec<(&str, bool)> = vec![
@@ -2069,10 +2120,12 @@ fn circuit_breaker_permission_denied_excluded() {
     assert!(consecutive_failures < 5, "Circuit breaker should not trip with permission denials excluded");
 }
 
-// ── Compaction Cooldown (behavioral simulation) ────────────────────────────
+// ── Compaction Cooldown (specification test) ───────────────────────────────
+// Validates intended cooldown behavior. No crate API tested directly.
+// TODO: Export CompactionCooldown struct and test it directly.
 
 #[test]
-fn compaction_cooldown_prevents_double_fire() {
+fn compaction_cooldown_spec_prevents_double_fire() {
     use std::time::Instant;
     let cooldown_secs = 30u64;
     let mut last_compacted: Option<Instant> = None;
@@ -2144,7 +2197,8 @@ fn context_manager_strategy() {
 fn context_manager_should_compact_respects_threshold() {
     use caduceus_bridge::orchestrator::context::{ContextManager, ContextBreakdown};
     use caduceus_bridge::orchestrator::ContextZone;
-    // should_compact triggers on zone (Orange/Red/Critical), not raw threshold
+    // should_compact derives zone from fill_percentage() (total_tokens/context_limit).
+    // The .zone field on ContextBreakdown is NOT read — zone is recomputed internally.
     let mgr = ContextManager::new(10000);
     // 40% = Green — should NOT compact
     let green = ContextBreakdown {
@@ -2191,4 +2245,47 @@ fn context_source_conversation_history() {
     ]));
     let result = assembler.assemble();
     assert!(result.content.contains("Rust"), "Conversation should appear in assembled output");
+}
+
+#[test]
+fn context_source_pinned() {
+    use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
+    let mut assembler = ContextAssembler::new(10000);
+    assembler.add_source(ContextSource::Pinned("Always respond in JSON format.".to_string()));
+    let result = assembler.assemble();
+    assert!(result.content.contains("JSON"), "Pinned content should appear in assembled output");
+}
+
+#[test]
+fn context_source_git_diff() {
+    use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
+    let mut assembler = ContextAssembler::new(10000);
+    assembler.add_source(ContextSource::GitDiff("diff --git a/main.rs b/main.rs\n+fn new_function() {}".to_string()));
+    let result = assembler.assemble();
+    assert!(result.content.contains("new_function"), "Git diff should appear in assembled output");
+}
+
+// ── Negative/Edge Cases ────────────────────────────────────────────────────
+
+#[test]
+fn context_zone_negative_percentage() {
+    use caduceus_bridge::orchestrator::ContextZone;
+    assert_eq!(ContextZone::from_percentage(-1.0), ContextZone::Green);
+    assert_eq!(ContextZone::from_percentage(-100.0), ContextZone::Green);
+}
+
+#[test]
+fn estimate_tokens_whitespace_only() {
+    use caduceus_bridge::orchestrator::estimate_tokens;
+    let tokens = estimate_tokens("   \n\t\n   ");
+    assert!(tokens > 0, "Whitespace has bytes, should produce tokens");
+}
+
+#[test]
+fn dual_model_compactor_zero_original() {
+    use caduceus_bridge::orchestrator::compaction::DualModelCompactor;
+    let compactor = DualModelCompactor::new("gpt-4", "gpt-3.5");
+    let savings = compactor.estimate_savings(0, 100);
+    // Division by zero protection
+    assert!(savings.is_finite(), "Should handle zero-token original without panic");
 }
