@@ -336,6 +336,8 @@ pub struct ThreadView {
     pub history: Option<Entity<ThreadHistory>>,
     pub _history_subscription: Option<Subscription>,
     checkpoint_count_cache: (Instant, Option<usize>),
+    checkpoint_tooltip_cache: Option<String>,
+    _guardrail_dismiss_task: Option<Task<()>>,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -579,6 +581,8 @@ impl ThreadView {
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
             checkpoint_count_cache: (Instant::now() - std::time::Duration::from_secs(60), None),
+            checkpoint_tooltip_cache: None,
+            _guardrail_dismiss_task: None,
         };
 
         this.sync_generating_indicator(cx);
@@ -3555,7 +3559,7 @@ impl ThreadView {
     }
 
     /// Caduceus: render guardrail alert banner when loop/circuit breaker fires
-    fn render_guardrail_alert(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_guardrail_alert(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.as_native_thread(cx)?;
         let (alert_msg, severity) = {
             let t = thread.read(cx);
@@ -3563,14 +3567,18 @@ impl ThreadView {
             (msg.to_string(), sev)
         };
 
-        // Schedule auto-dismiss after 10s TTL expires
-        cx.spawn(async move |_this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(10))
-                .await;
-            _this.update(cx, |_, cx| cx.notify()).ok();
-        })
-        .detach();
+        // Schedule auto-dismiss ONCE (not per frame)
+        if self._guardrail_dismiss_task.is_none() {
+            self._guardrail_dismiss_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(10))
+                    .await;
+                this.update(cx, |this, cx| {
+                    this._guardrail_dismiss_task = None;
+                    cx.notify();
+                }).ok();
+            }));
+        }
 
         let (bg_color, border_color) = match severity {
             agent::AlertSeverity::Error => (cx.theme().status().error.opacity(0.1), cx.theme().status().error.opacity(0.4)),
@@ -3671,51 +3679,39 @@ impl ThreadView {
             let root = worktree.read(cx).abs_path();
             let checkpoint_dir = root.join(".caduceus").join("checkpoints");
 
-            let new_count = if checkpoint_dir.exists() {
-                std::fs::read_dir(&checkpoint_dir)
-                    .ok()
-                    .map(|entries| entries.count())
-                    .filter(|&c| c > 0)
-            } else {
-                None
-            };
-
-            self.checkpoint_count_cache = (Instant::now(), new_count);
-            new_count
-        };
-
-        let count = count?;
-
-        // Read checkpoint labels for tooltip
-        let checkpoint_tooltip = if let Some(project) = self.project.upgrade() {
-            let project_read = project.read(cx);
-            if let Some(worktree) = project_read.worktrees(cx).next() {
-                let root = worktree.read(cx).abs_path();
-                let checkpoint_dir = root.join(".caduceus").join("checkpoints");
-                let mut labels: Vec<String> = std::fs::read_dir(&checkpoint_dir)
+            let (new_count, tooltip) = if checkpoint_dir.exists() {
+                let entries: Vec<String> = std::fs::read_dir(&checkpoint_dir)
                     .ok()
                     .map(|entries| {
-                        entries
+                        let mut names: Vec<String> = entries
                             .filter_map(|e| e.ok())
                             .filter_map(|e| e.file_name().into_string().ok())
                             .filter(|name| name.ends_with(".tar.gz") || name.ends_with(".json"))
                             .take(5)
-                            .collect()
+                            .collect();
+                        names.sort();
+                        names
                     })
                     .unwrap_or_default();
-                labels.sort();
-                if labels.is_empty() {
-                    format!("📌 {} checkpoints\nUse /checkpoint to create one", count)
+                let cnt = entries.len();
+                if cnt == 0 {
+                    (None, "No checkpoints".to_string())
                 } else {
-                    let list = labels.join(", ");
-                    format!("📌 {} checkpoints: {}\nUse /checkpoint to manage", count, list)
+                    let tip = format!("📌 {} checkpoints: {}\nUse /checkpoint to manage", cnt, entries.join(", "));
+                    (Some(cnt), tip)
                 }
             } else {
-                format!("📌 {} checkpoints", count)
-            }
-        } else {
-            format!("📌 {} checkpoints", count)
+                (None, "No checkpoints".to_string())
+            };
+
+            self.checkpoint_count_cache = (Instant::now(), new_count);
+            self.checkpoint_tooltip_cache = Some(tooltip);
+            new_count
         };
+
+        let count = count?;
+        let tooltip = self.checkpoint_tooltip_cache.clone()
+            .unwrap_or_else(|| format!("📌 {} checkpoints", count));
 
         Some(
             div()
@@ -3726,7 +3722,7 @@ impl ThreadView {
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
-                .tooltip(Tooltip::text(checkpoint_tooltip)),
+                .tooltip(Tooltip::text(tooltip)),
         )
     }
 

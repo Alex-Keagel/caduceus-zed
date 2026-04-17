@@ -1623,6 +1623,16 @@ impl Thread {
     /// Triggers based on both message count AND estimated token usage.
     /// Uses engine's ContextZone (Green/Yellow/Orange/Red/Critical) for decisions.
     pub(crate) fn auto_compact_context(&mut self, cx: &mut Context<Self>) -> bool {
+        let zone = self.current_context_zone();
+        self.auto_compact_context_with_zone(zone, cx)
+    }
+
+    /// Same as auto_compact_context but accepts a pre-computed zone to avoid recomputation.
+    fn auto_compact_context_with_zone(
+        &mut self,
+        zone: caduceus_bridge::orchestrator::ContextZone,
+        cx: &mut Context<Self>,
+    ) -> bool {
         use caduceus_bridge::orchestrator::{estimate_tokens, ContextZone};
 
         // Use compaction cooldown guard
@@ -1630,13 +1640,9 @@ impl Thread {
             return false; // Compacted recently, skip
         }
 
-        // Estimate current context size (reuse DRY helper)
         let total_tokens = self.estimate_total_tokens();
-
-        // Determine context zone
         let max_context = self.model_max_tokens();
-        let fill_pct = (total_tokens as f64 / max_context as f64) * 100.0;
-        let zone = ContextZone::from_percentage(fill_pct);
+        let fill_pct = if max_context == 0 { 0.0 } else { (total_tokens as f64 / max_context as f64) * 100.0 };
 
         // Also check message count
         let msg_count = self.messages.len();
@@ -2234,8 +2240,8 @@ impl Thread {
             _ => {}
         }
 
-        // Caduceus: auto-compact context when message count is high
-        self.auto_compact_context(cx);
+        // Caduceus: auto-compact context — pass pre-computed zone to avoid recomputation
+        self.auto_compact_context_with_zone(zone, cx);
 
         // Flush the old pending message synchronously before cancelling,
         // to avoid a race where the detached cancel task might flush the NEW
