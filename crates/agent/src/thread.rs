@@ -1577,9 +1577,17 @@ impl Thread {
             return true;
         }
 
-        let read_only_modes = ["plan", "research", "architect", "review"];
+        // Use engine's AgentMode for read-only classification
+        let is_read_only = caduceus_bridge::orchestrator::BridgeAgentMode::from_str_loose(mode)
+            .map(|m| matches!(m,
+                caduceus_bridge::orchestrator::BridgeAgentMode::Plan
+                | caduceus_bridge::orchestrator::BridgeAgentMode::Research
+                | caduceus_bridge::orchestrator::BridgeAgentMode::Architect
+                | caduceus_bridge::orchestrator::BridgeAgentMode::Review
+            ))
+            .unwrap_or(false);
 
-        if read_only_modes.contains(&mode) {
+        if is_read_only {
             let allowed_tools = [
                 // Zed built-in read tools (local only — no network)
                 "read_file", "find_path", "grep", "list_directory",

@@ -1303,20 +1303,17 @@ impl NativeAgentConnection {
                 "📌 Use the `caduceus_checkpoint` tool with operation `create` and a label to save a checkpoint.".to_string()
             }
             "mode" => {
+                use caduceus_bridge::orchestrator::BridgeAgentMode;
                 let mode_name = args.trim();
-                let valid_modes = [
-                    "plan", "act", "research", "autopilot", "architect", "debug", "review",
-                ];
                 if mode_name.is_empty() {
                     let current = self
                         .thread(session_id, cx)
-                        .map(|t| t.read(cx).profile().0.to_string())
+                        .map(|t| t.read(cx).caduceus_mode_name().to_string())
                         .unwrap_or_else(|| "act".to_string());
                     format!(
-                        "Current mode: **{current}**\nAvailable: {}",
-                        valid_modes.join(", ")
+                        "Current mode: **{current}**\nAvailable: plan, act, research, autopilot, architect, debug, review"
                     )
-                } else if valid_modes.contains(&mode_name) {
+                } else if BridgeAgentMode::from_str_loose(mode_name).is_some() {
                     let modes = self
                         .0
                         .read(cx)
@@ -1334,8 +1331,7 @@ impl NativeAgentConnection {
                     format!("✅ Mode switched to **{mode_name}**")
                 } else {
                     format!(
-                        "❌ Unknown mode '{mode_name}'. Valid: {}",
-                        valid_modes.join(", ")
+                        "❌ Unknown mode '{mode_name}'. Valid: plan, act, research, autopilot, architect, debug, review"
                     )
                 }
             }
