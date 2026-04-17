@@ -35,7 +35,7 @@ fn validate_key(key: &str) -> Result<(), String> {
 }
 
 /// Reserved key prefixes that only the engine can write (not tool-accessible)
-const RESERVED_PREFIXES: &[&str] = &["wiki:", "system:", "caduceus:"];
+const RESERVED_PREFIXES: &[&str] = &["wiki:", "system:", "caduceus:", "auto:"];
 
 fn read_store(project_root: &Path) -> BTreeMap<String, String> {
     let json_path = project_root.join(".caduceus/memory.json");

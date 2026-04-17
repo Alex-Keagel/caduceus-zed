@@ -83,14 +83,18 @@ impl From<CaduceusTaskDecomposeToolOutput> for LanguageModelToolResultContent {
 use std::sync::Mutex;
 use caduceus_bridge::orchestrator::TaskDAG;
 
-static ACTIVE_DAG: std::sync::LazyLock<Mutex<TaskDAG>> =
-    std::sync::LazyLock::new(|| Mutex::new(TaskDAG::new()));
+/// Maximum number of tasks per DAG
+const MAX_DAG_TASKS: usize = 50;
+const MAX_TASK_ID_LEN: usize = 64;
+const MAX_TASK_TITLE_LEN: usize = 256;
 
-pub struct CaduceusTaskDecomposeTool;
+pub struct CaduceusTaskDecomposeTool {
+    dag: Arc<Mutex<TaskDAG>>,
+}
 
 impl CaduceusTaskDecomposeTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(dag: Arc<Mutex<TaskDAG>>) -> Self {
+        Self { dag }
     }
 }
 
@@ -136,17 +140,23 @@ impl AgentTool for CaduceusTaskDecomposeTool {
                 }
             })?;
 
-            let mut dag = ACTIVE_DAG.lock().map_err(|e| {
-                CaduceusTaskDecomposeToolOutput::Error {
-                    error: format!("DAG lock error: {e}"),
-                }
-            })?;
+            let mut dag = self.dag.lock().unwrap_or_else(|e| e.into_inner());
 
             let result = match input.operation {
                 TaskDecomposeOperation::Create { tasks } => {
+                    if tasks.len() > MAX_DAG_TASKS {
+                        return Err(CaduceusTaskDecomposeToolOutput::Error {
+                            error: format!("Too many tasks ({}, max {})", tasks.len(), MAX_DAG_TASKS),
+                        });
+                    }
+                    let prev_incomplete = dag.tasks().values().any(|t| !t.status.is_terminal());
                     *dag = TaskDAG::new();
                     let mut errors = Vec::new();
                     for task in &tasks {
+                        if task.id.len() > MAX_TASK_ID_LEN || task.title.len() > MAX_TASK_TITLE_LEN {
+                            errors.push(format!("{}: id or title too long", task.id));
+                            continue;
+                        }
                         let mut td = caduceus_bridge::orchestrator::TaskDefinition::new(
                             &task.id, &task.title,
                         );
@@ -164,7 +174,8 @@ impl AgentTool for CaduceusTaskDecomposeTool {
                         }
                     }
                     if errors.is_empty() {
-                        format!("✅ Created DAG with {} tasks. Use `ready` to see executable tasks.", tasks.len())
+                        let prefix = if prev_incomplete { "⚠️ Previous DAG had incomplete tasks. " } else { "" };
+                        format!("{prefix}✅ Created DAG with {} tasks. Use `ready` to see executable tasks.", tasks.len())
                     } else {
                         format!("⚠️ Created DAG with {} tasks, {} errors:\n{}", 
                             tasks.len(), errors.len(), errors.join("\n"))

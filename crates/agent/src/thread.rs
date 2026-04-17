@@ -1012,6 +1012,8 @@ pub struct Thread {
     context_compacted_this_turn: bool,
     /// Pinned context items that survive compaction
     context_pins: caduceus_bridge::orchestrator::ContextManager,
+    /// Task DAG for multi-agent decomposition (per-thread, not global)
+    task_dag: std::sync::Arc<std::sync::Mutex<caduceus_bridge::orchestrator::TaskDAG>>,
 }
 
 impl Thread {
@@ -1142,6 +1144,7 @@ impl Thread {
             guardrail_alert: None,
             context_compacted_this_turn: false,
             context_pins: caduceus_bridge::orchestrator::ContextManager::new(128000),
+            task_dag: std::sync::Arc::new(std::sync::Mutex::new(caduceus_bridge::orchestrator::TaskDAG::new())),
         }
     }
 
@@ -1386,6 +1389,7 @@ impl Thread {
             guardrail_alert: None,
             context_compacted_this_turn: false,
             context_pins: caduceus_bridge::orchestrator::ContextManager::new(128000),
+            task_dag: std::sync::Arc::new(std::sync::Mutex::new(caduceus_bridge::orchestrator::TaskDAG::new())),
         }
     }
 
@@ -2015,7 +2019,7 @@ impl Thread {
         self.add_tool(CaduceusModeRequestTool::new());
         self.add_tool(CaduceusTreeSitterTool::new(self.project.clone()));
         self.add_tool(CaduceusTaskTreeTool::new());
-        self.add_tool(CaduceusTaskDecomposeTool::new());
+        self.add_tool(CaduceusTaskDecomposeTool::new(self.task_dag.clone()));
         self.add_tool(CaduceusKillSwitchTool::new());
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
@@ -3296,8 +3300,10 @@ impl Thread {
         self.updated_at = Utc::now();
         self.clear_summary();
 
-        // Caduceus: auto-extract memories from the latest user→agent exchange
-        self.auto_extract_memories(cx);
+        // Only extract memories from complete turns (not cancellations)
+        if self.running_turn.is_none() {
+            self.auto_extract_memories(cx);
+        }
 
         cx.notify()
     }
@@ -3334,10 +3340,13 @@ impl Thread {
                 if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
                     let root = worktree.read(cx).abs_path().to_path_buf();
                     for mem in &memories {
-                        // Use a deterministic key from the memory content
-                        let key = format!("auto:{}", &mem.chars().take(30).collect::<String>()
-                            .replace(' ', "_").replace('\n', ""));
-                        let _ = caduceus_bridge::memory::store(&root, &key, mem);
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        mem.hash(&mut hasher);
+                        let key = format!("auto:{:x}", hasher.finish());
+                        if let Err(e) = caduceus_bridge::memory::store_system(&root, &key, mem) {
+                            log::warn!("[caduceus] Failed to store auto-memory: {e}");
+                        }
                     }
                     if !memories.is_empty() {
                         log::debug!("[caduceus] Auto-extracted {} memories from turn", memories.len());
