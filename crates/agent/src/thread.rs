@@ -1634,21 +1634,21 @@ impl Thread {
         zone: caduceus_bridge::orchestrator::ContextZone,
         cx: &mut Context<Self>,
     ) -> bool {
-        use caduceus_bridge::orchestrator::{estimate_tokens, ContextZone};
+        use caduceus_bridge::orchestrator::{estimate_tokens, ContextZone, CompactMessage, CompactionPipeline};
+        use caduceus_bridge::orchestrator::compaction::{build_message_groups, MessageGroupKind};
 
         // Use compaction cooldown guard
         if !self.compaction_cooldown.can_compact() {
-            return false; // Compacted recently, skip
+            return false;
         }
 
         let total_tokens = self.estimate_total_tokens();
         let max_context = self.model_max_tokens();
         let fill_pct = if max_context == 0 { 0.0 } else { (total_tokens as f64 / max_context as f64) * 100.0 };
 
-        // Also check message count
         let msg_count = self.messages.len();
 
-        // Decide whether to compact
+        // Decide whether to compact based on zone + message count
         let (should_compact, keep_recent) = match zone {
             ContextZone::Green => {
                 if msg_count > 60 { (true, 20) } else { (false, 0) }
@@ -1681,40 +1681,48 @@ impl Thread {
             self.messages.len(), fill_pct, zone, keep_recent
         );
 
-        // Build summary of older messages
-        let mut summary = String::from("# Conversation Context (auto-compacted)\n\n");
-        for msg in &self.messages[..messages_to_compact] {
-            match msg {
+        // Convert IDE messages to engine CompactMessages for the pipeline
+        let compact_messages: Vec<CompactMessage> = self.messages[..messages_to_compact]
+            .iter()
+            .map(|msg| match msg {
                 Message::User(u) => {
-                    summary.push_str("**User:** ");
-                    for content in &u.content {
-                        match content {
-                            UserMessageContent::Text(t) => {
-                                let truncated: String = t.chars().take(200).collect();
-                                summary.push_str(&truncated);
-                            }
-                            _ => summary.push_str("[attachment]"),
-                        }
-                    }
-                    summary.push('\n');
+                    let text: String = u.content.iter().map(|c| match c {
+                        UserMessageContent::Text(t) => t.as_str(),
+                        _ => "[attachment]",
+                    }).collect::<Vec<_>>().join(" ");
+                    CompactMessage::new("user", text)
                 }
                 Message::Agent(a) => {
                     let text = a.to_markdown();
-                    // Collapse tool results to just the tool name (they're usually the biggest)
                     if text.contains("Tool Call:") || text.contains("Status: Completed") {
-                        summary.push_str("**Agent:** [tool calls executed]\n");
+                        CompactMessage::new("tool", "[tool calls executed]")
                     } else {
-                        let truncated: String = text.chars().take(300).collect();
-                        summary.push_str("**Assistant:** ");
-                        summary.push_str(&truncated);
-                        summary.push('\n');
+                        CompactMessage::new("assistant", text)
                     }
                 }
-                Message::Resume => {
-                    summary.push_str("[session resumed]\n");
-                }
-            }
-        }
+                Message::Resume => CompactMessage::new("system", "[session resumed]"),
+            })
+            .collect();
+
+        // Run engine's compaction pipeline — tool collapse + summarize
+        let mut groups = build_message_groups(&compact_messages);
+        let budget = (max_context as usize) / 4; // target 25% of context for summary
+        let pipeline = CompactionPipeline::default_pipeline(budget);
+        let result = pipeline.run(&mut groups);
+
+        // Extract summary from the pipeline output (Summary groups contain the compacted text)
+        let summary: String = groups
+            .iter()
+            .filter(|g| !g.excluded)
+            .flat_map(|g| &g.messages)
+            .map(|m| format!("{}: {}", m.role, m.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        log::info!(
+            "[caduceus] Pipeline applied {} strategies, freed {} tokens",
+            result.strategies_applied.len(), result.total_removed_tokens
+        );
 
         // Save context summary to project in background
         if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
@@ -1743,7 +1751,7 @@ impl Thread {
             Message::User(UserMessage {
                 id: acp_thread::UserMessageId::new(),
                 content: vec![UserMessageContent::Text(format!(
-                    "[Context compacted — {} older messages summarized, {:.0}% token usage]\n\n{}",
+                    "[Context compacted — {} older messages summarized via engine pipeline, {:.0}% token usage]\n\n{}",
                     messages_to_compact, fill_pct, summary
                 ))],
             }),
