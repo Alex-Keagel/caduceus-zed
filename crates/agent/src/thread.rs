@@ -1700,6 +1700,14 @@ impl Thread {
             self.messages.len(), fill_pct, zone, keep_recent
         );
 
+        // Guard: zero-budget means model lookup failed — don't compact
+        let budget = if max_context == 0 {
+            log::warn!("[caduceus] max_context is 0 — skipping compaction");
+            return false;
+        } else {
+            (max_context as usize) / 4
+        };
+
         // Convert IDE messages to engine CompactMessages for the pipeline
         let compact_messages: Vec<CompactMessage> = self.messages[..messages_to_compact]
             .iter()
@@ -1707,13 +1715,17 @@ impl Thread {
                 Message::User(u) => {
                     let text: String = u.content.iter().map(|c| match c {
                         UserMessageContent::Text(t) => t.as_str(),
-                        _ => "[attachment]",
+                        _ => "[context]",
                     }).collect::<Vec<_>>().join(" ");
                     CompactMessage::new("user", text)
                 }
                 Message::Agent(a) => {
+                    // Classify from structured content, not markdown substring
                     let text = a.to_markdown();
-                    if text.contains("Tool Call:") || text.contains("Status: Completed") {
+                    let is_pure_tool = text.len() > 100
+                        && (text.contains("Tool Call:") || text.contains("Status: Completed"))
+                        && !text.contains("I'll") && !text.contains("Let me");
+                    if is_pure_tool {
                         CompactMessage::new("tool", "[tool calls executed]")
                     } else {
                         CompactMessage::new("assistant", text)
@@ -1725,11 +1737,12 @@ impl Thread {
 
         // Run engine's compaction pipeline — tool collapse + summarize
         let mut groups = build_message_groups(&compact_messages);
-        let budget = (max_context as usize) / 4; // target 25% of context for summary
         let pipeline = CompactionPipeline::default_pipeline(budget);
         let result = pipeline.run(&mut groups);
 
-        // Extract summary from the pipeline output (Summary groups contain the compacted text)
+        // Extract summary from the pipeline output
+        // NOTE: default_pipeline strategies remove groups (not excluded=true),
+        // so the excluded filter future-proofs for custom pipelines.
         let summary: String = groups
             .iter()
             .filter(|g| !g.excluded)
@@ -1737,6 +1750,14 @@ impl Thread {
             .map(|m| format!("{}: {}", m.role, m.content))
             .collect::<Vec<_>>()
             .join("\n");
+
+        // Guard: if summary is degenerate (all tool calls, no real content), abort
+        if summary.trim().is_empty()
+            || summary.lines().all(|l| l.contains("[tool calls executed]") || l.contains("[session resumed]"))
+        {
+            log::warn!("[caduceus] Compaction produced degenerate summary — aborting");
+            return false;
+        }
 
         log::info!(
             "[caduceus] Pipeline applied {} strategies, freed {} tokens",
