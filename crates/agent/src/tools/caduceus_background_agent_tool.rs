@@ -193,6 +193,19 @@ impl AgentTool for CaduceusBackgroundAgentTool {
                     mode,
                     auto_commit,
                 } => {
+                    // SEC-8: Enforce per-project agent quota
+                    const MAX_AGENTS: usize = 10;
+                    let existing = store.list_all();
+                    let active_count = existing.iter()
+                        .filter(|a| a.status != "completed" && a.status != "stopped")
+                        .count();
+                    if active_count >= MAX_AGENTS {
+                        return Err(CaduceusBackgroundAgentToolOutput::Error {
+                            error: format!("Agent limit reached ({MAX_AGENTS} active). Stop or complete existing agents first."),
+                        });
+                    }
+                    // SEC-7: Cap task description size
+                    let task_description: String = task_description.chars().take(2000).collect();
                     let id = uuid::Uuid::new_v4().to_string();
                     let config = BackgroundAgentConfig {
                         id: id.clone(),

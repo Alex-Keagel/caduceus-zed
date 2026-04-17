@@ -1557,11 +1557,12 @@ impl Thread {
                 // Zed built-in read tools
                 "read_file", "find_path", "grep", "list_directory",
                 "diagnostics", "now", "fetch", "search_web", "open",
-                // All Caduceus tools (they manage .caduceus/ state, not code)
+                // Caduceus read-only tools (no state mutation)
                 "caduceus_semantic_search", "caduceus_index",
                 "caduceus_code_graph", "caduceus_tree_sitter",
                 "caduceus_git_read", "caduceus_memory_read",
-                "caduceus_memory_write",
+                // caduceus_memory_write REMOVED — write access is privilege escalation
+                // caduceus_background_agent REMOVED — can spawn autopilot agents
                 "caduceus_dependency_scan", "caduceus_security_scan",
                 "caduceus_error_analysis", "caduceus_mcp_security",
                 "caduceus_prd", "caduceus_progress",
@@ -1571,7 +1572,7 @@ impl Thread {
                 "caduceus_task_tree", "caduceus_time_tracking",
                 "caduceus_policy", "caduceus_kanban",
                 "caduceus_checkpoint", "caduceus_storage",
-                "caduceus_automations", "caduceus_background_agent",
+                "caduceus_automations",
                 "caduceus_scaffold",
                 "caduceus_cross_search", "caduceus_api_registry",
                 "caduceus_architect", "caduceus_product",

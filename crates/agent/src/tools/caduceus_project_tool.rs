@@ -333,23 +333,44 @@ pub fn resolve_repo_path(
     project_root: &std::path::Path,
     repo_path: &str,
 ) -> Result<std::path::PathBuf, String> {
+    // Reject obvious traversal attempts
+    if repo_path.contains("..") {
+        return Err(format!("Repo path '{}' contains '..' — path traversal not allowed", repo_path));
+    }
+
     let p = std::path::PathBuf::from(repo_path);
     let resolved = if p.is_absolute() {
         p
     } else {
         project_root.join(repo_path)
     };
+
+    // Canonicalize to resolve symlinks and relative components
+    let canonical = resolved.canonicalize().map_err(|e| {
+        format!("Cannot resolve repo path '{}': {}", repo_path, e)
+    })?;
+
+    // Must be under project root or user's home directory
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let project_canonical = project_root.canonicalize().unwrap_or_else(|_| project_root.to_path_buf());
+
+    if !canonical.starts_with(&project_canonical) && !canonical.starts_with(&home) {
+        return Err(format!(
+            "Repo path '{}' resolves outside project and home directory — access denied",
+            repo_path
+        ));
+    }
+
+    // Block system directories even under home (e.g., ~/../../etc)
     let forbidden_prefixes = [
         "/etc", "/var", "/usr", "/bin", "/sbin", "/root", "/proc", "/sys", "/dev",
     ];
-    let path_str = resolved.to_string_lossy();
+    let canonical_str = canonical.to_string_lossy();
     for prefix in &forbidden_prefixes {
-        if path_str.starts_with(prefix) {
-            return Err(format!(
-                "Repo path '{}' points to a system directory",
-                repo_path
-            ));
+        if canonical_str.starts_with(prefix) {
+            return Err(format!("Repo path '{}' points to a system directory", repo_path));
         }
     }
-    Ok(resolved)
+
+    Ok(canonical)
 }

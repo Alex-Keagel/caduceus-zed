@@ -72,6 +72,55 @@ pub(crate) fn truncate_str(s: &str, max_chars: usize) -> &str {
     }
 }
 
+/// Check if a file path refers to a sensitive/secret file that should not
+/// be sent to the LLM. Blocks .env files, key files, credential stores, etc.
+pub(crate) fn is_sensitive_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let filename = lower.rsplit('/').next().unwrap_or(&lower);
+
+    // Exact filename matches
+    const SENSITIVE_NAMES: &[&str] = &[
+        ".env", ".env.local", ".env.production", ".env.development", ".env.staging",
+        ".env.test", ".npmrc", ".pypirc", ".netrc", ".pgpass", ".my.cnf",
+        "credentials", "credentials.json", "service-account.json",
+        "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+        ".htpasswd", "shadow", "passwd",
+    ];
+    if SENSITIVE_NAMES.contains(&filename) {
+        return true;
+    }
+
+    // Extension matches
+    const SENSITIVE_EXTENSIONS: &[&str] = &[
+        ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore",
+        ".env", // catches .env.anything
+    ];
+    for ext in SENSITIVE_EXTENSIONS {
+        if filename.ends_with(ext) {
+            return true;
+        }
+    }
+
+    // Path component matches (e.g., .ssh/, .gnupg/)
+    const SENSITIVE_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".kube"];
+    for dir in SENSITIVE_DIRS {
+        if lower.contains(&format!("/{}/", dir)) || lower.starts_with(&format!("{}/", dir)) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Redact sensitive content from a snippet before sending to LLM
+pub(crate) fn redact_if_sensitive(path: &str, content: &str) -> String {
+    if is_sensitive_file(path) {
+        format!("[REDACTED — {} is a sensitive file and was not sent to the model]", path)
+    } else {
+        content.to_string()
+    }
+}
+
 pub use caduceus_api_registry_tool::*;
 pub use caduceus_architect_tool::*;
 pub use caduceus_automations_tool::*;

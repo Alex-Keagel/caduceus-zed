@@ -119,6 +119,10 @@ impl AgentTool for CaduceusSemanticSearchTool {
                 Ok(hits) => {
                     let results: Vec<SearchHit> = hits
                         .into_iter()
+                        .filter(|(content, _)| {
+                            let path = content.lines().next().unwrap_or("");
+                            !crate::tools::is_sensitive_file(path)
+                        })
                         .map(|(content, score)| SearchHit {
                             path: content.lines().next().unwrap_or("unknown").to_string(),
                             snippet: content,

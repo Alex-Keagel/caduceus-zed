@@ -199,13 +199,18 @@ impl AgentTool for CaduceusCrossSearchTool {
                         match engine.semantic_search(&query, 5).await {
                             Ok(hits) => {
                                 for (content, score) in hits {
+                                    let path = content
+                                        .lines()
+                                        .next()
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    // Skip sensitive files
+                                    if crate::tools::is_sensitive_file(&path) {
+                                        continue;
+                                    }
                                     all_results.push(CrossSearchHit {
                                         repo: name.clone(),
-                                        path: content
-                                            .lines()
-                                            .next()
-                                            .unwrap_or("unknown")
-                                            .to_string(),
+                                        path,
                                         snippet: content,
                                         score,
                                     });
