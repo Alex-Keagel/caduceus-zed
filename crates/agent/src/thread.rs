@@ -6,7 +6,7 @@ use crate::{
     CaduceusMemoryReadTool, CaduceusMemoryWriteTool, CaduceusModeRequestTool,
     CaduceusPolicyTool, CaduceusPrdTool, CaduceusProductTool, CaduceusProjectTool, CaduceusProjectWikiTool,
     CaduceusProgressTool, CaduceusScaffoldTool, CaduceusSecurityScanTool,
-    CaduceusSemanticSearchTool, CaduceusStorageTool, CaduceusTaskTreeTool,
+    CaduceusSemanticSearchTool, CaduceusStorageTool, CaduceusTaskTreeTool, CaduceusTaskDecomposeTool,
     CaduceusTelemetryTool, CaduceusTimeTrackingTool, CaduceusTreeSitterTool, CaduceusWikiTool,
     ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, DbLanguageModel, DbThread, DeletePathTool,
@@ -1740,16 +1740,30 @@ impl Thread {
         let pipeline = CompactionPipeline::default_pipeline(budget);
         let result = pipeline.run(&mut groups);
 
-        // Extract summary from the pipeline output
-        // NOTE: default_pipeline strategies remove groups (not excluded=true),
-        // so the excluded filter future-proofs for custom pipelines.
-        let summary: String = groups
-            .iter()
-            .filter(|g| !g.excluded)
-            .flat_map(|g| &g.messages)
-            .map(|m| format!("{}: {}", m.role, m.content))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Extract summary from the pipeline output — prefer Summary groups,
+        // fall back to all surviving groups if no summary was generated
+        let summary: String = {
+            let summary_groups: Vec<_> = groups
+                .iter()
+                .filter(|g| g.kind == MessageGroupKind::Summary && !g.excluded)
+                .collect();
+            if !summary_groups.is_empty() {
+                summary_groups
+                    .iter()
+                    .flat_map(|g| &g.messages)
+                    .map(|m| m.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                groups
+                    .iter()
+                    .filter(|g| !g.excluded)
+                    .flat_map(|g| &g.messages)
+                    .map(|m| format!("{}: {}", m.role, m.content))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        };
 
         // Guard: if summary is degenerate (all tool calls, no real content), abort
         if summary.trim().is_empty()
@@ -2001,6 +2015,7 @@ impl Thread {
         self.add_tool(CaduceusModeRequestTool::new());
         self.add_tool(CaduceusTreeSitterTool::new(self.project.clone()));
         self.add_tool(CaduceusTaskTreeTool::new());
+        self.add_tool(CaduceusTaskDecomposeTool::new());
         self.add_tool(CaduceusKillSwitchTool::new());
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
@@ -3280,7 +3295,56 @@ impl Thread {
         self.messages.push(Message::Agent(message));
         self.updated_at = Utc::now();
         self.clear_summary();
+
+        // Caduceus: auto-extract memories from the latest user→agent exchange
+        self.auto_extract_memories(cx);
+
         cx.notify()
+    }
+
+    /// Extract important facts/preferences from the latest exchange and store them.
+    fn auto_extract_memories(&self, cx: &Context<Self>) {
+        // Need at least 2 messages (user + agent)
+        if self.messages.len() < 2 {
+            return;
+        }
+        // Get the last user message and last agent message
+        let last_user = self.messages.iter().rev().find_map(|m| {
+            if let Message::User(u) = m {
+                Some(u.content.iter().filter_map(|c| {
+                    if let UserMessageContent::Text(t) = c { Some(t.as_str()) } else { None }
+                }).collect::<Vec<_>>().join(" "))
+            } else {
+                None
+            }
+        });
+        let last_agent = self.messages.last().and_then(|m| {
+            if let Message::Agent(a) = m {
+                Some(a.to_markdown())
+            } else {
+                None
+            }
+        });
+
+        if let (Some(user_text), Some(agent_text)) = (last_user, last_agent) {
+            let memories = caduceus_bridge::orchestrator::OrchestratorBridge::extract_memories(
+                &user_text, &agent_text,
+            );
+            if !memories.is_empty() {
+                if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
+                    let root = worktree.read(cx).abs_path().to_path_buf();
+                    for mem in &memories {
+                        // Use a deterministic key from the memory content
+                        let key = format!("auto:{}", &mem.chars().take(30).collect::<String>()
+                            .replace(' ', "_").replace('\n', ""));
+                        let _ = caduceus_bridge::memory::store(&root, &key, mem);
+                    }
+                    if !memories.is_empty() {
+                        log::debug!("[caduceus] Auto-extracted {} memories from turn", memories.len());
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn build_completion_request(

@@ -32,6 +32,7 @@ pub use caduceus_orchestrator::{
     automations::{Automation, AutomationTrigger, AutomationAgentConfig, AutomationRegistry},
     context::{self, ContextZone, ContextSource, ContextAssembler, AssembledContext, estimate_tokens, ContextManager, PinnedContext},
     compaction::{self, CompactMessage, CompactionPipeline, ContextStats, CompactionTrigger},
+    workers::{TaskDAG, TaskDefinition, TaskStatus, SharedContext, TeamResult, AgentConfig},
 };
 
 // Re-export types needed by tools.
