@@ -779,6 +779,8 @@ struct CaduceusStatsCache {
     project_repo_count: usize,
     api_count: usize,
     health_score: Option<f64>,
+    memory_count: usize,
+    memory_entries: Vec<(String, String)>,
     last_refresh: Instant,
 }
 
@@ -793,6 +795,8 @@ impl Default for CaduceusStatsCache {
             project_repo_count: 0,
             api_count: 0,
             health_score: None,
+            memory_count: 0,
+            memory_entries: Vec::new(),
             last_refresh: Instant::now() - Duration::from_secs(60),
         }
     }
@@ -4514,8 +4518,30 @@ impl AgentPanel {
         health_score: Option<f64>,
         cx: &mut Context<Self>,
     ) -> Div {
+        let memory_count = self.caduceus_stats_cache.memory_count;
+        let memory_tooltip = if self.caduceus_stats_cache.memory_entries.is_empty() {
+            "No memories stored".to_string()
+        } else {
+            let mut tip = format!("🧠 {} memories:\n", memory_count);
+            for (k, v) in self.caduceus_stats_cache.memory_entries.iter().take(10) {
+                let truncated_v: String = v.chars().take(40).collect();
+                tip.push_str(&format!("  {} → {}\n", k, truncated_v));
+            }
+            if memory_count > 10 {
+                tip.push_str(&format!("  ... and {} more", memory_count - 10));
+            }
+            tip
+        };
+
         h_flex()
             .gap_1()
+            .when(memory_count > 0, |this| {
+                this.child(
+                    Label::new(format!("🧠 {memory_count}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Accent),
+                )
+            })
             .when(project_repo_count > 0, |this| {
                 let label = if let Some(ref name) = project_name {
                     let truncated: String = name.chars().take(12).collect();
@@ -4709,6 +4735,14 @@ impl AgentPanel {
             self.caduceus_stats_cache.project_repo_count = 0;
             self.caduceus_stats_cache.api_count = 0;
             self.caduceus_stats_cache.health_score = None;
+        }
+
+        // Memory entries
+        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
+            let root = worktree.read(cx).abs_path();
+            let entries = caduceus_bridge::memory::list(&root);
+            self.caduceus_stats_cache.memory_count = entries.len();
+            self.caduceus_stats_cache.memory_entries = entries;
         }
 
         self.caduceus_stats_cache.last_refresh = Instant::now();

@@ -3674,6 +3674,38 @@ impl ThreadView {
         };
 
         let count = count?;
+
+        // Read checkpoint labels for tooltip
+        let checkpoint_tooltip = if let Some(project) = self.project.upgrade() {
+            let project_read = project.read(cx);
+            if let Some(worktree) = project_read.worktrees(cx).next() {
+                let root = worktree.read(cx).abs_path();
+                let checkpoint_dir = root.join(".caduceus").join("checkpoints");
+                let mut labels: Vec<String> = std::fs::read_dir(&checkpoint_dir)
+                    .ok()
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .filter_map(|e| e.file_name().into_string().ok())
+                            .filter(|name| name.ends_with(".tar.gz") || name.ends_with(".json"))
+                            .take(5)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                labels.sort();
+                if labels.is_empty() {
+                    format!("📌 {} checkpoints\nUse /checkpoint to create one", count)
+                } else {
+                    let list = labels.join(", ");
+                    format!("📌 {} checkpoints: {}\nUse /checkpoint to manage", count, list)
+                }
+            } else {
+                format!("📌 {} checkpoints", count)
+            }
+        } else {
+            format!("📌 {} checkpoints", count)
+        };
+
         Some(
             div()
                 .id("checkpoint-status")
@@ -3683,7 +3715,7 @@ impl ThreadView {
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
-                .tooltip(Tooltip::text("Caduceus safety checkpoints")),
+                .tooltip(Tooltip::text(checkpoint_tooltip)),
         )
     }
 
