@@ -557,6 +557,27 @@ impl NativeAgent {
                     }
 
                     log::info!("[caduceus] Wiki populated for {}", root.display());
+
+                    // Summarize memory if too large
+                    let memory_path = root.join(".caduceus").join("memory.md");
+                    if let Ok(metadata) = std::fs::metadata(&memory_path) {
+                        if metadata.len() > 10_000 { // 10KB threshold
+                            log::info!("[caduceus] Memory file too large ({}KB), truncating old entries", metadata.len() / 1024);
+                            if let Ok(content) = std::fs::read_to_string(&memory_path) {
+                                let lines: Vec<&str> = content.lines().collect();
+                                // Keep header + last 50 lines
+                                let kept: Vec<&str> = if lines.len() > 52 {
+                                    let mut result = vec![lines[0]]; // header
+                                    result.extend_from_slice(&lines[lines.len()-50..]);
+                                    result
+                                } else {
+                                    lines
+                                };
+                                let _ = std::fs::write(&memory_path, kept.join("\n"));
+                                log::info!("[caduceus] Memory trimmed to {} lines", kept.len());
+                            }
+                        }
+                    }
                     } // end if !already_indexed
                 }
             }).detach();

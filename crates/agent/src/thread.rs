@@ -993,6 +993,10 @@ pub struct Thread {
     caduceus_mode: Option<String>,
     /// Cached project instructions to avoid repeated sync I/O
     cached_project_instructions: Option<String>,
+    /// Loop detection: tracks (tool_name, consecutive_count)
+    consecutive_same_tool: Option<(String, usize)>,
+    /// Circuit breaker: consecutive tool failure count
+    consecutive_tool_failures: u32,
 }
 
 impl Thread {
@@ -1115,6 +1119,8 @@ impl Thread {
             running_subagents: Vec::new(),
             caduceus_mode: None,
             cached_project_instructions: None,
+            consecutive_same_tool: None,
+            consecutive_tool_failures: 0,
         }
     }
 
@@ -1351,6 +1357,8 @@ impl Thread {
             running_subagents: Vec::new(),
             caduceus_mode: None,
             cached_project_instructions: None,
+            consecutive_same_tool: None,
+            consecutive_tool_failures: 0,
         }
     }
 
@@ -1520,11 +1528,35 @@ impl Thread {
         }
     }
 
+    /// Caduceus: estimate current context zone based on token usage.
+    fn current_context_zone(&self) -> caduceus_bridge::orchestrator::ContextZone {
+        use caduceus_bridge::orchestrator::{estimate_tokens, ContextZone};
+        let total: u32 = self.messages.iter().map(|m| match m {
+            Message::User(u) => u.content.iter().map(|c| match c {
+                UserMessageContent::Text(t) => estimate_tokens(t),
+                _ => 10,
+            }).sum::<u32>(),
+            Message::Agent(a) => estimate_tokens(&a.to_markdown()),
+            Message::Resume => 0,
+        }).sum();
+        let max = self.model.as_ref().map(|m| m.max_token_count() as u32).unwrap_or(64_000);
+        ContextZone::from_percentage((total as f64 / max as f64) * 100.0)
+    }
+
     /// Caduceus: smart context management using engine compaction pipeline.
     /// Triggers based on both message count AND estimated token usage.
     /// Uses engine's ContextZone (Green/Yellow/Orange/Red/Critical) for decisions.
     pub(crate) fn auto_compact_context(&mut self, cx: &mut Context<Self>) {
         use caduceus_bridge::orchestrator::{estimate_tokens, ContextZone};
+
+        // Skip if last message is already a compaction summary
+        if let Some(Message::User(last)) = self.messages.first() {
+            if let Some(UserMessageContent::Text(t)) = last.content.first() {
+                if t.starts_with("[Context compacted") {
+                    return; // Already compacted, don't double-fire
+                }
+            }
+        }
 
         // Estimate current context size
         let mut total_tokens: u32 = 0;
@@ -1605,11 +1637,16 @@ impl Thread {
                     summary.push('\n');
                 }
                 Message::Agent(a) => {
-                    summary.push_str("**Assistant:** ");
                     let text = a.to_markdown();
-                    let truncated: String = text.chars().take(300).collect();
-                    summary.push_str(&truncated);
-                    summary.push('\n');
+                    // Collapse tool results to just the tool name (they're usually the biggest)
+                    if text.contains("Tool Call:") || text.contains("Status: Completed") {
+                        summary.push_str("**Agent:** [tool calls executed]\n");
+                    } else {
+                        let truncated: String = text.chars().take(300).collect();
+                        summary.push_str("**Assistant:** ");
+                        summary.push_str(&truncated);
+                        summary.push('\n');
+                    }
                 }
                 Message::Resume => {
                     summary.push_str("[session resumed]\n");
@@ -2120,6 +2157,15 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        // Caduceus: check context zone and warn user
+        let zone = self.current_context_zone();
+        match zone {
+            caduceus_bridge::orchestrator::ContextZone::Orange => log::warn!("[caduceus] Context 70-85% full — consider /compact"),
+            caduceus_bridge::orchestrator::ContextZone::Red => log::warn!("[caduceus] Context 85-95% full — auto-compacting soon"),
+            caduceus_bridge::orchestrator::ContextZone::Critical => log::error!("[caduceus] Context >95% full — EMERGENCY"),
+            _ => {}
+        }
+
         // Caduceus: auto-compact context when message count is high
         self.auto_compact_context(cx);
 
@@ -2414,6 +2460,12 @@ impl Thread {
             None,
         );
         this.update(cx, |this, _cx| {
+            // Caduceus: track consecutive failures for circuit breaker
+            if tool_result.is_error {
+                this.consecutive_tool_failures += 1;
+            } else {
+                this.consecutive_tool_failures = 0;
+            }
             this.pending_message()
                 .tool_results
                 .insert(tool_result.tool_use_id.clone(), tool_result)
@@ -2630,6 +2682,55 @@ impl Thread {
                 is_error: true,
                 output: None,
             }));
+        }
+
+        // Caduceus: circuit breaker — stop after 5 consecutive tool failures
+        if self.consecutive_tool_failures >= 5 {
+            log::error!("[caduceus] Circuit breaker: {} consecutive failures", self.consecutive_tool_failures);
+            self.consecutive_tool_failures = 0;
+            return Some(Task::ready(LanguageModelToolResult {
+                content: LanguageModelToolResultContent::Text(Arc::from(
+                    "CIRCUIT BREAKER: 5 consecutive tool failures. Stop and explain the issue to the user."
+                )),
+                tool_use_id: tool_use.id,
+                tool_name: tool_use.name,
+                is_error: true,
+                output: None,
+            }));
+        }
+
+        // Caduceus: loop detection — prevent same tool being called 3+ times consecutively
+        {
+            let tool_name = tool_use.name.as_ref();
+            let is_loop = if let Some((prev_tool, count)) = &self.consecutive_same_tool {
+                prev_tool == tool_name && *count >= 3
+            } else {
+                false
+            };
+            if is_loop {
+                log::warn!("[caduceus] Loop detected: {} called {} times consecutively", tool_name,
+                    self.consecutive_same_tool.as_ref().map(|(_, c)| c).unwrap_or(&0));
+                self.consecutive_same_tool = None;
+                return Some(Task::ready(LanguageModelToolResult {
+                    content: LanguageModelToolResultContent::Text(Arc::from(
+                        format!("LOOP DETECTED: {} called too many times in a row. Try a different approach.", tool_name)
+                    )),
+                    tool_use_id: tool_use.id,
+                    tool_name: tool_use.name,
+                    is_error: true,
+                    output: None,
+                }));
+            }
+            // Update consecutive tracking
+            if let Some((prev, count)) = &mut self.consecutive_same_tool {
+                if prev.as_str() == tool_name {
+                    *count += 1;
+                } else {
+                    self.consecutive_same_tool = Some((tool_name.to_string(), 1));
+                }
+            } else {
+                self.consecutive_same_tool = Some((tool_name.to_string(), 1));
+            }
         }
 
         let Some(tool) = tool else {
@@ -3399,7 +3500,8 @@ Write plans to .caduceus/wiki/ or .caduceus/ directory. Use caduceus_project_wik
                 cross_git, api_registry, architect, product. \
                 Mode escalation: use caduceus_mode_request. \
                 PERMISSION DENIED = don't retry, ask user. \
-                Before spawning sub-agents: explain plan, wait for approval.".to_string()
+                Before spawning sub-agents: explain plan, wait for approval. \
+                Use edit_file/save_file for writing files, NOT terminal cat/heredoc.".to_string()
             ));
 
             let assembled = assembler.assemble();
