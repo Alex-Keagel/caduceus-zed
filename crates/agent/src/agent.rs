@@ -539,50 +539,27 @@ impl NativeAgent {
                     }
 
                     // Write wiki pages
-                    let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:project-overview", &structure);
+                    let _ = caduceus_bridge::memory::store_system(&wiki_root, "wiki:project-overview", &structure);
                     if !readme.is_empty() {
-                        let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:readme", &readme);
+                        let _ = caduceus_bridge::memory::store_system(&wiki_root, "wiki:readme", &readme);
                     }
 
                     // Git context
                     if let Ok(branch) = engine_clone.git_branch() {
-                        let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:git-branch", &branch);
+                        let _ = caduceus_bridge::memory::store_system(&wiki_root, "wiki:git-branch", &branch);
                     }
                     if let Ok(log) = engine_clone.git_log(10) {
                         let log_text: String = log.iter()
                             .map(|c| format!("{} — {}", crate::tools::truncate_str(&c.sha, 7), c.message))
                             .collect::<Vec<_>>()
                             .join("\n");
-                        let _ = caduceus_bridge::memory::store(&wiki_root, "wiki:recent-commits", &log_text);
+                        let _ = caduceus_bridge::memory::store_system(&wiki_root, "wiki:recent-commits", &log_text);
                     }
 
                     log::info!("[caduceus] Wiki populated for {}", root.display());
 
-                    // Summarize memory if too large
-                    let memory_path = root.join(".caduceus").join("memory.md");
-                    if let Ok(metadata) = std::fs::metadata(&memory_path) {
-                        if metadata.len() > 10_000 { // 10KB threshold
-                            log::info!("[caduceus] Memory file too large ({}KB), truncating old entries", metadata.len() / 1024);
-                            if let Ok(content) = std::fs::read_to_string(&memory_path) {
-                                let lines: Vec<&str> = content.lines().collect();
-                                let original_len = lines.len();
-                                // Keep header + last 50 lines
-                                let kept: Vec<&str> = if original_len > 52 {
-                                    let mut result = vec![lines[0]]; // header
-                                    result.extend_from_slice(&lines[original_len-50..]);
-                                    result
-                                } else {
-                                    lines
-                                };
-                                if kept.len() < original_len {
-                                    let _ = std::fs::write(&memory_path, kept.join("\n"));
-                                    log::info!("[caduceus] Memory trimmed from {} to {} lines", original_len, kept.len());
-                                } else {
-                                    log::debug!("[caduceus] Memory within limits ({} lines)", original_len);
-                                }
-                            }
-                        }
-                    }
+                    // Memory size is now managed by JSON store with MAX_ENTRIES=100 cap.
+                    // No manual trimming needed — the store enforces limits on write.
                     } // end if !already_indexed
                 }
             }).detach();
