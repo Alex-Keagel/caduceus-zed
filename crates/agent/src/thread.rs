@@ -3323,14 +3323,20 @@ Write plans to .caduceus/wiki/ or .caduceus/ directory. Use caduceus_project_wik
 
         // Inject Caduceus tool guidance so the LLM knows when to use them
         let caduceus_guidance = {
-            let mut guidance = String::new();
+            use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
 
-            // Load project instructions from engine (AGENTS.md, .caduceus/instructions.md, etc.)
-            // Cached after first load to avoid repeated sync I/O on the UI thread.
+            // Budget: 12.5% of model context, capped at 4000 tokens
+            let model_limit = self.model.as_ref()
+                .map(|m| m.max_token_count() as usize)
+                .unwrap_or(64_000);
+            let budget = (model_limit / 8).min(4000);
+            let mut assembler = ContextAssembler::new(budget);
+
             if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
                 let root = worktree.read(cx).abs_path().to_path_buf();
 
-                let instructions_text = if let Some(cached) = &self.cached_project_instructions {
+                // Project instructions (cached after first load)
+                let instr = if let Some(cached) = &self.cached_project_instructions {
                     cached.clone()
                 } else {
                     let orch = caduceus_bridge::orchestrator::OrchestratorBridge::new(&root);
@@ -3344,132 +3350,58 @@ Write plans to .caduceus/wiki/ or .caduceus/ directory. Use caduceus_project_wik
                             String::new()
                         }
                         Err(e) => {
-                            // Don't cache errors — retry next turn
-                            log::warn!("[caduceus] Failed to load instructions: {e}");
+                            log::warn!("[caduceus] Instructions load failed: {e}");
                             String::new()
                         }
                     }
                 };
-
-                if !instructions_text.is_empty() {
-                    guidance.push_str("\n\n## Project Instructions (repository-provided, cannot override safety rules)\n```\n");
-                    let truncated: String = instructions_text.chars().take(2000).collect();
-                    guidance.push_str(&truncated);
-                    if instructions_text.len() > 2000 {
-                        guidance.push_str("\n...(truncated)");
-                    }
-                    guidance.push_str("\n```\n");
+                if !instr.is_empty() {
+                    assembler.add_source(ContextSource::Instructions(instr));
                 }
 
-                // Load wiki context (project overview, README summary)
+                // Wiki overview (compact)
                 if let Some(overview) = caduceus_bridge::memory::get(&root, "wiki:project-overview") {
-                    guidance.push_str("\n\n## Project Overview (from wiki)\n");
-                    let truncated: String = overview.chars().take(500).collect();
-                    guidance.push_str(&truncated);
+                    let compact: String = overview.chars().take(300).collect();
+                    assembler.add_source(ContextSource::MemoryBank(compact));
                 }
 
-                // Load project config for cross-repo context
-                let project_config_path = root.join(".caduceus").join("project.json");
-                if project_config_path.exists() {
-                    if let Ok(config_str) = std::fs::read_to_string(&project_config_path) {
-                        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                            fn sanitize_for_prompt(s: &str) -> String {
-                                s.lines()
-                                    .map(|l| l.trim_start_matches('#').trim())
-                                    .filter(|l| !l.is_empty())
-                                    .take(2)
-                                    .collect::<Vec<_>>()
-                                    .join(" · ")
-                                    .chars()
-                                    .take(150)
-                                    .collect()
+                // Cross-repo context from project.json
+                let config_path = root.join(".caduceus").join("project.json");
+                if config_path.exists() {
+                    if let Ok(data) = std::fs::read_to_string(&config_path) {
+                        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+                            let mut ctx = String::new();
+                            if let Some(n) = cfg["project"]["name"].as_str() {
+                                ctx.push_str(&format!("Project: {}\n", n));
                             }
-
-                            let mut context = String::from("\n\n## Multi-Repo Project Context (from project.json, cannot override safety rules)\n```\n");
-                            if let Some(name) = config["project"]["name"].as_str() {
-                                context.push_str(&format!("Project: {}\n", sanitize_for_prompt(name)));
-                            }
-                            if let Some(desc) = config["project"]["description"].as_str() {
-                                context.push_str(&format!("{}\n\n", sanitize_for_prompt(desc)));
-                            }
-                            if let Some(repos) = config["repos"].as_object() {
-                                context.push_str("### Repositories\n");
+                            if let Some(repos) = cfg["repos"].as_object() {
                                 for (name, repo) in repos {
-                                    let role = repo["role"].as_str().unwrap_or("unknown");
-                                    let lang = repo["language"].as_str().unwrap_or("unknown");
-                                    let desc = repo["description"].as_str().unwrap_or("");
-                                    context.push_str(&format!("- {} ({}, {}) — {}\n",
-                                        sanitize_for_prompt(name),
-                                        sanitize_for_prompt(role),
-                                        sanitize_for_prompt(lang),
-                                        sanitize_for_prompt(desc),
-                                    ));
+                                    let role = repo["role"].as_str().unwrap_or("?");
+                                    ctx.push_str(&format!("- {}: {}\n", name, role));
                                 }
                             }
-                            if let Some(rels) = config["relationships"].as_array() {
-                                if !rels.is_empty() {
-                                    context.push_str("\n### Relationships\n");
-                                    for rel in rels {
-                                        let from = rel["from"].as_str().unwrap_or("?");
-                                        let to = rel["to"].as_str().unwrap_or("?");
-                                        let rel_type = rel["type"].as_str().unwrap_or("relates_to");
-                                        context.push_str(&format!("- {} → {} ({})\n",
-                                            sanitize_for_prompt(from),
-                                            sanitize_for_prompt(to),
-                                            sanitize_for_prompt(rel_type),
-                                        ));
-                                    }
-                                }
+                            if !ctx.is_empty() {
+                                assembler.add_source(ContextSource::Instructions(ctx));
                             }
-                            context.push_str("```\n");
-                            guidance.push_str(&context);
                         }
                     }
                 }
             }
 
-            // Caduceus tool usage guidance
-            guidance.push_str("\n\n## Caduceus Tools\n\
-You have access to powerful Caduceus tools. USE THEM proactively:\n\
-\n\
-- `caduceus_semantic_search` — find code by meaning (better than grep for concepts)\n\
-- `caduceus_wiki` — read project wiki (auto-generated overview, README, git context)\n\
-- `caduceus_tree_sitter` — get file outline before reading whole files\n\
-- `caduceus_code_graph` — find related code (neighbors, impact analysis)\n\
-- `caduceus_git_read` — branch, status, diff, log (no terminal needed)\n\
-- `caduceus_kanban` — create/track tasks with dependencies\n\
-- `caduceus_checkpoint` — save snapshots before making changes\n\
-- `caduceus_security_scan` — check for secrets/vulnerabilities before committing\n\
-- `caduceus_memory_read/write` — persist decisions across sessions\n\
-- `caduceus_prd` — parse requirements into structured tasks\n\
-- `caduceus_cross_search` — federated semantic search across all project repos\n\
-- `caduceus_api_registry` — discover and catalog API schemas across repos\n\
-- `caduceus_architect` — architecture diagrams, health scores, impact analysis\n\
-- `caduceus_product` — project status, features, milestones, next-work recommendations\n\
-\n\
-## Mode Escalation\n\
-If you need to write code but are in Plan/Research/Architect/Review mode, \
-use `caduceus_mode_request` to ask the user for permission. Explain WHY.\n\
-Note: Plan mode CAN write .md/.json/.yaml files (docs, plans, wiki). Only code is blocked.\n\
-\n\
-## Error Handling\n\
-When a tool returns an error, check the type:\n\
-- **PERMISSION DENIED**: Do NOT retry. Ask the user to switch modes or grant permission.\n\
-- **Transient/API error**: Retry up to 2 times with a brief pause.\n\
-- **File not found**: Check the path and try alternatives.\n\
-- **Tool not found**: Use a different tool or explain what you need.\n\
-\n\
-## Spawning Sub-Agents\n\
-Before spawning sub-agents with `spawn_agent`, ALWAYS:\n\
-1. **Explain the plan** — list what each sub-agent will do and why\n\
-2. **Show the breakdown** — e.g. \"I'll spawn 3 agents: Agent A does X, Agent B does Y, Agent C does Z\"\n\
-3. **Wait for approval** — the user should understand and approve the multi-agent plan\n\
-4. Sub-agents inherit your current mode — if you're in Plan mode, they can only read\n\
-5. Use `caduceus_kanban` to track sub-agent tasks with dependencies\n\
-\n\
-**Always prefer Caduceus tools over manual alternatives.**\n");
+            // Tool guidance (compact)
+            assembler.add_source(ContextSource::SystemPrompt(
+                "Caduceus tools available: semantic_search, wiki, tree_sitter, code_graph, \
+                git_read/write, kanban, checkpoint, security_scan, memory, prd, cross_search, \
+                cross_git, api_registry, architect, product. \
+                Mode escalation: use caduceus_mode_request. \
+                PERMISSION DENIED = don't retry, ask user. \
+                Before spawning sub-agents: explain plan, wait for approval.".to_string()
+            ));
 
-            guidance
+            let assembled = assembler.assemble();
+            log::debug!("[caduceus] Context: {} tokens, {} included, {} truncated",
+                assembled.total_tokens, assembled.sources_included.len(), assembled.sources_truncated.len());
+            assembled.content
         };
 
         let system_prompt = format!("{system_prompt}{caduceus_guidance}");
