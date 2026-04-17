@@ -208,7 +208,7 @@ impl CaduceusProjectWikiTool {
             );
 
             // Try reading README from the repo
-            let repo_path = expand_tilde(&repo.path);
+            let repo_path = match crate::tools::caduceus_project_tool::resolve_repo_path(&self.project_root, &repo.path) { Ok(p) => p, Err(e) => { log::warn!("[caduceus] Skipping repo {}: {}", name, e); continue; } };
             if let Ok(readme) = std::fs::read_to_string(repo_path.join("README.md")) {
                 let truncated: String = readme.lines().take(50).collect::<Vec<_>>().join("\n");
                 page.push_str(&format!("\n## README (excerpt)\n\n{truncated}\n"));
@@ -223,7 +223,7 @@ impl CaduceusProjectWikiTool {
         let mut api_page = String::from("# API Index\n\n");
         let mut found_apis = false;
         for (name, repo) in &config.repos {
-            let repo_path = expand_tilde(&repo.path);
+            let repo_path = match crate::tools::caduceus_project_tool::resolve_repo_path(&self.project_root, &repo.path) { Ok(p) => p, Err(e) => { log::warn!("[caduceus] Skipping repo {}: {}", name, e); continue; } };
             let api_files = ["openapi.yaml", "openapi.json", "swagger.json", "swagger.yaml"];
             for api_file in &api_files {
                 if repo_path.join(api_file).exists() {

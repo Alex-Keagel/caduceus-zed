@@ -139,11 +139,25 @@ impl AgentTool for CaduceusSecurityScanTool {
 
             let content = match &input.content {
                 Some(c) => c.clone(),
-                None => std::fs::read_to_string(&input.path).map_err(|e| {
-                    CaduceusSecurityScanToolOutput::Error {
-                        error: format!("Failed to read file {}: {e}", input.path),
+                None => {
+                    // SEC-17: Validate path is under project root
+                    let path = std::path::Path::new(&input.path);
+                    if input.path.contains("..") {
+                        return Err(CaduceusSecurityScanToolOutput::Error {
+                            error: format!("Path traversal not allowed: {}", input.path),
+                        });
                     }
-                })?,
+                    if crate::tools::is_sensitive_file(&input.path) {
+                        return Err(CaduceusSecurityScanToolOutput::Error {
+                            error: format!("Cannot scan sensitive file: {}", input.path),
+                        });
+                    }
+                    std::fs::read_to_string(path).map_err(|e| {
+                        CaduceusSecurityScanToolOutput::Error {
+                            error: format!("Failed to read file {}: {e}", input.path),
+                        }
+                    })?
+                }
             };
 
             let findings: Vec<SecurityFinding> = engine
