@@ -1446,6 +1446,10 @@ impl Thread {
         self.caduceus_mode = mode;
     }
 
+    pub(crate) fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
     /// Derive caduceus_mode from the current profile_id so the two stay in sync.
     fn caduceus_mode_from_profile(&self) -> &str {
         self.caduceus_mode
@@ -1519,7 +1523,7 @@ impl Thread {
     /// Caduceus: smart context management using engine compaction pipeline.
     /// Triggers based on both message count AND estimated token usage.
     /// Uses engine's ContextZone (Green/Yellow/Orange/Red/Critical) for decisions.
-    fn auto_compact_context(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn auto_compact_context(&mut self, cx: &mut Context<Self>) {
         use caduceus_bridge::orchestrator::{estimate_tokens, ContextZone};
 
         // Estimate current context size

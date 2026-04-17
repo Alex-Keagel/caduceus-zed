@@ -26,7 +26,7 @@ pub use tools::*;
 
 use acp_thread::{
     AcpThread, AgentModelSelector, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
-    AgentSessionListResponse, TokenUsageRatio, UserMessageId,
+    AgentSessionListResponse, AgentSessionModes, TokenUsageRatio, UserMessageId,
 };
 use agent_client_protocol as acp;
 use anyhow::{Context as _, Result, anyhow};
@@ -1254,6 +1254,107 @@ impl NativeAgentConnection {
             .update(cx, |this, cx| this.load_thread(id, project, cx))
     }
 
+    /// Handle Caduceus-specific slash commands.
+    /// Returns `Some(Task)` if the command was recognized and handled,
+    /// `None` to fall through to MCP routing.
+    fn handle_caduceus_command(
+        &self,
+        command: &str,
+        args: &str,
+        session_id: &acp::SessionId,
+        cx: &mut App,
+    ) -> Option<Task<Result<acp::PromptResponse>>> {
+        let response_text = match command.to_lowercase().as_str() {
+            "compact" => {
+                if let Some(thread) = self.thread(session_id, cx) {
+                    thread.update(cx, |thread, cx| {
+                        thread.auto_compact_context(cx);
+                    });
+                }
+                "✅ Context compacted. Older messages summarized to save tokens.".to_string()
+            }
+            "checkpoint" => {
+                "📌 Use the `caduceus_checkpoint` tool with operation `create` and a label to save a checkpoint.".to_string()
+            }
+            "mode" => {
+                let mode_name = args.trim();
+                let valid_modes = [
+                    "plan", "act", "research", "autopilot", "architect", "debug", "review",
+                ];
+                if mode_name.is_empty() {
+                    let current = self
+                        .thread(session_id, cx)
+                        .map(|t| t.read(cx).profile().0.to_string())
+                        .unwrap_or_else(|| "act".to_string());
+                    format!(
+                        "Current mode: **{current}**\nAvailable: {}",
+                        valid_modes.join(", ")
+                    )
+                } else if valid_modes.contains(&mode_name) {
+                    let modes = self
+                        .0
+                        .read(cx)
+                        .sessions
+                        .get(session_id)
+                        .map(|s| s.caduceus_modes.clone());
+                    if let Some(modes) = modes {
+                        modes.set_mode(acp::SessionModeId::new(mode_name), cx).detach();
+                    }
+                    if let Some(thread) = self.thread(session_id, cx) {
+                        thread.update(cx, |thread, _cx| {
+                            thread.set_caduceus_mode(Some(mode_name.to_string()));
+                        });
+                    }
+                    format!("✅ Mode switched to **{mode_name}**")
+                } else {
+                    format!(
+                        "❌ Unknown mode '{mode_name}'. Valid: {}",
+                        valid_modes.join(", ")
+                    )
+                }
+            }
+            "context" => {
+                if let Some(thread) = self.thread(session_id, cx) {
+                    let msg_count = thread.read(cx).message_count();
+                    format!("📊 Context: {msg_count} messages\nUse `/compact` to free space.")
+                } else {
+                    "No active session".to_string()
+                }
+            }
+            "help" => {
+                "## Caduceus Commands\n\
+                 - `/compact` — compress conversation context\n\
+                 - `/mode [name]` — show/switch mode (plan, act, research, autopilot, architect, debug, review)\n\
+                 - `/context` — show context usage\n\
+                 - `/checkpoint` — create a code checkpoint\n\
+                 - `/help` — show this help"
+                    .to_string()
+            }
+            _ => return None, // Not a Caduceus command — fall through
+        };
+
+        // Push the response as an assistant message via the ACP thread
+        let acp_thread = self
+            .0
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .map(|s| s.acp_thread.clone());
+        if let Some(acp_thread) = acp_thread {
+            acp_thread.update(cx, |thread, cx| {
+                thread.push_assistant_content_block(
+                    acp::ContentBlock::Text(acp::TextContent::new(response_text)),
+                    false,
+                    cx,
+                );
+            });
+        }
+
+        Some(Task::ready(Ok(acp::PromptResponse::new(
+            acp::StopReason::EndTurn,
+        ))))
+    }
+
     fn run_turn(
         &self,
         session_id: acp::SessionId,
@@ -1666,6 +1767,20 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         let session_id = params.session_id.clone();
         log::info!("Received prompt request for session: {}", session_id);
         log::debug!("Prompt blocks count: {}", params.prompt.len());
+
+        // Caduceus slash commands — handle before MCP routing
+        if let Some(acp::ContentBlock::Text(text)) = params.prompt.first() {
+            let trimmed = text.text.trim();
+            if let Some(cmd) = trimmed.strip_prefix('/') {
+                let (command, args) =
+                    cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
+                if let Some(response) =
+                    self.handle_caduceus_command(command, args, &session_id, cx)
+                {
+                    return response;
+                }
+            }
+        }
 
         let Some(project_state) = self.0.read(cx).session_project_state(&session_id) else {
             return Task::ready(Err(anyhow::anyhow!("Session not found")));
