@@ -999,6 +999,10 @@ pub struct Thread {
     circuit_breaker: caduceus_bridge::safety::CircuitBreaker,
     /// Compaction cooldown: prevents double-fire within cooldown window
     compaction_cooldown: caduceus_bridge::safety::CompactionCooldown,
+    /// Last guardrail alert (visible in UI) — cleared after 10 seconds
+    guardrail_alert: Option<(String, std::time::Instant)>,
+    /// Whether context was compacted this turn (visible in UI)
+    context_compacted_this_turn: bool,
 }
 
 impl Thread {
@@ -1126,6 +1130,8 @@ impl Thread {
             compaction_cooldown: caduceus_bridge::safety::CompactionCooldown::new(
                 std::time::Duration::from_secs(30),
             ),
+            guardrail_alert: None,
+            context_compacted_this_turn: false,
         }
     }
 
@@ -1367,6 +1373,8 @@ impl Thread {
             compaction_cooldown: caduceus_bridge::safety::CompactionCooldown::new(
                 std::time::Duration::from_secs(30),
             ),
+            guardrail_alert: None,
+            context_compacted_this_turn: false,
         }
     }
 
@@ -1460,6 +1468,40 @@ impl Thread {
 
     pub fn set_caduceus_mode(&mut self, mode: Option<String>) {
         self.caduceus_mode = mode;
+    }
+
+    /// Current guardrail alert message (if any, within 10s TTL)
+    pub fn guardrail_alert(&self) -> Option<&str> {
+        self.guardrail_alert.as_ref().and_then(|(msg, ts)| {
+            if ts.elapsed() < std::time::Duration::from_secs(10) {
+                Some(msg.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Whether context was compacted during the current/last turn
+    pub fn context_compacted_this_turn(&self) -> bool {
+        self.context_compacted_this_turn
+    }
+
+    /// Current context zone (Green/Yellow/Orange/Red/Critical)
+    pub fn context_zone(&self) -> caduceus_bridge::orchestrator::ContextZone {
+        self.current_context_zone()
+    }
+
+    /// Context fill percentage (0-100+)
+    pub fn context_fill_pct(&self) -> f64 {
+        let total = self.estimate_total_tokens();
+        let max = self.model_max_tokens();
+        if max == 0 { return 0.0; }
+        (total as f64 / max as f64) * 100.0
+    }
+
+    /// Current Caduceus mode name
+    pub fn caduceus_mode_name(&self) -> &str {
+        self.caduceus_mode_from_profile()
     }
 
     pub(crate) fn message_count(&self) -> usize {
@@ -1694,6 +1736,7 @@ impl Thread {
         );
 
         self.compaction_cooldown.record_compaction();
+        self.context_compacted_this_turn = true;
         true
     }
 
@@ -2697,7 +2740,12 @@ impl Thread {
         // Caduceus: circuit breaker — stop after N consecutive tool failures
         if self.circuit_breaker.is_tripped() {
             log::error!("[caduceus] Circuit breaker: {} consecutive failures", self.circuit_breaker.consecutive_failures());
+            self.guardrail_alert = Some((
+                format!("🔴 Circuit breaker: {} consecutive tool failures — execution paused", self.circuit_breaker.consecutive_failures()),
+                std::time::Instant::now(),
+            ));
             self.circuit_breaker.reset();
+            cx.notify();
             return Some(Task::ready(LanguageModelToolResult {
                 content: LanguageModelToolResultContent::Text(Arc::from(
                     "CIRCUIT BREAKER: 5 consecutive tool failures. Stop and explain the issue to the user."
@@ -2716,6 +2764,11 @@ impl Thread {
                 self.loop_detector.record_tool(tool_name)
             {
                 log::warn!("[caduceus] Loop detected: {} called too many times consecutively", name);
+                self.guardrail_alert = Some((
+                    format!("⚠️ Loop detected: {} called too many times — trying different approach", name),
+                    std::time::Instant::now(),
+                ));
+                cx.notify();
                 return Some(Task::ready(LanguageModelToolResult {
                     content: LanguageModelToolResultContent::Text(Arc::from(
                         format!("LOOP DETECTED: {} called too many times in a row. Try a different approach.", name)

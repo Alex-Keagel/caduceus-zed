@@ -3288,6 +3288,7 @@ impl ThreadView {
                             .flex_none()
                             .flex_wrap()
                             .justify_between()
+                            .children(self.render_guardrail_alert(cx))
                             .child(
                                 h_flex()
                                     .gap_0p5()
@@ -3299,6 +3300,8 @@ impl ThreadView {
                             .child(
                                 h_flex()
                                     .gap_1()
+                                    .children(self.render_context_zone_indicator(cx))
+                                    .children(self.render_compaction_status(cx))
                                     .children(self.render_token_usage(cx))
                                     .children(self.render_checkpoint_status(cx))
                                     .children(self.profile_selector.clone())
@@ -3548,6 +3551,100 @@ impl ThreadView {
                 .rounded_full()
                 .bg(color)
                 .tooltip(Tooltip::text(tooltip_text)),
+        )
+    }
+
+    /// Caduceus: render guardrail alert banner when loop/circuit breaker fires
+    fn render_guardrail_alert(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let thread = self.as_native_thread(cx)?;
+        let alert_msg = thread.read(cx).guardrail_alert()?.to_string();
+
+        let (bg_color, border_color) = if alert_msg.contains("Circuit breaker") {
+            (cx.theme().status().error.opacity(0.1), cx.theme().status().error.opacity(0.4))
+        } else {
+            (cx.theme().status().warning.opacity(0.1), cx.theme().status().warning.opacity(0.4))
+        };
+
+        Some(
+            div()
+                .id("guardrail-alert")
+                .w_full()
+                .px_2()
+                .py_1()
+                .mb_1()
+                .rounded_md()
+                .bg(bg_color)
+                .border_1()
+                .border_color(border_color)
+                .child(
+                    Label::new(alert_msg)
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                ),
+        )
+    }
+
+    /// Caduceus: render context zone indicator next to token usage
+    fn render_context_zone_indicator(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        use caduceus_bridge::orchestrator::ContextZone;
+        let thread = self.as_native_thread(cx)?;
+        let thread_read = thread.read(cx);
+        let zone = thread_read.context_zone();
+        let fill_pct = thread_read.context_fill_pct();
+
+        if zone == ContextZone::Green {
+            return None;
+        }
+
+        let (label, color) = match zone {
+            ContextZone::Green => return None,
+            ContextZone::Yellow => ("⚠ ctx", cx.theme().status().warning),
+            ContextZone::Orange => ("🟠 ctx", cx.theme().status().warning),
+            ContextZone::Red => ("🔴 ctx", cx.theme().status().error),
+            ContextZone::Critical => ("🔴 FULL", cx.theme().status().error),
+        };
+
+        let tooltip = format!(
+            "Context {:.0}% full — {} zone. {}",
+            fill_pct,
+            zone.label(),
+            zone.recommendation()
+        );
+
+        Some(
+            div()
+                .id("context-zone-indicator")
+                .px_1()
+                .rounded_sm()
+                .bg(color.opacity(0.15))
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning),
+                )
+                .tooltip(Tooltip::text(tooltip)),
+        )
+    }
+
+    /// Caduceus: render compaction status chip
+    fn render_compaction_status(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let thread = self.as_native_thread(cx)?;
+        if !thread.read(cx).context_compacted_this_turn() {
+            return None;
+        }
+
+        Some(
+            div()
+                .id("compaction-status")
+                .px_1()
+                .rounded_sm()
+                .bg(cx.theme().status().info.opacity(0.1))
+                .child(
+                    Label::new("🗜 compacted")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .tooltip(Tooltip::text("Context was auto-compacted to free space")),
         )
     }
 
