@@ -997,6 +997,8 @@ pub struct Thread {
     consecutive_same_tool: Option<(String, usize)>,
     /// Circuit breaker: consecutive tool failure count
     consecutive_tool_failures: u32,
+    /// Timestamp of last successful context compaction (prevents double-fire)
+    last_compacted_at: Option<std::time::Instant>,
 }
 
 impl Thread {
@@ -1121,6 +1123,7 @@ impl Thread {
             cached_project_instructions: None,
             consecutive_same_tool: None,
             consecutive_tool_failures: 0,
+            last_compacted_at: None,
         }
     }
 
@@ -1359,6 +1362,7 @@ impl Thread {
             cached_project_instructions: None,
             consecutive_same_tool: None,
             consecutive_tool_failures: 0,
+            last_compacted_at: None,
         }
     }
 
@@ -1528,58 +1532,52 @@ impl Thread {
         }
     }
 
-    /// Caduceus: estimate current context zone based on token usage.
-    fn current_context_zone(&self) -> caduceus_bridge::orchestrator::ContextZone {
-        use caduceus_bridge::orchestrator::{estimate_tokens, ContextZone};
-        let total: u32 = self.messages.iter().map(|m| match m {
+    /// Caduceus: unified max-token fallback for context budgeting.
+    fn model_max_tokens(&self) -> u32 {
+        self.model.as_ref()
+            .map(|m| m.max_token_count() as u32)
+            .unwrap_or(64_000)
+    }
+
+    /// Caduceus: estimate total tokens across all messages (DRY helper).
+    fn estimate_total_tokens(&self) -> u32 {
+        use caduceus_bridge::orchestrator::estimate_tokens;
+        self.messages.iter().map(|m| match m {
             Message::User(u) => u.content.iter().map(|c| match c {
                 UserMessageContent::Text(t) => estimate_tokens(t),
                 _ => 10,
             }).sum::<u32>(),
             Message::Agent(a) => estimate_tokens(&a.to_markdown()),
             Message::Resume => 0,
-        }).sum();
-        let max = self.model.as_ref().map(|m| m.max_token_count() as u32).unwrap_or(64_000);
+        }).sum()
+    }
+
+    /// Caduceus: estimate current context zone based on token usage.
+    fn current_context_zone(&self) -> caduceus_bridge::orchestrator::ContextZone {
+        use caduceus_bridge::orchestrator::ContextZone;
+        let total = self.estimate_total_tokens();
+        let max = self.model_max_tokens();
         ContextZone::from_percentage((total as f64 / max as f64) * 100.0)
     }
 
     /// Caduceus: smart context management using engine compaction pipeline.
     /// Triggers based on both message count AND estimated token usage.
     /// Uses engine's ContextZone (Green/Yellow/Orange/Red/Critical) for decisions.
-    pub(crate) fn auto_compact_context(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn auto_compact_context(&mut self, cx: &mut Context<Self>) -> bool {
         use caduceus_bridge::orchestrator::{estimate_tokens, ContextZone};
 
-        // Skip if last message is already a compaction summary
-        if let Some(Message::User(last)) = self.messages.first() {
-            if let Some(UserMessageContent::Text(t)) = last.content.first() {
-                if t.starts_with("[Context compacted") {
-                    return; // Already compacted, don't double-fire
-                }
+        // Timestamp-based guard: don't compact more than once per 30s
+        if let Some(last) = self.last_compacted_at {
+            if last.elapsed() < std::time::Duration::from_secs(30) {
+                return false; // Compacted recently, skip
             }
         }
 
-        // Estimate current context size
-        let mut total_tokens: u32 = 0;
-        for msg in &self.messages {
-            match msg {
-                Message::User(u) => {
-                    for content in &u.content {
-                        if let UserMessageContent::Text(t) = content {
-                            total_tokens += estimate_tokens(t);
-                        }
-                    }
-                }
-                Message::Agent(a) => {
-                    total_tokens += estimate_tokens(&a.to_markdown());
-                }
-                Message::Resume => {}
-            }
-        }
+        // Estimate current context size (reuse DRY helper)
+        let total_tokens = self.estimate_total_tokens();
 
         // Determine context zone
-        let max_context = self.model.as_ref()
-            .map(|m| m.max_token_count() as u32)
-            .unwrap_or(128_000);
+        let max_context = self.model_max_tokens();
         let fill_pct = (total_tokens as f64 / max_context as f64) * 100.0;
         let zone = ContextZone::from_percentage(fill_pct);
 
@@ -1610,7 +1608,7 @@ impl Thread {
         };
 
         if !should_compact {
-            return;
+            return false;
         }
 
         let messages_to_compact = self.messages.len() - keep_recent;
@@ -1692,6 +1690,9 @@ impl Thread {
             self.messages.len(),
             total_tokens.saturating_sub(estimate_tokens(&summary))
         );
+
+        self.last_compacted_at = Some(std::time::Instant::now());
+        true
     }
 
     pub fn set_model(&mut self, model: Arc<dyn LanguageModel>, cx: &mut Context<Self>) {
@@ -2675,6 +2676,8 @@ impl Thread {
                 tool_use.name, mode, tool_use.name
             );
             log::warn!("[caduceus] PERMISSION DENIED '{}' in {} mode", tool_use.name, mode);
+            // Permission denials are not failures — don't trigger circuit breaker
+            self.consecutive_tool_failures = 0;
             return Some(Task::ready(LanguageModelToolResult {
                 content: LanguageModelToolResultContent::Text(Arc::from(content)),
                 tool_use_id: tool_use.id,
@@ -3431,9 +3434,7 @@ Write plans to .caduceus/wiki/ or .caduceus/ directory. Use caduceus_project_wik
             use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
 
             // Budget: 12.5% of model context, capped at 4000 tokens
-            let model_limit = self.model.as_ref()
-                .map(|m| m.max_token_count() as usize)
-                .unwrap_or(64_000);
+            let model_limit = self.model_max_tokens() as usize;
             let budget = (model_limit / 8).min(4000);
             let mut assembler = ContextAssembler::new(budget);
 

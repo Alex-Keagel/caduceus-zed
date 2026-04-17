@@ -565,16 +565,21 @@ impl NativeAgent {
                             log::info!("[caduceus] Memory file too large ({}KB), truncating old entries", metadata.len() / 1024);
                             if let Ok(content) = std::fs::read_to_string(&memory_path) {
                                 let lines: Vec<&str> = content.lines().collect();
+                                let original_len = lines.len();
                                 // Keep header + last 50 lines
-                                let kept: Vec<&str> = if lines.len() > 52 {
+                                let kept: Vec<&str> = if original_len > 52 {
                                     let mut result = vec![lines[0]]; // header
-                                    result.extend_from_slice(&lines[lines.len()-50..]);
+                                    result.extend_from_slice(&lines[original_len-50..]);
                                     result
                                 } else {
                                     lines
                                 };
-                                let _ = std::fs::write(&memory_path, kept.join("\n"));
-                                log::info!("[caduceus] Memory trimmed to {} lines", kept.len());
+                                if kept.len() < original_len {
+                                    let _ = std::fs::write(&memory_path, kept.join("\n"));
+                                    log::info!("[caduceus] Memory trimmed from {} to {} lines", original_len, kept.len());
+                                } else {
+                                    log::debug!("[caduceus] Memory within limits ({} lines)", original_len);
+                                }
                             }
                         }
                     }
@@ -1287,12 +1292,18 @@ impl NativeAgentConnection {
     ) -> Option<Task<Result<acp::PromptResponse>>> {
         let response_text = match command.to_lowercase().as_str() {
             "compact" => {
-                if let Some(thread) = self.thread(session_id, cx) {
+                let compacted = if let Some(thread) = self.thread(session_id, cx) {
                     thread.update(cx, |thread, cx| {
-                        thread.auto_compact_context(cx);
-                    });
+                        thread.auto_compact_context(cx)
+                    })
+                } else {
+                    false
+                };
+                if compacted {
+                    "✅ Context compacted. Older messages summarized to save tokens.".to_string()
+                } else {
+                    "ℹ️ Context is within budget — no compaction needed.".to_string()
                 }
-                "✅ Context compacted. Older messages summarized to save tokens.".to_string()
             }
             "checkpoint" => {
                 "📌 Use the `caduceus_checkpoint` tool with operation `create` and a label to save a checkpoint.".to_string()
