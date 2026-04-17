@@ -3310,11 +3310,10 @@ impl Thread {
 
     /// Extract important facts/preferences from the latest exchange and store them.
     fn auto_extract_memories(&self, cx: &Context<Self>) {
-        // Need at least 2 messages (user + agent)
-        if self.messages.len() < 2 {
+        // Skip for subagents — they shouldn't pollute parent memory
+        if self.is_subagent() || self.messages.len() < 2 {
             return;
         }
-        // Get the last user message and last agent message
         let last_user = self.messages.iter().rev().find_map(|m| {
             if let Message::User(u) = m {
                 Some(u.content.iter().filter_map(|c| {
@@ -3333,25 +3332,28 @@ impl Thread {
         });
 
         if let (Some(user_text), Some(agent_text)) = (last_user, last_agent) {
-            let memories = caduceus_bridge::orchestrator::OrchestratorBridge::extract_memories(
-                &user_text, &agent_text,
-            );
-            if !memories.is_empty() {
-                if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
-                    let root = worktree.read(cx).abs_path().to_path_buf();
-                    for mem in &memories {
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                        mem.hash(&mut hasher);
-                        let key = format!("auto:{:x}", hasher.finish());
-                        if let Err(e) = caduceus_bridge::memory::store_system(&root, &key, mem) {
-                            log::warn!("[caduceus] Failed to store auto-memory: {e}");
+            if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
+                let root = worktree.read(cx).abs_path().to_path_buf();
+                // Move extraction + disk I/O to background
+                cx.background_executor()
+                    .spawn(async move {
+                        let memories = caduceus_bridge::orchestrator::OrchestratorBridge::extract_memories(
+                            &user_text, &agent_text,
+                        );
+                        for mem in &memories {
+                            use std::hash::{Hash, Hasher};
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            mem.hash(&mut hasher);
+                            let key = format!("auto:{:x}", hasher.finish());
+                            if let Err(e) = caduceus_bridge::memory::store_system(&root, &key, mem) {
+                                log::warn!("[caduceus] Failed to store auto-memory: {e}");
+                            }
                         }
-                    }
-                    if !memories.is_empty() {
-                        log::debug!("[caduceus] Auto-extracted {} memories from turn", memories.len());
-                    }
-                }
+                        if !memories.is_empty() {
+                            log::debug!("[caduceus] Auto-extracted {} memories from turn", memories.len());
+                        }
+                    })
+                    .detach();
             }
         }
     }
