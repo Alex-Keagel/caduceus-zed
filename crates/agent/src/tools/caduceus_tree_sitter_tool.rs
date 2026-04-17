@@ -169,55 +169,23 @@ impl AgentTool for CaduceusTreeSitterTool {
 
             match input.operation {
                 TreeSitterOperation::Outline { path } => {
-                    // Read file and extract outline via language buffer
                     let content = std::fs::read_to_string(&path).map_err(|e| {
                         CaduceusTreeSitterToolOutput::Error {
                             error: format!("Cannot read {path}: {e}"),
                         }
                     })?;
 
-                    let entries: Vec<OutlineEntry> = content
-                        .lines()
-                        .enumerate()
-                        .filter_map(|(line_num, line)| {
-                            let trimmed = line.trim();
-                            // Simple heuristic for common patterns when tree-sitter
-                            // buffer is not available (no project buffer open)
-                            let is_definition = trimmed.starts_with("fn ")
-                                || trimmed.starts_with("pub fn ")
-                                || trimmed.starts_with("pub(crate) fn ")
-                                || trimmed.starts_with("async fn ")
-                                || trimmed.starts_with("pub async fn ")
-                                || trimmed.starts_with("pub struct ")
-                                || trimmed.starts_with("pub enum ")
-                                || trimmed.starts_with("pub trait ")
-                                || trimmed.starts_with("impl ")
-                                || trimmed.starts_with("class ")
-                                || trimmed.starts_with("def ")
-                                || trimmed.starts_with("function ")
-                                || trimmed.starts_with("export function ")
-                                || trimmed.starts_with("export default ")
-                                || trimmed.starts_with("const ")
-                                || trimmed.starts_with("type ");
+                    // Use bridge TreeSitterChunker for real AST parsing
+                    let chunker = caduceus_bridge::tree_sitter::TreeSitterChunker::new();
+                    let chunks = caduceus_bridge::tree_sitter::TreeSitterChunker::chunk_file_static(&path, &content);
 
-                            if is_definition {
-                                let depth = line.len() - line.trim_start().len();
-                                let name = trimmed
-                                    .split(&['{', '(', ':', '<', ' '][..])
-                                    .take(3)
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                                    .trim()
-                                    .to_string();
-                                Some(OutlineEntry {
-                                    name,
-                                    depth: depth / 4,
-                                    start_line: line_num as u32,
-                                    end_line: line_num as u32,
-                                })
-                            } else {
-                                None
-                            }
+                    let entries: Vec<OutlineEntry> = chunks
+                        .iter()
+                        .map(|chunk| OutlineEntry {
+                            name: format!("{} {}", chunk.symbol_type, chunk.symbol_name),
+                            depth: 0,
+                            start_line: chunk.start_line as u32,
+                            end_line: chunk.end_line as u32,
                         })
                         .collect();
 

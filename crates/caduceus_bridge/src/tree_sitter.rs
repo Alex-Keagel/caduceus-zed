@@ -14,6 +14,18 @@ impl TreeSitterChunker {
     pub fn new() -> Self {
         Self
     }
+
+    /// Static convenience method — usable without importing Chunker trait
+    pub fn chunk_file_static(path: &str, content: &str) -> Vec<CodeChunk> {
+        let language = detect_language(path);
+        match get_parser(&language) {
+            Some(mut parser) => parse_with_tree_sitter(&mut parser, path, content, &language),
+            None => {
+                let fallback = caduceus_omniscience::CodeChunker::default();
+                caduceus_omniscience::Chunker::chunk_file(&fallback, path, content)
+            }
+        }
+    }
 }
 
 impl Default for TreeSitterChunker {
