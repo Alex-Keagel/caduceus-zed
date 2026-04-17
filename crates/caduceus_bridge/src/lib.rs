@@ -26,5 +26,6 @@ pub mod marketplace;
 pub mod providers;
 pub mod runtime;
 pub mod safety;
+pub mod tree_sitter;
 
 pub use engine::CaduceusEngine;

@@ -952,6 +952,7 @@ impl NativeAgent {
                 .input(acp::AvailableCommandInput::Unstructured(
                     acp::UnstructuredCommandInput::new("<prompt>"),
                 )),
+            acp::AvailableCommand::new("map", "Show project repo map (tree-sitter outline)"),
         ];
 
         let Some(state) = project_state else {
@@ -1392,6 +1393,39 @@ impl NativeAgentConnection {
                  The agent will use the security scanner and dependency checker automatically."
                     .to_string()
             }
+            "map" => {
+                // Generate repo map from tree-sitter outline
+                if let Some(worktree) = self.0.read(cx).projects.values().next()
+                    .and_then(|ps| ps.project.read(cx).worktrees(cx).next())
+                {
+                    let root = worktree.read(cx).abs_path().to_path_buf();
+                    let mut files: Vec<(String, String)> = Vec::new();
+                    let walker = ignore::WalkBuilder::new(&root)
+                        .hidden(true)
+                        .git_ignore(true)
+                        .max_depth(Some(4))
+                        .build();
+                    for entry in walker.flatten() {
+                        let path = entry.path();
+                        if !path.is_file() { continue; }
+                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        if !["rs", "py", "ts", "tsx", "js", "jsx", "go"].contains(&ext) { continue; }
+                        if let Ok(content) = std::fs::read_to_string(path) {
+                            let rel = path.strip_prefix(&root).unwrap_or(path);
+                            files.push((rel.to_string_lossy().to_string(), content));
+                        }
+                        if files.len() >= 100 { break; } // cap for large repos
+                    }
+                    if files.is_empty() {
+                        "No supported source files found in project.".to_string()
+                    } else {
+                        let map = caduceus_bridge::tree_sitter::generate_repo_map(&files);
+                        format!("## Repo Map ({} files)\n\n```\n{}\n```", files.len(), map)
+                    }
+                } else {
+                    "No project open.".to_string()
+                }
+            }
             "headless" => {
                 let prompt = args.trim();
                 if prompt.is_empty() {
@@ -1428,6 +1462,7 @@ impl NativeAgentConnection {
                  - `/checkpoint [label]` — create a code checkpoint\n\
                  - `/review` — review code for security issues\n\
                  - `/headless [prompt]` — generate CLI command for headless execution\n\
+                 - `/map` — show project repo map (tree-sitter symbol outline)\n\
                  - `/help` — show this help"
                     .to_string()
             }

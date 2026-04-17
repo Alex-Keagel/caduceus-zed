@@ -56,7 +56,18 @@ impl CaduceusEngine {
             log::info!("[caduceus] Using dummy embeddings (set CADUCEUS_EMBEDDING_API_KEY for real semantic search)");
             Box::new(DummyEmbedder::new(384))
         };
-        let search_index = Arc::new(RwLock::new(SemanticIndex::new(embedder)));
+        let mut index = SemanticIndex::new(embedder)
+            .with_chunker(crate::tree_sitter::TreeSitterChunker::new());
+
+        // Try loading persisted index
+        let index_path = root.join(".caduceus").join("index.json");
+        if let Ok(count) = index.load_from_file(&index_path) {
+            if count > 0 {
+                log::info!("[caduceus] Loaded {} cached embeddings from index.json", count);
+            }
+        }
+
+        let search_index = Arc::new(RwLock::new(index));
         let code_graph = CodePropertyGraph::new();
         let security_scanner = SastScanner::new();
         let secret_scanner = SecretScanner::new();
@@ -178,10 +189,19 @@ impl CaduceusEngine {
     /// Index a directory for semantic search.
     pub async fn index_directory(&self, path: &Path) -> Result<usize, String> {
         let mut index = self.search_index.write().await;
-        index
-            .index_directory(path)
+        // Use incremental indexing to skip unchanged files
+        let count = index
+            .index_directory_incremental(path)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+
+        // Persist the index for faster startup next time
+        let index_path = self.project_root.join(".caduceus").join("index.json");
+        if let Err(e) = index.save_to_file(&index_path) {
+            log::warn!("[caduceus] Failed to persist index: {e}");
+        }
+
+        Ok(count)
     }
 
     /// Search indexed code semantically.
