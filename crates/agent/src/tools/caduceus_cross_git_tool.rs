@@ -86,7 +86,7 @@ impl AgentTool for CaduceusCrossGitTool {
     const NAME: &'static str = "caduceus_cross_git";
 
     fn kind() -> acp::ToolKind {
-        acp::ToolKind::Read
+        acp::ToolKind::Execute // Contains CreateBranchAll which mutates repos
     }
 
     fn initial_title(

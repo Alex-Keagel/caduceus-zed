@@ -169,6 +169,17 @@ impl AgentTool for CaduceusTreeSitterTool {
 
             match input.operation {
                 TreeSitterOperation::Outline { path } => {
+                    // Validate path — reject traversal and absolute paths
+                    if path.contains("..") || std::path::Path::new(&path).is_absolute() {
+                        return Err(CaduceusTreeSitterToolOutput::Error {
+                            error: "Path traversal or absolute paths not allowed".to_string(),
+                        });
+                    }
+                    if crate::tools::is_sensitive_file(&path) {
+                        return Err(CaduceusTreeSitterToolOutput::Error {
+                            error: format!("Cannot read sensitive file: {path}"),
+                        });
+                    }
                     let content = std::fs::read_to_string(&path).map_err(|e| {
                         CaduceusTreeSitterToolOutput::Error {
                             error: format!("Cannot read {path}: {e}"),
@@ -192,6 +203,11 @@ impl AgentTool for CaduceusTreeSitterTool {
                     Ok(CaduceusTreeSitterToolOutput::Outline { path, entries })
                 }
                 TreeSitterOperation::SymbolsAt { path, line, column: _ } => {
+                    if path.contains("..") || std::path::Path::new(&path).is_absolute() {
+                        return Err(CaduceusTreeSitterToolOutput::Error {
+                            error: "Path traversal or absolute paths not allowed".to_string(),
+                        });
+                    }
                     let content = std::fs::read_to_string(&path).map_err(|e| {
                         CaduceusTreeSitterToolOutput::Error {
                             error: format!("Cannot read {path}: {e}"),
