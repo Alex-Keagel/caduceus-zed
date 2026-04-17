@@ -960,8 +960,20 @@ impl NativeAgent {
         project_state: Option<&ProjectState>,
         cx: &App,
     ) -> Vec<acp::AvailableCommand> {
+        // Caduceus built-in commands — always available, even without a project
+        let mut commands = vec![
+            acp::AvailableCommand::new("compact", "Compress conversation context to free tokens"),
+            acp::AvailableCommand::new("mode", "Show or switch Caduceus mode")
+                .input(acp::AvailableCommandInput::Unstructured(
+                    acp::UnstructuredCommandInput::new("<plan|act|research|autopilot|architect|debug|review>"),
+                )),
+            acp::AvailableCommand::new("context", "Show context usage and zone status"),
+            acp::AvailableCommand::new("checkpoint", "Create a code checkpoint for rollback"),
+            acp::AvailableCommand::new("help", "Show all Caduceus commands"),
+        ];
+
         let Some(state) = project_state else {
-            return vec![];
+            return commands;
         };
         let registry = state.context_server_registry.read(cx);
 
@@ -972,7 +984,7 @@ impl NativeAgent {
                 .or_insert(0) += 1;
         }
 
-        let mut commands: Vec<acp::AvailableCommand> = registry
+        let context_server_commands: Vec<acp::AvailableCommand> = registry
             .prompts()
             .flat_map(|context_server_prompt| {
                 let prompt = &context_server_prompt.prompt;
@@ -1013,18 +1025,8 @@ impl NativeAgent {
             })
             .collect::<Vec<_>>();
 
-        // Caduceus: add built-in slash commands
-        let caduceus_commands = vec![
-            acp::AvailableCommand::new("compact", "Compress conversation context to free tokens"),
-            acp::AvailableCommand::new("mode", "Show or switch Caduceus mode")
-                .input(acp::AvailableCommandInput::Unstructured(
-                    acp::UnstructuredCommandInput::new("<plan|act|research|autopilot|architect|debug|review>"),
-                )),
-            acp::AvailableCommand::new("context", "Show context usage and zone status"),
-            acp::AvailableCommand::new("checkpoint", "Create a code checkpoint for rollback"),
-            acp::AvailableCommand::new("help", "Show all Caduceus commands"),
-        ];
-        commands.extend(caduceus_commands);
+        // Context server commands added to the Caduceus built-ins
+        commands.extend(context_server_commands);
         commands
     }
 

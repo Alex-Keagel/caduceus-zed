@@ -943,6 +943,13 @@ enum CompletionError {
     Other(#[from] anyhow::Error),
 }
 
+/// Severity of a guardrail alert (drives UI color)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertSeverity {
+    Warning,
+    Error,
+}
+
 pub struct Thread {
     id: acp::SessionId,
     prompt_id: PromptId,
@@ -1000,7 +1007,7 @@ pub struct Thread {
     /// Compaction cooldown: prevents double-fire within cooldown window
     compaction_cooldown: caduceus_bridge::safety::CompactionCooldown,
     /// Last guardrail alert (visible in UI) — cleared after 10 seconds
-    guardrail_alert: Option<(String, std::time::Instant)>,
+    guardrail_alert: Option<(String, AlertSeverity, std::time::Instant)>,
     /// Whether context was compacted this turn (visible in UI)
     context_compacted_this_turn: bool,
 }
@@ -1470,11 +1477,11 @@ impl Thread {
         self.caduceus_mode = mode;
     }
 
-    /// Current guardrail alert message (if any, within 10s TTL)
-    pub fn guardrail_alert(&self) -> Option<&str> {
-        self.guardrail_alert.as_ref().and_then(|(msg, ts)| {
+    /// Current guardrail alert message and severity (if any, within 10s TTL)
+    pub fn guardrail_alert(&self) -> Option<(&str, AlertSeverity)> {
+        self.guardrail_alert.as_ref().and_then(|(msg, sev, ts)| {
             if ts.elapsed() < std::time::Duration::from_secs(10) {
-                Some(msg.as_str())
+                Some((msg.as_str(), *sev))
             } else {
                 None
             }
@@ -1486,17 +1493,22 @@ impl Thread {
         self.context_compacted_this_turn
     }
 
-    /// Current context zone (Green/Yellow/Orange/Red/Critical)
-    pub fn context_zone(&self) -> caduceus_bridge::orchestrator::ContextZone {
-        self.current_context_zone()
-    }
-
-    /// Context fill percentage (0-100+)
-    pub fn context_fill_pct(&self) -> f64 {
+    /// Current context zone and fill percentage (combined to avoid double computation)
+    pub fn context_zone_and_pct(&self) -> (caduceus_bridge::orchestrator::ContextZone, f64) {
         let total = self.estimate_total_tokens();
         let max = self.model_max_tokens();
-        if max == 0 { return 0.0; }
-        (total as f64 / max as f64) * 100.0
+        let pct = if max == 0 { 0.0 } else { ((total as f64 / max as f64) * 100.0).min(100.0) };
+        (caduceus_bridge::orchestrator::ContextZone::from_percentage(pct), pct)
+    }
+
+    /// Current context zone (Green/Yellow/Orange/Red/Critical)
+    pub fn context_zone(&self) -> caduceus_bridge::orchestrator::ContextZone {
+        self.context_zone_and_pct().0
+    }
+
+    /// Context fill percentage (0-100, capped)
+    pub fn context_fill_pct(&self) -> f64 {
+        self.context_zone_and_pct().1
     }
 
     /// Current Caduceus mode name
@@ -1603,6 +1615,7 @@ impl Thread {
         use caduceus_bridge::orchestrator::ContextZone;
         let total = self.estimate_total_tokens();
         let max = self.model_max_tokens();
+        if max == 0 { return ContextZone::Green; }
         ContextZone::from_percentage((total as f64 / max as f64) * 100.0)
     }
 
@@ -2203,6 +2216,15 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        // Reset per-turn UI state
+        self.context_compacted_this_turn = false;
+        // Clean stale guardrail alert from memory
+        if self.guardrail_alert.as_ref().is_some_and(|(_, _, ts)| {
+            ts.elapsed() >= std::time::Duration::from_secs(10)
+        }) {
+            self.guardrail_alert = None;
+        }
+
         // Caduceus: check context zone and warn user
         let zone = self.current_context_zone();
         match zone {
@@ -2742,6 +2764,7 @@ impl Thread {
             log::error!("[caduceus] Circuit breaker: {} consecutive failures", self.circuit_breaker.consecutive_failures());
             self.guardrail_alert = Some((
                 format!("🔴 Circuit breaker: {} consecutive tool failures — execution paused", self.circuit_breaker.consecutive_failures()),
+                AlertSeverity::Error,
                 std::time::Instant::now(),
             ));
             self.circuit_breaker.reset();
@@ -2766,6 +2789,7 @@ impl Thread {
                 log::warn!("[caduceus] Loop detected: {} called too many times consecutively", name);
                 self.guardrail_alert = Some((
                     format!("⚠️ Loop detected: {} called too many times — trying different approach", name),
+                    AlertSeverity::Warning,
                     std::time::Instant::now(),
                 ));
                 cx.notify();

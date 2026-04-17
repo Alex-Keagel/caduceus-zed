@@ -3557,12 +3557,29 @@ impl ThreadView {
     /// Caduceus: render guardrail alert banner when loop/circuit breaker fires
     fn render_guardrail_alert(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.as_native_thread(cx)?;
-        let alert_msg = thread.read(cx).guardrail_alert()?.to_string();
+        let (alert_msg, severity) = {
+            let t = thread.read(cx);
+            let (msg, sev) = t.guardrail_alert()?;
+            (msg.to_string(), sev)
+        };
 
-        let (bg_color, border_color) = if alert_msg.contains("Circuit breaker") {
-            (cx.theme().status().error.opacity(0.1), cx.theme().status().error.opacity(0.4))
-        } else {
-            (cx.theme().status().warning.opacity(0.1), cx.theme().status().warning.opacity(0.4))
+        // Schedule auto-dismiss after 10s TTL expires
+        cx.spawn(async move |_this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(10))
+                .await;
+            _this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+
+        let (bg_color, border_color) = match severity {
+            agent::AlertSeverity::Error => (cx.theme().status().error.opacity(0.1), cx.theme().status().error.opacity(0.4)),
+            agent::AlertSeverity::Warning => (cx.theme().status().warning.opacity(0.1), cx.theme().status().warning.opacity(0.4)),
+        };
+
+        let label_color = match severity {
+            agent::AlertSeverity::Error => Color::Error,
+            agent::AlertSeverity::Warning => Color::Warning,
         };
 
         Some(
@@ -3579,7 +3596,7 @@ impl ThreadView {
                 .child(
                     Label::new(alert_msg)
                         .size(LabelSize::Small)
-                        .color(Color::Warning),
+                        .color(label_color),
                 ),
         )
     }
@@ -3588,13 +3605,7 @@ impl ThreadView {
     fn render_context_zone_indicator(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         use caduceus_bridge::orchestrator::ContextZone;
         let thread = self.as_native_thread(cx)?;
-        let thread_read = thread.read(cx);
-        let zone = thread_read.context_zone();
-        let fill_pct = thread_read.context_fill_pct();
-
-        if zone == ContextZone::Green {
-            return None;
-        }
+        let (zone, fill_pct) = thread.read(cx).context_zone_and_pct();
 
         let (label, color) = match zone {
             ContextZone::Green => return None,
