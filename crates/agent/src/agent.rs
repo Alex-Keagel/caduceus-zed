@@ -1339,15 +1339,47 @@ impl NativeAgentConnection {
                 }
             }
             "context" => {
+                let sub = args.trim();
                 if let Some(thread) = self.thread(session_id, cx) {
-                    let t = thread.read(cx);
-                    let msg_count = t.message_count();
-                    let zone = t.context_zone();
-                    let fill_pct = t.context_fill_pct();
-                    format!(
-                        "📊 Context: {} messages | {:.0}% full | Zone: {} — {}\nUse `/compact` to free space.",
-                        msg_count, fill_pct, zone.label(), zone.recommendation()
-                    )
+                    if sub.starts_with("pin ") {
+                        let rest = sub.strip_prefix("pin ").unwrap_or("");
+                        if let Some((label, content)) = rest.split_once(' ') {
+                            thread.update(cx, |t, _| t.pin_context(label.trim(), content.trim()));
+                            format!("📌 Pinned: **{}** — survives compaction", label.trim())
+                        } else {
+                            "Usage: `/context pin <label> <content>`".to_string()
+                        }
+                    } else if sub.starts_with("unpin ") {
+                        let label = sub.strip_prefix("unpin ").unwrap_or("").trim();
+                        let removed = thread.update(cx, |t, _| t.unpin_context(label));
+                        if removed {
+                            format!("🗑 Unpinned: **{}**", label)
+                        } else {
+                            format!("❌ No pin named '{}'", label)
+                        }
+                    } else if sub == "pins" {
+                        let pins = thread.read(cx).list_pins();
+                        if pins.is_empty() {
+                            "No pinned context items.".to_string()
+                        } else {
+                            let mut out = format!("📌 {} pinned items:\n", pins.len());
+                            for p in pins {
+                                let preview: String = p.content.chars().take(50).collect();
+                                out.push_str(&format!("  **{}**: {}\n", p.label, preview));
+                            }
+                            out
+                        }
+                    } else {
+                        let t = thread.read(cx);
+                        let msg_count = t.message_count();
+                        let zone = t.context_zone();
+                        let fill_pct = t.context_fill_pct();
+                        let pin_count = t.list_pins().len();
+                        format!(
+                            "📊 Context: {} messages | {:.0}% full | Zone: {} — {}\n📌 {} pinned items (survive compaction)\nUse `/compact` to free space, `/context pin <label> <text>` to pin.",
+                            msg_count, fill_pct, zone.label(), zone.recommendation(), pin_count
+                        )
+                    }
                 } else {
                     "No active session".to_string()
                 }
@@ -1355,9 +1387,12 @@ impl NativeAgentConnection {
             "help" => {
                 "## Caduceus Commands\n\
                  - `/compact` — compress conversation context\n\
-                 - `/mode [name]` — show/switch mode (plan, act, research, autopilot, architect, debug, review)\n\
-                 - `/context` — show context usage\n\
-                 - `/checkpoint` — create a code checkpoint\n\
+                 - `/mode [name]` — show/switch mode\n\
+                 - `/context` — show context usage and pinned items\n\
+                 - `/context pin <label> <text>` — pin context (survives compaction)\n\
+                 - `/context unpin <label>` — remove a pin\n\
+                 - `/context pins` — list all pins\n\
+                 - `/checkpoint [label]` — create a code checkpoint\n\
                  - `/help` — show this help"
                     .to_string()
             }

@@ -1010,6 +1010,8 @@ pub struct Thread {
     guardrail_alert: Option<(String, AlertSeverity, std::time::Instant)>,
     /// Whether context was compacted this turn (visible in UI)
     context_compacted_this_turn: bool,
+    /// Pinned context items that survive compaction
+    context_pins: caduceus_bridge::orchestrator::ContextManager,
 }
 
 impl Thread {
@@ -1139,6 +1141,7 @@ impl Thread {
             ),
             guardrail_alert: None,
             context_compacted_this_turn: false,
+            context_pins: caduceus_bridge::orchestrator::ContextManager::new(128000),
         }
     }
 
@@ -1382,6 +1385,7 @@ impl Thread {
             ),
             guardrail_alert: None,
             context_compacted_this_turn: false,
+            context_pins: caduceus_bridge::orchestrator::ContextManager::new(128000),
         }
     }
 
@@ -1514,6 +1518,21 @@ impl Thread {
     /// Current Caduceus mode name
     pub fn caduceus_mode_name(&self) -> &str {
         self.caduceus_mode_from_profile()
+    }
+
+    /// Pin context that survives compaction
+    pub fn pin_context(&mut self, label: &str, content: &str) {
+        self.context_pins.pin(label, content);
+    }
+
+    /// Unpin context
+    pub fn unpin_context(&mut self, label: &str) -> bool {
+        self.context_pins.unpin(label)
+    }
+
+    /// List pinned context items
+    pub fn list_pins(&self) -> &[caduceus_bridge::orchestrator::PinnedContext] {
+        self.context_pins.list_pins()
     }
 
     pub(crate) fn message_count(&self) -> usize {
@@ -3553,6 +3572,13 @@ Write plans to .caduceus/wiki/ or .caduceus/ directory. Use caduceus_project_wik
                 if let Some(overview) = caduceus_bridge::memory::get(&root, "wiki:project-overview") {
                     let compact: String = overview.chars().take(300).collect();
                     assembler.add_source(ContextSource::MemoryBank(compact));
+                }
+
+                // Inject pinned context items (survive compaction)
+                for pin in self.context_pins.list_pins() {
+                    assembler.add_source(ContextSource::Pinned(
+                        format!("[Pinned: {}] {}", pin.label, pin.content)
+                    ));
                 }
 
                 // Cross-repo context from project.json
