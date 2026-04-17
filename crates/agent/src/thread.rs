@@ -993,12 +993,12 @@ pub struct Thread {
     caduceus_mode: Option<String>,
     /// Cached project instructions to avoid repeated sync I/O
     cached_project_instructions: Option<String>,
-    /// Loop detection: tracks (tool_name, consecutive_count)
-    consecutive_same_tool: Option<(String, usize)>,
-    /// Circuit breaker: consecutive tool failure count
-    consecutive_tool_failures: u32,
-    /// Timestamp of last successful context compaction (prevents double-fire)
-    last_compacted_at: Option<std::time::Instant>,
+    /// Loop detection: blocks Nth consecutive same-tool call
+    loop_detector: caduceus_bridge::safety::LoopDetector,
+    /// Circuit breaker: trips after N consecutive tool failures
+    circuit_breaker: caduceus_bridge::safety::CircuitBreaker,
+    /// Compaction cooldown: prevents double-fire within cooldown window
+    compaction_cooldown: caduceus_bridge::safety::CompactionCooldown,
 }
 
 impl Thread {
@@ -1121,9 +1121,11 @@ impl Thread {
             running_subagents: Vec::new(),
             caduceus_mode: None,
             cached_project_instructions: None,
-            consecutive_same_tool: None,
-            consecutive_tool_failures: 0,
-            last_compacted_at: None,
+            loop_detector: caduceus_bridge::safety::LoopDetector::new(3),
+            circuit_breaker: caduceus_bridge::safety::CircuitBreaker::new(5),
+            compaction_cooldown: caduceus_bridge::safety::CompactionCooldown::new(
+                std::time::Duration::from_secs(30),
+            ),
         }
     }
 
@@ -1360,9 +1362,11 @@ impl Thread {
             running_subagents: Vec::new(),
             caduceus_mode: None,
             cached_project_instructions: None,
-            consecutive_same_tool: None,
-            consecutive_tool_failures: 0,
-            last_compacted_at: None,
+            loop_detector: caduceus_bridge::safety::LoopDetector::new(3),
+            circuit_breaker: caduceus_bridge::safety::CircuitBreaker::new(5),
+            compaction_cooldown: caduceus_bridge::safety::CompactionCooldown::new(
+                std::time::Duration::from_secs(30),
+            ),
         }
     }
 
@@ -1566,11 +1570,9 @@ impl Thread {
     pub(crate) fn auto_compact_context(&mut self, cx: &mut Context<Self>) -> bool {
         use caduceus_bridge::orchestrator::{estimate_tokens, ContextZone};
 
-        // Timestamp-based guard: don't compact more than once per 30s
-        if let Some(last) = self.last_compacted_at {
-            if last.elapsed() < std::time::Duration::from_secs(30) {
-                return false; // Compacted recently, skip
-            }
+        // Use compaction cooldown guard
+        if !self.compaction_cooldown.can_compact() {
+            return false; // Compacted recently, skip
         }
 
         // Estimate current context size (reuse DRY helper)
@@ -1691,7 +1693,7 @@ impl Thread {
             total_tokens.saturating_sub(estimate_tokens(&summary))
         );
 
-        self.last_compacted_at = Some(std::time::Instant::now());
+        self.compaction_cooldown.record_compaction();
         true
     }
 
@@ -2462,11 +2464,7 @@ impl Thread {
         );
         this.update(cx, |this, _cx| {
             // Caduceus: track consecutive failures for circuit breaker
-            if tool_result.is_error {
-                this.consecutive_tool_failures += 1;
-            } else {
-                this.consecutive_tool_failures = 0;
-            }
+            this.circuit_breaker.record_result(tool_result.is_error);
             this.pending_message()
                 .tool_results
                 .insert(tool_result.tool_use_id.clone(), tool_result)
@@ -2676,8 +2674,8 @@ impl Thread {
                 tool_use.name, mode, tool_use.name
             );
             log::warn!("[caduceus] PERMISSION DENIED '{}' in {} mode", tool_use.name, mode);
-            // Permission denials are not failures — don't trigger circuit breaker
-            self.consecutive_tool_failures = 0;
+            // Permission denials reset the circuit breaker (not real failures)
+            self.circuit_breaker.record_permission_denied();
             return Some(Task::ready(LanguageModelToolResult {
                 content: LanguageModelToolResultContent::Text(Arc::from(content)),
                 tool_use_id: tool_use.id,
@@ -2687,10 +2685,10 @@ impl Thread {
             }));
         }
 
-        // Caduceus: circuit breaker — stop after 5 consecutive tool failures
-        if self.consecutive_tool_failures >= 5 {
-            log::error!("[caduceus] Circuit breaker: {} consecutive failures", self.consecutive_tool_failures);
-            self.consecutive_tool_failures = 0;
+        // Caduceus: circuit breaker — stop after N consecutive tool failures
+        if self.circuit_breaker.is_tripped() {
+            log::error!("[caduceus] Circuit breaker: {} consecutive failures", self.circuit_breaker.consecutive_failures());
+            self.circuit_breaker.reset();
             return Some(Task::ready(LanguageModelToolResult {
                 content: LanguageModelToolResultContent::Text(Arc::from(
                     "CIRCUIT BREAKER: 5 consecutive tool failures. Stop and explain the issue to the user."
@@ -2702,37 +2700,22 @@ impl Thread {
             }));
         }
 
-        // Caduceus: loop detection — prevent same tool being called 3+ times consecutively
+        // Caduceus: loop detection — prevent same tool being called too many times consecutively
         {
             let tool_name = tool_use.name.as_ref();
-            let is_loop = if let Some((prev_tool, count)) = &self.consecutive_same_tool {
-                prev_tool == tool_name && *count >= 3
-            } else {
-                false
-            };
-            if is_loop {
-                log::warn!("[caduceus] Loop detected: {} called {} times consecutively", tool_name,
-                    self.consecutive_same_tool.as_ref().map(|(_, c)| c).unwrap_or(&0));
-                self.consecutive_same_tool = None;
+            if let caduceus_bridge::safety::LoopCheckResult::LoopDetected(name) =
+                self.loop_detector.record_tool(tool_name)
+            {
+                log::warn!("[caduceus] Loop detected: {} called too many times consecutively", name);
                 return Some(Task::ready(LanguageModelToolResult {
                     content: LanguageModelToolResultContent::Text(Arc::from(
-                        format!("LOOP DETECTED: {} called too many times in a row. Try a different approach.", tool_name)
+                        format!("LOOP DETECTED: {} called too many times in a row. Try a different approach.", name)
                     )),
                     tool_use_id: tool_use.id,
                     tool_name: tool_use.name,
                     is_error: true,
                     output: None,
                 }));
-            }
-            // Update consecutive tracking
-            if let Some((prev, count)) = &mut self.consecutive_same_tool {
-                if prev.as_str() == tool_name {
-                    *count += 1;
-                } else {
-                    self.consecutive_same_tool = Some((tool_name.to_string(), 1));
-                }
-            } else {
-                self.consecutive_same_tool = Some((tool_name.to_string(), 1));
             }
         }
 

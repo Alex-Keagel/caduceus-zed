@@ -2034,136 +2034,89 @@ fn message_group_system_flag() {
     assert!(!user.is_system());
 }
 
-// ── Loop Detection (behavioral simulation) ─────────────────────────────────
+// ── Loop Detection (real struct tests) ──────────────────────────────────────
 
 #[test]
-fn loop_detection_simulated_repetition() {
-    // Simulates the loop detection logic from thread.rs:
-    // If the same tool is called 3+ times consecutively, it's a loop.
-    let tool_calls = vec!["edit_file", "edit_file", "edit_file", "edit_file"];
-    let mut consecutive_count = 0u32;
-    let mut last_tool: Option<&str> = None;
-    let mut loop_detected = false;
-
-    for tool in &tool_calls {
-        if last_tool == Some(tool) {
-            consecutive_count += 1;
-        } else {
-            consecutive_count = 1;
-        }
-        last_tool = Some(tool);
-        if consecutive_count >= 3 {
-            loop_detected = true;
-            break;
-        }
-    }
-    assert!(loop_detected, "4 consecutive same-tool calls should trigger loop detection");
+fn loop_detector_blocks_4th_consecutive_same_tool() {
+    use caduceus_bridge::safety::{LoopDetector, LoopCheckResult};
+    let mut ld = LoopDetector::new(3);
+    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
+    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
+    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
+    assert_eq!(
+        ld.record_tool("edit_file"),
+        LoopCheckResult::LoopDetected("edit_file".to_string())
+    );
 }
 
 #[test]
-fn loop_detection_spec_different_tools_no_trigger() {
-    let tool_calls = vec!["edit_file", "read_file", "edit_file", "read_file"];
-    let mut consecutive_count = 0u32;
-    let mut last_tool: Option<&str> = None;
-    let mut loop_detected = false;
-
-    for tool in &tool_calls {
-        if last_tool == Some(tool) {
-            consecutive_count += 1;
-        } else {
-            consecutive_count = 1;
-        }
-        last_tool = Some(tool);
-        if consecutive_count >= 3 {
-            loop_detected = true;
-        }
-    }
-    assert!(!loop_detected, "Alternating tools should not trigger loop detection");
-}
-
-// ── Circuit Breaker (specification tests) ──────────────────────────────
-// These tests document INTENDED circuit breaker behavior as a specification.
-// The actual circuit breaker lives in thread.rs (gpui context, not unit-testable here).
-// TODO: Export CircuitBreaker struct and test it directly.
-
-#[test]
-fn circuit_breaker_spec_trips_after_5_failures() {
-    let max_failures = 5u32;
-    let mut consecutive_failures = 0u32;
-    let results = vec![false, false, false, false, false]; // 5 failures
-
-    for success in &results {
-        if *success {
-            consecutive_failures = 0;
-        } else {
-            consecutive_failures += 1;
-        }
-    }
-    assert!(consecutive_failures >= max_failures, "5 consecutive failures should trip circuit breaker");
+fn loop_detector_different_tools_no_trigger() {
+    use caduceus_bridge::safety::{LoopDetector, LoopCheckResult};
+    let mut ld = LoopDetector::new(3);
+    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
+    assert_eq!(ld.record_tool("read_file"), LoopCheckResult::Ok);
+    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
+    assert_eq!(ld.record_tool("read_file"), LoopCheckResult::Ok);
 }
 
 #[test]
-fn circuit_breaker_spec_resets_on_success() {
-    let mut consecutive_failures = 0u32;
-    let results = vec![false, false, true, false, false, false]; // success at index 2 resets
+fn loop_detector_resets_after_detection() {
+    use caduceus_bridge::safety::{LoopDetector, LoopCheckResult};
+    let mut ld = LoopDetector::new(3);
+    for _ in 0..3 { ld.record_tool("edit_file"); }
+    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::LoopDetected("edit_file".to_string()));
+    // After detection, fresh start
+    assert_eq!(ld.consecutive_count(), 0);
+    assert_eq!(ld.record_tool("edit_file"), LoopCheckResult::Ok);
+}
 
-    for success in &results {
-        if *success {
-            consecutive_failures = 0;
-        } else {
-            consecutive_failures += 1;
-        }
+// ── Circuit Breaker (real struct tests) ────────────────────────────────────
+
+#[test]
+fn circuit_breaker_trips_after_5_failures() {
+    use caduceus_bridge::safety::CircuitBreaker;
+    let mut cb = CircuitBreaker::new(5);
+    for _ in 0..4 {
+        cb.record_result(true);
+        assert!(!cb.is_tripped());
     }
-    assert_eq!(consecutive_failures, 3, "Should be 3 after reset, not 5");
-    assert!(consecutive_failures < 5, "Circuit breaker should not trip");
+    cb.record_result(true);
+    assert!(cb.is_tripped());
 }
 
 #[test]
-fn circuit_breaker_spec_permission_denied_excluded() {
-    // Simulates: permission denials don't count as failures
-    let mut consecutive_failures = 0u32;
-    let results: Vec<(&str, bool)> = vec![
-        ("error", false),
-        ("permission_denied", false),
-        ("error", false),
-        ("permission_denied", false),
-        ("error", false),
-    ];
-
-    for (kind, success) in &results {
-        if *success {
-            consecutive_failures = 0;
-        } else if *kind != "permission_denied" {
-            consecutive_failures += 1;
-        }
-        // permission_denied does NOT increment
-    }
-    assert_eq!(consecutive_failures, 3, "Only real errors count, not permission denials");
-    assert!(consecutive_failures < 5, "Circuit breaker should not trip with permission denials excluded");
+fn circuit_breaker_resets_on_success() {
+    use caduceus_bridge::safety::CircuitBreaker;
+    let mut cb = CircuitBreaker::new(5);
+    for _ in 0..4 { cb.record_result(true); }
+    cb.record_result(false);
+    assert_eq!(cb.consecutive_failures(), 0);
+    assert!(!cb.is_tripped());
 }
 
-// ── Compaction Cooldown (specification test) ───────────────────────────────
-// Validates intended cooldown behavior. No crate API tested directly.
-// TODO: Export CompactionCooldown struct and test it directly.
+#[test]
+fn circuit_breaker_permission_denied_resets() {
+    use caduceus_bridge::safety::CircuitBreaker;
+    let mut cb = CircuitBreaker::new(5);
+    for _ in 0..4 { cb.record_result(true); }
+    cb.record_permission_denied();
+    assert_eq!(cb.consecutive_failures(), 0);
+    assert!(!cb.is_tripped());
+}
+
+// ── Compaction Cooldown (real struct tests) ─────────────────────────────────
 
 #[test]
-fn compaction_cooldown_spec_prevents_double_fire() {
-    use std::time::Instant;
-    let cooldown_secs = 30u64;
-    let mut last_compacted: Option<Instant> = None;
-
-    // First compaction — should proceed
-    let can_compact_1 = last_compacted
-        .map(|t| t.elapsed().as_secs() >= cooldown_secs)
-        .unwrap_or(true);
-    assert!(can_compact_1, "First compaction should always proceed");
-    last_compacted = Some(Instant::now());
-
-    // Immediate second attempt — should be blocked
-    let can_compact_2 = last_compacted
-        .map(|t| t.elapsed().as_secs() >= cooldown_secs)
-        .unwrap_or(true);
-    assert!(!can_compact_2, "Immediate retry should be blocked by cooldown");
+fn compaction_cooldown_allows_first_blocks_immediate() {
+    use caduceus_bridge::safety::CompactionCooldown;
+    use std::time::{Duration, Instant};
+    let mut cd = CompactionCooldown::new(Duration::from_secs(30));
+    let now = Instant::now();
+    assert!(cd.can_compact_at(now), "First compaction should always proceed");
+    cd.record_compaction_at(now);
+    assert!(!cd.can_compact_at(now), "Immediate retry should be blocked");
+    assert!(!cd.can_compact_at(now + Duration::from_secs(15)), "15s is within cooldown");
+    assert!(cd.can_compact_at(now + Duration::from_secs(30)), "30s should be allowed");
 }
 
 // ── Compact Instructions ───────────────────────────────────────────────────

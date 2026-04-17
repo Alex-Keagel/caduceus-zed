@@ -25,5 +25,6 @@ pub mod orchestrator;
 pub mod marketplace;
 pub mod providers;
 pub mod runtime;
+pub mod safety;
 
 pub use engine::CaduceusEngine;
