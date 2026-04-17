@@ -39,6 +39,14 @@ pub fn acquire_file_lock(path: &std::path::Path) -> Result<FileLockGuard, String
     Ok(FileLockGuard { path })
 }
 
+/// List currently locked file paths.
+pub fn list_locked_files() -> Vec<PathBuf> {
+    LOCKED_FILES
+        .lock()
+        .map(|locks| locks.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -781,6 +781,10 @@ struct CaduceusStatsCache {
     health_score: Option<f64>,
     memory_count: usize,
     memory_entries: Vec<(String, String)>,
+    locked_file_count: usize,
+    lock_tooltip: String,
+    bg_agent_tooltip: String,
+    security_tooltip: String,
     last_refresh: Instant,
 }
 
@@ -797,6 +801,10 @@ impl Default for CaduceusStatsCache {
             health_score: None,
             memory_count: 0,
             memory_entries: Vec::new(),
+            locked_file_count: 0,
+            lock_tooltip: String::new(),
+            bg_agent_tooltip: "No background agents".to_string(),
+            security_tooltip: "Security score based on last scan".to_string(),
             last_refresh: Instant::now() - Duration::from_secs(60),
         }
     }
@@ -4563,10 +4571,16 @@ impl AgentPanel {
                 )
             })
             .when(background_agent_count > 0, |this| {
+                let bg_tooltip = self.caduceus_stats_cache.bg_agent_tooltip.clone();
                 this.child(
-                    Label::new(format!("🤖 {background_agent_count}"))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    div()
+                        .id("bg-agents-badge")
+                        .child(
+                            Label::new(format!("🤖 {background_agent_count}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .tooltip(Tooltip::text(bg_tooltip)),
                 )
             })
             .when(evolved_skill_count > 0, |this| {
@@ -4576,17 +4590,37 @@ impl AgentPanel {
                         .color(Color::Muted),
                 )
             })
-            .child(
-                Label::new(format!("🛡️ {:.0}%", security_score * 100.0))
-                    .size(LabelSize::Small)
-                    .color(if security_score >= 0.8 {
-                        Color::Success
-                    } else if security_score >= 0.5 {
-                        Color::Warning
-                    } else {
-                        Color::Error
-                    }),
-            )
+            .child({
+                let security_tooltip = self.caduceus_stats_cache.security_tooltip.clone();
+                div()
+                    .id("security-badge")
+                    .child(
+                        Label::new(format!("🛡️ {:.0}%", security_score * 100.0))
+                            .size(LabelSize::Small)
+                            .color(if security_score >= 0.8 {
+                                Color::Success
+                            } else if security_score >= 0.5 {
+                                Color::Warning
+                            } else {
+                                Color::Error
+                            }),
+                    )
+                    .tooltip(Tooltip::text(security_tooltip))
+            })
+            .when(self.caduceus_stats_cache.locked_file_count > 0, |this| {
+                let lock_count = self.caduceus_stats_cache.locked_file_count;
+                let lock_tooltip = self.caduceus_stats_cache.lock_tooltip.clone();
+                this.child(
+                    div()
+                        .id("file-lock-badge")
+                        .child(
+                            Label::new(format!("🔒 {lock_count}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                        )
+                        .tooltip(Tooltip::text(lock_tooltip)),
+                )
+            })
             .when(api_count > 0, |this| {
                 this.child(
                     Label::new(format!("🔌 {} APIs", api_count))
@@ -4743,6 +4777,53 @@ impl AgentPanel {
             let entries = caduceus_bridge::memory::list(&root);
             self.caduceus_stats_cache.memory_count = entries.len();
             self.caduceus_stats_cache.memory_entries = entries;
+
+            // Background agent details for tooltip
+            let agents_path = root.join(".caduceus/background-agents.json");
+            self.caduceus_stats_cache.bg_agent_tooltip = if agents_path.exists() {
+                std::fs::read_to_string(&agents_path)
+                    .ok()
+                    .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(&json).ok())
+                    .map(|agents| {
+                        let mut tip = format!("🤖 {} background agents:\n", agents.len());
+                        for agent in agents.iter().take(5) {
+                            let id = agent["id"].as_str().unwrap_or("?");
+                            let status = agent["status"].as_str().unwrap_or("unknown");
+                            let task: String = agent["task"].as_str().unwrap_or("").chars().take(30).collect();
+                            tip.push_str(&format!("  {} [{}] {}\n", id, status, task));
+                        }
+                        if agents.len() > 5 {
+                            tip.push_str(&format!("  ... and {} more", agents.len() - 5));
+                        }
+                        tip
+                    })
+                    .unwrap_or_else(|| "No background agents".to_string())
+            } else {
+                "No background agents".to_string()
+            };
+
+            // Security scan tooltip
+            let security_score = self.caduceus_stats_cache.security_score;
+            self.caduceus_stats_cache.security_tooltip = if security_score >= 0.8 {
+                format!("🛡️ Security score: {:.0}% — Good\nRun caduceus_security_scan for details", security_score * 100.0)
+            } else if security_score >= 0.5 {
+                format!("🛡️ Security score: {:.0}% — Needs attention\nRun caduceus_security_scan for findings", security_score * 100.0)
+            } else {
+                format!("🛡️ Security score: {:.0}% — Critical issues\nRun caduceus_security_scan immediately", security_score * 100.0)
+            };
+        }
+
+        // File locks (in-process, not filesystem)
+        let locked = agent::caduceus_file_lock::list_locked_files();
+        self.caduceus_stats_cache.locked_file_count = locked.len();
+        if locked.is_empty() {
+            self.caduceus_stats_cache.lock_tooltip = "No files locked".to_string();
+        } else {
+            let mut tip = format!("🔒 {} files locked:\n", locked.len());
+            for path in locked.iter().take(5) {
+                tip.push_str(&format!("  {}\n", path.display()));
+            }
+            self.caduceus_stats_cache.lock_tooltip = tip;
         }
 
         self.caduceus_stats_cache.last_refresh = Instant::now();
