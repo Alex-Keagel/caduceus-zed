@@ -48,8 +48,10 @@ fn default_mode() -> String {
     "autopilot".to_string()
 }
 
+/// Extended agent config that wraps engine's BackgroundAgent with IDE-specific fields
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BackgroundAgentConfig {
+    /// Core state from engine
     id: String,
     task: String,
     mode: String,
@@ -57,6 +59,19 @@ struct BackgroundAgentConfig {
     auto_commit: bool,
     created_at: String,
     completed_at: Option<String>,
+}
+
+impl BackgroundAgentConfig {
+    /// Convert to engine BackgroundStatus for consistent display
+    fn engine_status(&self) -> caduceus_bridge::orchestrator::BackgroundStatus {
+        match self.status.as_str() {
+            "running" => caduceus_bridge::orchestrator::BackgroundStatus::Running,
+            "paused" => caduceus_bridge::orchestrator::BackgroundStatus::Paused,
+            "completed" => caduceus_bridge::orchestrator::BackgroundStatus::Completed("done".into()),
+            "stopped" | "cancelled" => caduceus_bridge::orchestrator::BackgroundStatus::Cancelled,
+            _ => caduceus_bridge::orchestrator::BackgroundStatus::Failed(self.status.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -231,7 +246,7 @@ impl AgentTool for CaduceusBackgroundAgentTool {
                         for a in &agents {
                             out.push_str(&format!(
                                 "  [{}] {} — {} (mode: {}, auto-commit: {})\n",
-                                a.status,
+                                a.engine_status(),
                                 crate::tools::truncate_str(&a.id, 8),
                                 a.task,
                                 a.mode,

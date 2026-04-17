@@ -948,6 +948,10 @@ impl NativeAgent {
             acp::AvailableCommand::new("checkpoint", "Create a code checkpoint for rollback"),
             acp::AvailableCommand::new("help", "Show all Caduceus commands"),
             acp::AvailableCommand::new("review", "Review code for security issues"),
+            acp::AvailableCommand::new("headless", "Generate CLI command for headless execution")
+                .input(acp::AvailableCommandInput::Unstructured(
+                    acp::UnstructuredCommandInput::new("<prompt>"),
+                )),
         ];
 
         let Some(state) = project_state else {
@@ -1388,6 +1392,31 @@ impl NativeAgentConnection {
                  The agent will use the security scanner and dependency checker automatically."
                     .to_string()
             }
+            "headless" => {
+                let prompt = args.trim();
+                if prompt.is_empty() {
+                    "## Headless Mode\n\
+                     Run Caduceus from the command line without the IDE:\n\n\
+                     ```bash\n\
+                     caduceus run --prompt \"your task here\" --mode act --format json\n\
+                     ```\n\n\
+                     Options:\n\
+                     - `--mode plan|act|research|autopilot|architect|debug|review`\n\
+                     - `--format text|json|compact`\n\
+                     - `--print-only` — suppress streaming, output final result only\n\n\
+                     Use `/headless <prompt>` to generate a ready-to-run command."
+                        .to_string()
+                } else {
+                    let mode = self.thread(session_id, cx)
+                        .map(|t| t.read(cx).caduceus_mode_name().to_string())
+                        .unwrap_or_else(|| "act".to_string());
+                    let escaped = prompt.replace('\'', "'\\''");
+                    format!(
+                        "```bash\ncaduceus run \\\n  --prompt '{}' \\\n  --mode {} \\\n  --format json \\\n  --print-only\n```\n\nCopy and run in your terminal.",
+                        escaped, mode
+                    )
+                }
+            }
             "help" => {
                 "## Caduceus Commands\n\
                  - `/compact` — compress conversation context\n\
@@ -1398,6 +1427,7 @@ impl NativeAgentConnection {
                  - `/context pins` — list all pins\n\
                  - `/checkpoint [label]` — create a code checkpoint\n\
                  - `/review` — review code for security issues\n\
+                 - `/headless [prompt]` — generate CLI command for headless execution\n\
                  - `/help` — show this help"
                     .to_string()
             }
