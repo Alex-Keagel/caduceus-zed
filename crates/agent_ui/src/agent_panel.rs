@@ -765,10 +765,28 @@ pub struct AgentPanel {
     show_trust_workspace_message: bool,
     _base_view_observation: Option<Subscription>,
     caduceus_stats_cache: CaduceusStatsCache,
+    _caduceus_stats_refresh_task: Option<Task<()>>,
+}
+
+/// Data computed by the background I/O task for Caduceus stats.
+struct CaduceusStatsSnapshot {
+    automation_count: usize,
+    background_agent_count: usize,
+    evolved_skill_count: usize,
+    security_score: f64,
+    project_name: Option<String>,
+    project_repo_count: usize,
+    api_count: usize,
+    health_score: Option<f64>,
+    memory_count: usize,
+    memory_entries: Vec<(String, String)>,
+    memory_tooltip: String,
+    bg_agent_tooltip: String,
+    security_tooltip: String,
 }
 
 /// Cached Caduceus stats to avoid synchronous filesystem I/O on every render.
-/// Refreshes at most every 5 seconds.
+/// Refreshes at most every 5 seconds via a background task.
 #[derive(Clone, Debug)]
 struct CaduceusStatsCache {
     automation_count: usize,
@@ -1152,6 +1170,7 @@ impl AgentPanel {
             )),
             _base_view_observation: None,
             caduceus_stats_cache: CaduceusStatsCache::default(),
+            _caduceus_stats_refresh_task: None,
         };
 
         // Initial sync of agent servers from extensions
@@ -4535,9 +4554,14 @@ impl AgentPanel {
             .gap_1()
             .when(memory_count > 0, |this| {
                 this.child(
-                    Label::new(format!("🧠 {memory_count}"))
-                        .size(LabelSize::Small)
-                        .color(Color::Accent),
+                    div()
+                        .id("memory-badge")
+                        .child(
+                            Label::new(format!("🧠 {memory_count}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Accent),
+                        )
+                        .tooltip(Tooltip::text(memory_tooltip)),
                 )
             })
             .when(project_repo_count > 0, |this| {
@@ -4652,18 +4676,52 @@ impl AgentPanel {
 
     /// Refreshes the cached Caduceus stats if the cache is stale (>5 seconds old).
     /// Avoids synchronous filesystem I/O on every render frame.
-    fn refresh_caduceus_stats(&mut self, cx: &Context<Self>) {
+    fn refresh_caduceus_stats(&mut self, cx: &mut Context<Self>) {
         const CACHE_TTL: Duration = Duration::from_secs(5);
         if self.caduceus_stats_cache.last_refresh.elapsed() < CACHE_TTL {
             return;
         }
+        // Already refreshing in the background — don't pile up tasks.
+        if self._caduceus_stats_refresh_task.is_some() {
+            return;
+        }
 
-        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
-            let root = worktree.read(cx).abs_path();
+        // Stamp the refresh time immediately so the TTL guard holds while the
+        // background task is running (prevents repeated spawns if render fires
+        // again before the task completes).
+        self.caduceus_stats_cache.last_refresh = Instant::now();
+
+        // In-process lock list — no I/O, safe on the UI thread.
+        let locked = agent::caduceus_file_lock::list_locked_files();
+        self.caduceus_stats_cache.locked_file_count = locked.len();
+        if locked.is_empty() {
+            self.caduceus_stats_cache.lock_tooltip = "No files locked".to_string();
+        } else {
+            let mut tip = format!("🔒 {} files locked:\n", locked.len());
+            for path in locked.iter().take(5) {
+                tip.push_str(&format!("  {}\n", path.display()));
+            }
+            self.caduceus_stats_cache.lock_tooltip = tip;
+        }
+
+        // Grab the worktree root (cheap — reads from in-memory model).
+        let root_opt = self
+            .project
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .map(|wt| wt.read(cx).abs_path());
+
+        // All filesystem I/O runs on the background executor so the UI thread
+        // is never blocked.
+        let io_task = cx.background_spawn(async move {
+            let Some(root) = root_opt else {
+                return None;
+            };
 
             // Automations count
             let path = root.join(".caduceus/automations.json");
-            self.caduceus_stats_cache.automation_count = if path.exists() {
+            let automation_count = if path.exists() {
                 std::fs::read_to_string(&path)
                     .ok()
                     .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(&json).ok())
@@ -4674,7 +4732,7 @@ impl AgentPanel {
 
             // Background agents count
             let dir = root.join(".caduceus/agents");
-            self.caduceus_stats_cache.background_agent_count = if dir.exists() {
+            let background_agent_count = if dir.exists() {
                 std::fs::read_dir(&dir)
                     .map(|entries| {
                         entries
@@ -4693,7 +4751,7 @@ impl AgentPanel {
 
             // Evolved skills count
             let path = root.join(".caduceus/evolved_skills.json");
-            self.caduceus_stats_cache.evolved_skill_count = if path.exists() {
+            let evolved_skill_count = if path.exists() {
                 std::fs::read_to_string(&path)
                     .ok()
                     .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(&json).ok())
@@ -4704,33 +4762,29 @@ impl AgentPanel {
 
             // Security compliance score
             let bridge = caduceus_bridge::security::PermissionsBridge::new(root.as_ref());
-            self.caduceus_stats_cache.security_score = bridge.compliance_score();
+            let security_score = bridge.compliance_score();
 
             // Multi-repo project info
             let project_path = root.join(".caduceus/project.json");
-            if project_path.exists() {
+            let (project_name, project_repo_count) = if project_path.exists() {
                 if let Some(config) = std::fs::read_to_string(&project_path)
                     .ok()
                     .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
                 {
-                    self.caduceus_stats_cache.project_name = config["project"]["name"]
-                        .as_str()
-                        .map(|s| s.to_string());
-                    self.caduceus_stats_cache.project_repo_count = config["repos"]
-                        .as_object()
-                        .map_or(0, |r| r.len());
+                    (
+                        config["project"]["name"].as_str().map(|s| s.to_string()),
+                        config["repos"].as_object().map_or(0, |r| r.len()),
+                    )
                 } else {
-                    self.caduceus_stats_cache.project_name = None;
-                    self.caduceus_stats_cache.project_repo_count = 0;
+                    (None, 0)
                 }
             } else {
-                self.caduceus_stats_cache.project_name = None;
-                self.caduceus_stats_cache.project_repo_count = 0;
-            }
+                (None, 0)
+            };
 
             // API registry count
             let apis_path = root.join(".caduceus/apis.json");
-            self.caduceus_stats_cache.api_count = if apis_path.exists() {
+            let api_count = if apis_path.exists() {
                 std::fs::read_to_string(&apis_path)
                     .ok()
                     .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
@@ -4742,7 +4796,7 @@ impl AgentPanel {
 
             // Architecture health score
             let health_path = root.join(".caduceus/health.json");
-            self.caduceus_stats_cache.health_score = if health_path.exists() {
+            let health_score = if health_path.exists() {
                 std::fs::read_to_string(&health_path)
                     .ok()
                     .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
@@ -4750,24 +4804,11 @@ impl AgentPanel {
             } else {
                 None
             };
-        } else {
-            self.caduceus_stats_cache.automation_count = 0;
-            self.caduceus_stats_cache.background_agent_count = 0;
-            self.caduceus_stats_cache.evolved_skill_count = 0;
-            self.caduceus_stats_cache.security_score = 0.0;
-            self.caduceus_stats_cache.project_name = None;
-            self.caduceus_stats_cache.project_repo_count = 0;
-            self.caduceus_stats_cache.api_count = 0;
-            self.caduceus_stats_cache.health_score = None;
-        }
 
-        // Memory entries
-        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
-            let root = worktree.read(cx).abs_path();
+            // Memory entries
             let entries = caduceus_bridge::memory::list(&root);
-            self.caduceus_stats_cache.memory_count = entries.len();
-            // Pre-build memory tooltip (avoid per-frame allocation)
-            self.caduceus_stats_cache.memory_tooltip = if entries.is_empty() {
+            let memory_count = entries.len();
+            let memory_tooltip = if entries.is_empty() {
                 "No memories stored".to_string()
             } else {
                 let mut tip = format!("🧠 {} memories:\n", entries.len());
@@ -4780,11 +4821,10 @@ impl AgentPanel {
                 }
                 tip
             };
-            self.caduceus_stats_cache.memory_entries = entries;
 
             // Background agent details for tooltip
             let agents_path = root.join(".caduceus/background-agents.json");
-            self.caduceus_stats_cache.bg_agent_tooltip = if agents_path.exists() {
+            let bg_agent_tooltip = if agents_path.exists() {
                 std::fs::read_to_string(&agents_path)
                     .ok()
                     .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(&json).ok())
@@ -4793,7 +4833,8 @@ impl AgentPanel {
                         for agent in agents.iter().take(5) {
                             let id = agent["id"].as_str().unwrap_or("?");
                             let status = agent["status"].as_str().unwrap_or("unknown");
-                            let task: String = agent["task"].as_str().unwrap_or("").chars().take(30).collect();
+                            let task: String =
+                                agent["task"].as_str().unwrap_or("").chars().take(30).collect();
                             tip.push_str(&format!("  {} [{}] {}\n", id, status, task));
                         }
                         if agents.len() > 5 {
@@ -4807,30 +4848,75 @@ impl AgentPanel {
             };
 
             // Security scan tooltip
-            let security_score = self.caduceus_stats_cache.security_score;
-            self.caduceus_stats_cache.security_tooltip = if security_score >= 0.8 {
-                format!("🛡️ Security score: {:.0}% — Good\nRun caduceus_security_scan for details", security_score * 100.0)
+            let security_tooltip = if security_score >= 0.8 {
+                format!(
+                    "🛡️ Security score: {:.0}% — Good\nRun caduceus_security_scan for details",
+                    security_score * 100.0
+                )
             } else if security_score >= 0.5 {
-                format!("🛡️ Security score: {:.0}% — Needs attention\nRun caduceus_security_scan for findings", security_score * 100.0)
+                format!(
+                    "🛡️ Security score: {:.0}% — Needs attention\nRun caduceus_security_scan for findings",
+                    security_score * 100.0
+                )
             } else {
-                format!("🛡️ Security score: {:.0}% — Critical issues\nRun caduceus_security_scan immediately", security_score * 100.0)
+                format!(
+                    "🛡️ Security score: {:.0}% — Critical issues\nRun caduceus_security_scan immediately",
+                    security_score * 100.0
+                )
             };
-        }
 
-        // File locks (in-process, not filesystem)
-        let locked = agent::caduceus_file_lock::list_locked_files();
-        self.caduceus_stats_cache.locked_file_count = locked.len();
-        if locked.is_empty() {
-            self.caduceus_stats_cache.lock_tooltip = "No files locked".to_string();
-        } else {
-            let mut tip = format!("🔒 {} files locked:\n", locked.len());
-            for path in locked.iter().take(5) {
-                tip.push_str(&format!("  {}\n", path.display()));
-            }
-            self.caduceus_stats_cache.lock_tooltip = tip;
-        }
+            Some(CaduceusStatsSnapshot {
+                automation_count,
+                background_agent_count,
+                evolved_skill_count,
+                security_score,
+                project_name,
+                project_repo_count,
+                api_count,
+                health_score,
+                memory_count,
+                memory_entries: entries,
+                memory_tooltip,
+                bg_agent_tooltip,
+                security_tooltip,
+            })
+        });
 
-        self.caduceus_stats_cache.last_refresh = Instant::now();
+        // Merge the snapshot back into the cache on the UI thread once done.
+        self._caduceus_stats_refresh_task = Some(cx.spawn(async move |this, cx| {
+            let snapshot = io_task.await;
+            this.update(cx, |this, cx| {
+                this._caduceus_stats_refresh_task = None;
+                if let Some(snap) = snapshot {
+                    let cache = &mut this.caduceus_stats_cache;
+                    cache.automation_count = snap.automation_count;
+                    cache.background_agent_count = snap.background_agent_count;
+                    cache.evolved_skill_count = snap.evolved_skill_count;
+                    cache.security_score = snap.security_score;
+                    cache.project_name = snap.project_name;
+                    cache.project_repo_count = snap.project_repo_count;
+                    cache.api_count = snap.api_count;
+                    cache.health_score = snap.health_score;
+                    cache.memory_count = snap.memory_count;
+                    cache.memory_entries = snap.memory_entries;
+                    cache.memory_tooltip = snap.memory_tooltip;
+                    cache.bg_agent_tooltip = snap.bg_agent_tooltip;
+                    cache.security_tooltip = snap.security_tooltip;
+                } else {
+                    let cache = &mut this.caduceus_stats_cache;
+                    cache.automation_count = 0;
+                    cache.background_agent_count = 0;
+                    cache.evolved_skill_count = 0;
+                    cache.security_score = 0.0;
+                    cache.project_name = None;
+                    cache.project_repo_count = 0;
+                    cache.api_count = 0;
+                    cache.health_score = None;
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn render_worktree_creation_status(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

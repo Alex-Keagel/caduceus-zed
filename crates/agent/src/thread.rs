@@ -3639,24 +3639,12 @@ impl Thread {
 
         // Inject Caduceus mode prefix into system prompt
         let system_prompt = {
-            let mode = self.caduceus_mode_from_profile();
-            let mode_prefix = match mode {
-                "plan" => "You are in PLAN mode. You CAN write documentation files (.md, .json, .yaml, .txt) \
-— plans, specs, wiki pages, PRDs, architecture docs. \
-You CANNOT modify code files (.rs, .py, .js, .ts, etc.) or run terminal commands.\n\
-Output your plan as a numbered list with this format:\n\
-## Plan\n\
-1. **[Action]** Description (tool: tool_name)\n\
-2. **[Action]** Description (tool: tool_name)\n\
-...\n\
-Write plans to .caduceus/wiki/ or .caduceus/ directory. Use caduceus_project_wiki to update the wiki.\n\n",
-                "act" => "You are in ACT mode. Execute code changes as requested. Each write operation requires user approval before proceeding.\n\n",
-                "research" => "You are in RESEARCH mode. Read-only exploration. Search the codebase, read files, and summarize your findings. Do NOT modify any files.\n\n",
-                "autopilot" => "You are in AUTOPILOT mode. Fully autonomous execution. Plan, implement, test, and commit changes without waiting for approval. Be thorough and verify your changes work before committing.\n\n",
-                "architect" => "You are in ARCHITECT mode. Focus on high-level design. Discuss architecture, dependencies, module boundaries, and system design. You may read files for context but do NOT make code changes.\n\n",
-                "debug" => "You are in DEBUG mode. Investigate errors and trace bugs. Read files, check logs, run diagnostic commands, and propose fixes. Output a step-by-step trace of your investigation.\n\n",
-                "review" => "You are in REVIEW mode. Perform a code review. Read code, identify issues, suggest improvements. Do NOT modify any files. Output a structured findings list.\n\n",
-                _ => "",
+            use caduceus_bridge::orchestrator::BridgeAgentMode;
+            let mode_str = self.caduceus_mode_from_profile();
+            let mode_prefix = if let Some(mode) = BridgeAgentMode::from_str_loose(mode_str) {
+                format!("You are in {} mode. {}\n\n", mode.name().to_uppercase(), mode.description())
+            } else {
+                String::new()
             };
             if mode_prefix.is_empty() {
                 system_prompt
@@ -3702,7 +3690,7 @@ Write plans to .caduceus/wiki/ or .caduceus/ directory. Use caduceus_project_wik
                 }
 
                 // Wiki overview (compact)
-                if let Some(overview) = caduceus_bridge::memory::get(&root, "wiki:project-overview") {
+                if let Some(overview) = caduceus_bridge::memory::get(&root, caduceus_bridge::memory::KEY_PROJECT_OVERVIEW) {
                     let compact: String = overview.chars().take(300).collect();
                     assembler.add_source(ContextSource::MemoryBank(compact));
                 }

@@ -11,6 +11,12 @@ const MAX_VALUE_LEN: usize = 4096;
 /// Maximum number of memory entries per project
 const MAX_ENTRIES: usize = 100;
 
+// Well-known system memory keys (use with store_system)
+pub const KEY_PROJECT_OVERVIEW: &str = "wiki:project-overview";
+pub const KEY_README: &str = "wiki:readme";
+pub const KEY_GIT_BRANCH: &str = "wiki:git-branch";
+pub const KEY_RECENT_COMMITS: &str = "wiki:recent-commits";
+
 /// Sanitize a value: strip control characters, cap length
 fn sanitize_value(value: &str) -> String {
     value

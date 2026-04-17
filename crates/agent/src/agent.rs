@@ -539,21 +539,21 @@ impl NativeAgent {
                     }
 
                     // Write wiki pages
-                    let _ = caduceus_bridge::memory::store_system(&wiki_root, "wiki:project-overview", &structure);
+                    let _ = caduceus_bridge::memory::store_system(&wiki_root, caduceus_bridge::memory::KEY_PROJECT_OVERVIEW, &structure);
                     if !readme.is_empty() {
-                        let _ = caduceus_bridge::memory::store_system(&wiki_root, "wiki:readme", &readme);
+                        let _ = caduceus_bridge::memory::store_system(&wiki_root, caduceus_bridge::memory::KEY_README, &readme);
                     }
 
                     // Git context
                     if let Ok(branch) = engine_clone.git_branch() {
-                        let _ = caduceus_bridge::memory::store_system(&wiki_root, "wiki:git-branch", &branch);
+                        let _ = caduceus_bridge::memory::store_system(&wiki_root, caduceus_bridge::memory::KEY_GIT_BRANCH, &branch);
                     }
                     if let Ok(log) = engine_clone.git_log(10) {
                         let log_text: String = log.iter()
                             .map(|c| format!("{} — {}", crate::tools::truncate_str(&c.sha, 7), c.message))
                             .collect::<Vec<_>>()
                             .join("\n");
-                        let _ = caduceus_bridge::memory::store_system(&wiki_root, "wiki:recent-commits", &log_text);
+                        let _ = caduceus_bridge::memory::store_system(&wiki_root, caduceus_bridge::memory::KEY_RECENT_COMMITS, &log_text);
                     }
 
                     log::info!("[caduceus] Wiki populated for {}", root.display());
