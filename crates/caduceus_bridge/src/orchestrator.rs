@@ -41,6 +41,22 @@ pub use caduceus_orchestrator::{
 pub use caduceus_orchestrator::modes::AgentMode as BridgeAgentMode;
 pub use caduceus_core::ModelId as BridgeModelId;
 
+/// Exact token count using tiktoken (cl100k_base, used by GPT-4/Claude).
+/// Falls back to the heuristic estimate if tokenizer initialization fails.
+pub fn count_tokens_exact(text: &str) -> u32 {
+    use std::sync::OnceLock;
+    static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
+
+    let bpe = BPE.get_or_init(|| {
+        tiktoken_rs::get_bpe_from_model("gpt-4o").ok()
+    });
+
+    match bpe {
+        Some(encoder) => encoder.encode_ordinary(text).len() as u32,
+        None => estimate_tokens(text), // fallback to heuristic
+    }
+}
+
 /// Wrapper around the AgentHarness for the bridge.
 pub struct OrchestratorBridge {
     project_root: PathBuf,

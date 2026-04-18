@@ -195,6 +195,14 @@ actions!(
         ScrollOutputToPreviousMessage,
         /// Scroll the output to the next user message.
         ScrollOutputToNextMessage,
+        /// Caduceus: Compact the conversation context.
+        CaduceusCompact,
+        /// Caduceus: Show the project repo map.
+        CaduceusShowMap,
+        /// Caduceus: Create a checkpoint.
+        CaduceusCheckpoint,
+        /// Caduceus: Emergency stop all agents.
+        CaduceusKillSwitch,
     ]
 );
 

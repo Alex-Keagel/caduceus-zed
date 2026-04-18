@@ -1430,12 +1430,21 @@ impl NativeAgentConnection {
                 }
             }
             "index" => {
-                "📚 To index your project for semantic search:\n\
-                 - Ask: \"Index this project\" or \"Re-index the codebase\"\n\
-                 - The agent will use `caduceus_index` to build the search index\n\
-                 - After indexing, use `/search` or ask code questions\n\
-                 - Indexing is incremental — only changed files are re-processed"
-                    .to_string()
+                if let Some(state) = self.0.read(cx).projects.values().next() {
+                    if state.caduceus_engine.is_some() {
+                        "📚 **Index Status**\n\
+                         - Engine: ✅ active\n\
+                         - Indexing: incremental (only changed files re-processed)\n\
+                         - Storage: `.caduceus/index.json` (persistent across restarts)\n\n\
+                         To re-index: Ask \"Re-index the project\"\n\
+                         To search: `/search <query>` or ask a code question"
+                            .to_string()
+                    } else {
+                        "📚 No engine initialized. Open a project to start indexing.".to_string()
+                    }
+                } else {
+                    "📚 No project open. Open a project first.".to_string()
+                }
             }
             "map" => {
                 // Generate repo map from tree-sitter outline

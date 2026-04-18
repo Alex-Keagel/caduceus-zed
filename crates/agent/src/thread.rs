@@ -1640,26 +1640,26 @@ impl Thread {
         if let Some(cached) = self.cached_token_estimate {
             return cached;
         }
-        use caduceus_bridge::orchestrator::estimate_tokens;
+        use caduceus_bridge::orchestrator::count_tokens_exact as estimate_tokens;
         self.messages.iter().map(|m| match m {
             Message::User(u) => u.content.iter().map(|c| match c {
-                UserMessageContent::Text(t) => estimate_tokens(t),
+                UserMessageContent::Text(t) => caduceus_bridge::orchestrator::count_tokens_exact(t),
                 _ => 10,
             }).sum::<u32>(),
-            Message::Agent(a) => estimate_tokens(&a.to_markdown()),
+            Message::Agent(a) => caduceus_bridge::orchestrator::count_tokens_exact(&a.to_markdown()),
             Message::Resume => 0,
         }).sum()
     }
 
     /// Recompute and cache the token estimate (call after message changes)
     fn refresh_token_cache(&mut self) {
-        use caduceus_bridge::orchestrator::estimate_tokens;
+        use caduceus_bridge::orchestrator::count_tokens_exact as estimate_tokens;
         let total: u32 = self.messages.iter().map(|m| match m {
             Message::User(u) => u.content.iter().map(|c| match c {
-                UserMessageContent::Text(t) => estimate_tokens(t),
+                UserMessageContent::Text(t) => caduceus_bridge::orchestrator::count_tokens_exact(t),
                 _ => 10,
             }).sum::<u32>(),
-            Message::Agent(a) => estimate_tokens(&a.to_markdown()),
+            Message::Agent(a) => caduceus_bridge::orchestrator::count_tokens_exact(&a.to_markdown()),
             Message::Resume => 0,
         }).sum();
         self.cached_token_estimate = Some(total);
@@ -1855,7 +1855,7 @@ impl Thread {
         log::info!(
             "[caduceus] Compacted: {} messages remain, ~{} tokens freed",
             self.messages.len(),
-            total_tokens.saturating_sub(estimate_tokens(&summary))
+            total_tokens.saturating_sub(caduceus_bridge::orchestrator::count_tokens_exact(&summary))
         );
 
         self.compaction_cooldown.record_compaction();
