@@ -35,6 +35,7 @@ pub use caduceus_orchestrator::{
     workers::{TaskDAG, TaskDefinition, TaskStatus, SharedContext, TeamResult, AgentConfig},
     background::{BackgroundAgent, BackgroundStatus},
     headless::{HeadlessConfig, HeadlessResult, OutputFormat as HeadlessOutputFormat},
+    mentions::MentionResolver,
 };
 
 // Re-export types needed by tools.

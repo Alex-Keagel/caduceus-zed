@@ -3750,6 +3750,27 @@ impl Thread {
                     ));
                 }
 
+                // Resolve @mentions from the latest user message
+                if let Some(last_user_text) = self.messages.iter().rev().find_map(|m| {
+                    if let Message::User(u) = m {
+                        Some(u.content.iter().filter_map(|c| {
+                            if let UserMessageContent::Text(t) = c { Some(t.as_str()) } else { None }
+                        }).collect::<Vec<_>>().join(" "))
+                    } else { None }
+                }) {
+                    let resolver = caduceus_bridge::orchestrator::MentionResolver::new(&root);
+                    if let Ok(Some(resolved)) = resolver.resolve(&last_user_text) {
+                        if !resolved.is_empty() {
+                            let truncated: String = resolved.chars().take(2000).collect();
+                            assembler.add_source(ContextSource::FileContext {
+                                path: "@mention".to_string(),
+                                content: truncated,
+                                priority: 2,
+                            });
+                        }
+                    }
+                }
+
                 // Cross-repo context from project.json
                 let config_path = root.join(".caduceus").join("project.json");
                 if config_path.exists() {
