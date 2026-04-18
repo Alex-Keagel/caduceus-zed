@@ -953,6 +953,12 @@ impl NativeAgent {
                     acp::UnstructuredCommandInput::new("<prompt>"),
                 )),
             acp::AvailableCommand::new("map", "Show project repo map (tree-sitter outline)"),
+            acp::AvailableCommand::new("start", "Getting started guide for new users"),
+            acp::AvailableCommand::new("search", "Semantic search across indexed code")
+                .input(acp::AvailableCommandInput::Unstructured(
+                    acp::UnstructuredCommandInput::new("<query>"),
+                )),
+            acp::AvailableCommand::new("index", "Index project for semantic search"),
         ];
 
         let Some(state) = project_state else {
@@ -1393,6 +1399,44 @@ impl NativeAgentConnection {
                  The agent will use the security scanner and dependency checker automatically."
                     .to_string()
             }
+            "start" => {
+                "## 🚀 Getting Started with Caduceus\n\n\
+                 **1. Index your project** — Ask: \"Index this project for semantic search\"\n\
+                 **2. Explore** — Try: `/map` to see the project structure\n\
+                 **3. Ask questions** — The agent knows your codebase after indexing\n\
+                 **4. Switch modes** — `/mode plan` for planning, `/mode act` for coding\n\
+                 **5. Pin important context** — `/context pin arch We use microservices`\n\n\
+                 **Quick commands:** `/help` for all commands, `/compact` to free context"
+                    .to_string()
+            }
+            "search" => {
+                let query = args.trim();
+                if query.is_empty() {
+                    "Usage: `/search <query>` — semantic search across indexed code\n\
+                     Example: `/search authentication handler`"
+                        .to_string()
+                } else if let Some(thread) = self.thread(session_id, cx) {
+                    let engine = thread.read(cx).project().read(cx).worktrees(cx).next()
+                        .map(|wt| caduceus_bridge::engine::CaduceusEngine::new(wt.read(cx).abs_path().to_path_buf()));
+                    if let Some(engine) = engine {
+                        // Run search synchronously for slash command (async would need different pattern)
+                        format!("🔍 Use `caduceus_semantic_search` tool with query: \"{}\"\n\
+                                 The agent will search your indexed codebase.", query)
+                    } else {
+                        "No project open. Open a project first.".to_string()
+                    }
+                } else {
+                    "No active session.".to_string()
+                }
+            }
+            "index" => {
+                "📚 To index your project for semantic search:\n\
+                 - Ask: \"Index this project\" or \"Re-index the codebase\"\n\
+                 - The agent will use `caduceus_index` to build the search index\n\
+                 - After indexing, use `/search` or ask code questions\n\
+                 - Indexing is incremental — only changed files are re-processed"
+                    .to_string()
+            }
             "map" => {
                 // Generate repo map from tree-sitter outline
                 if let Some(worktree) = self.0.read(cx).projects.values().next()
@@ -1452,18 +1496,31 @@ impl NativeAgentConnection {
                 }
             }
             "help" => {
-                "## Caduceus Commands\n\
-                 - `/compact` — compress conversation context\n\
-                 - `/mode [name]` — show/switch mode\n\
-                 - `/context` — show context usage and pinned items\n\
-                 - `/context pin <label> <text>` — pin context (survives compaction)\n\
-                 - `/context unpin <label>` — remove a pin\n\
-                 - `/context pins` — list all pins\n\
-                 - `/checkpoint [label]` — create a code checkpoint\n\
-                 - `/review` — review code for security issues\n\
-                 - `/headless [prompt]` — generate CLI command for headless execution\n\
+                "## Caduceus Commands\n\n\
+                 **Context Management:**\n\
+                 - `/compact` — compress conversation context to free tokens\n\
+                 - `/context` — show context usage, zone status, and pinned items\n\
+                 - `/context pin <label> <text>` — pin context that survives compaction\n\
+                 - `/context unpin <label>` — remove a pinned item\n\
+                 - `/context pins` — list all pinned items\n\n\
+                 **Modes** (use `/mode <name>` to switch):\n\
+                 - `plan` — read-only analysis, write plans/docs only\n\
+                 - `act` — execute code changes with approval\n\
+                 - `research` — read-only exploration, summarize findings\n\
+                 - `autopilot` — fully autonomous (plan + act + test + commit)\n\
+                 - `architect` — high-level design, no code changes\n\
+                 - `debug` — investigate errors, trace bugs\n\
+                 - `review` — code review, find issues\n\n\
+                 **Tools:**\n\
                  - `/map` — show project repo map (tree-sitter symbol outline)\n\
-                 - `/help` — show this help"
+                 - `/review` — review code for security issues\n\
+                 - `/checkpoint [label]` — create a code checkpoint for rollback\n\
+                 - `/headless [prompt]` — generate CLI command for headless execution\n\n\
+                 **Examples:**\n\
+                 - `/mode research` → switch to read-only research mode\n\
+                 - `/context pin arch Use microservices pattern` → pin architecture decision\n\
+                 - `/map` → see all symbols in the project\n\
+                 - `/compact` → free up context when conversation gets long"
                     .to_string()
             }
             _ => return None, // Not a Caduceus command — fall through

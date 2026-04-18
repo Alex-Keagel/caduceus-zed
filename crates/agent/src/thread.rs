@@ -3726,15 +3726,29 @@ impl Thread {
                 }
             }
 
-            // Tool guidance (compact)
+            // Tool guidance — structured guide for the LLM
             assembler.add_source(ContextSource::SystemPrompt(
-                "Caduceus tools available: semantic_search, wiki, tree_sitter, code_graph, \
-                git_read/write, kanban, checkpoint, security_scan, memory, prd, cross_search, \
-                cross_git, api_registry, architect, product. \
-                Mode escalation: use caduceus_mode_request. \
-                PERMISSION DENIED = don't retry, ask user. \
-                Before spawning sub-agents: explain plan, wait for approval. \
-                Use edit_file/save_file for writing files, NOT terminal cat/heredoc.".to_string()
+                "## Caduceus Tool Guide\n\
+                \n\
+                **Search & Understand**: caduceus_semantic_search (find code by meaning), caduceus_code_graph (dependencies), \
+                caduceus_tree_sitter (AST outline of a file), caduceus_cross_search (search across repos)\n\
+                **Read Code**: caduceus_git_read (git status/log/diff), caduceus_dependency_scan (vulnerabilities)\n\
+                **Plan & Track**: caduceus_prd (parse requirements), caduceus_task_decompose (break into parallel subtasks), \
+                caduceus_task_tree (hierarchical tasks), caduceus_kanban (board with worktree isolation)\n\
+                **Write & Edit**: Use edit_file/save_file for code. caduceus_wiki (project wiki), \
+                caduceus_project_wiki (cross-repo wiki with auto-populate), caduceus_checkpoint (save/restore snapshots)\n\
+                **Memory**: caduceus_memory_read (recall facts), caduceus_memory_write (store facts). \
+                NOT caduceus_storage (that's for structured task persistence).\n\
+                **Security**: caduceus_security_scan (SAST), caduceus_mcp_security (MCP tool vetting), caduceus_policy (compliance)\n\
+                **Project**: caduceus_project (multi-repo config), caduceus_api_registry (API catalog), \
+                caduceus_architect (health score), caduceus_product (feature tracking)\n\
+                **Meta**: caduceus_mode_request (switch modes), caduceus_progress (velocity), \
+                caduceus_telemetry (token usage), caduceus_time_tracking (session time)\n\
+                \n\
+                Rules: PERMISSION DENIED = don't retry, ask user to switch mode. \
+                LOOP DETECTED = try a different approach. \
+                Use edit_file for code changes, NOT terminal heredocs.\n\
+                Before spawning sub-agents: explain plan, wait for approval.".to_string()
             ));
 
             let assembled = assembler.assemble();

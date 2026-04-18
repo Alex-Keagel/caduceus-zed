@@ -2638,6 +2638,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tree-sitter",
+ "tree-sitter-c",
  "tree-sitter-go",
  "tree-sitter-python",
  "tree-sitter-rust",

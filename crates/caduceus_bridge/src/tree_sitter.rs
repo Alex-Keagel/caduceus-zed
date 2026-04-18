@@ -96,6 +96,7 @@ fn detect_language(path: &str) -> String {
         "ts" | "tsx" => "typescript",
         "js" | "jsx" | "mjs" | "cjs" => "javascript",
         "go" => "go",
+        "c" | "h" => "c",
         _ => "unknown",
     }
     .to_string()
@@ -105,8 +106,10 @@ fn get_parser(language: &str) -> Option<tree_sitter::Parser> {
     let ts_language = match language {
         "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
         "python" => Some(tree_sitter_python::LANGUAGE.into()),
-        "typescript" | "javascript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "javascript" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
+        "c" => Some(tree_sitter_c::LANGUAGE.into()),
         _ => None,
     }?;
 
@@ -200,6 +203,7 @@ fn classify_node(
         "python" => classify_python_node(kind, node, content),
         "typescript" | "javascript" => classify_ts_node(kind, node, content),
         "go" => classify_go_node(kind, node, content),
+        "c" => classify_c_node(kind, node, content),
         _ => None,
     }
 }
@@ -344,6 +348,39 @@ fn classify_go_node(kind: &str, node: tree_sitter::Node, content: &str) -> Optio
             let text = node.utf8_text(content.as_bytes()).ok()?;
             let short: String = text.chars().take(60).collect();
             Some((SymbolType::Import, short))
+        }
+        _ => None,
+    }
+}
+
+// ── C ───────────────────────────────────────────────────────────────────────
+
+fn classify_c_node(kind: &str, node: tree_sitter::Node, content: &str) -> Option<(SymbolType, String)> {
+    match kind {
+        "function_definition" => {
+            let declarator = node.child_by_field_name("declarator")?;
+            let name = get_child_text(declarator, "declarator", content)
+                .or_else(|| declarator.utf8_text(content.as_bytes()).ok())?;
+            // Strip parameter list from name
+            let clean: String = name.chars().take_while(|c| *c != '(').collect();
+            Some((SymbolType::Function, clean.trim().to_string()))
+        }
+        "struct_specifier" => {
+            let name = get_child_text(node, "name", content)?;
+            Some((SymbolType::Struct, name.to_string()))
+        }
+        "enum_specifier" => {
+            let name = get_child_text(node, "name", content)?;
+            Some((SymbolType::Enum, name.to_string()))
+        }
+        "type_definition" => {
+            let text = node.utf8_text(content.as_bytes()).ok()?;
+            let short: String = text.chars().take(60).collect();
+            Some((SymbolType::Other, short))
+        }
+        "preproc_include" => {
+            let text = node.utf8_text(content.as_bytes()).ok()?;
+            Some((SymbolType::Import, text.trim().to_string()))
         }
         _ => None,
     }
