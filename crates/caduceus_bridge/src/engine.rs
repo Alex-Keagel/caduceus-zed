@@ -22,7 +22,7 @@ pub struct CaduceusEngine {
     /// Semantic code search index.
     pub search_index: Arc<RwLock<SemanticIndex>>,
     /// Code property graph for dependency analysis.
-    pub code_graph: CodePropertyGraph,
+    pub code_graph: std::sync::RwLock<CodePropertyGraph>,
     /// SAST security scanner.
     pub security_scanner: SastScanner,
     /// Secret scanner.
@@ -85,7 +85,7 @@ impl CaduceusEngine {
         }
 
         let search_index = Arc::new(RwLock::new(index));
-        let code_graph = CodePropertyGraph::new();
+        let code_graph = std::sync::RwLock::new(CodePropertyGraph::new());
         let security_scanner = SastScanner::new();
         let secret_scanner = SecretScanner::new();
         let federated_index = FederatedIndex::new();
@@ -218,6 +218,13 @@ impl CaduceusEngine {
             log::warn!("[caduceus] Failed to persist index: {e}");
         }
 
+        // Auto-populate code property graph from indexed chunks
+        let chunks: Vec<_> = index.chunks().into_iter().cloned().collect();
+        drop(index); // release write lock
+        self.code_graph.write().unwrap().build_from_chunks(&chunks);
+        log::info!("[caduceus] Code graph: {} nodes, {} edges",
+            self.code_graph.read().unwrap().stats().node_count, self.code_graph.read().unwrap().stats().edge_count);
+
         Ok(count)
     }
 
@@ -249,7 +256,7 @@ impl CaduceusEngine {
 
     /// Find code that depends on a symbol.
     pub fn code_neighbors(&self, node_id: &str) -> Vec<crate::search::GraphNodeInfo> {
-        self.code_graph
+        self.code_graph.read().unwrap()
             .neighbors(node_id)
             .iter()
             .map(|n| crate::search::GraphNodeInfo {
@@ -263,7 +270,7 @@ impl CaduceusEngine {
 
     /// Impact analysis — what would be affected by changing a symbol.
     pub fn code_affected_by(&self, node_id: &str) -> Vec<crate::search::GraphNodeInfo> {
-        self.code_graph
+        self.code_graph.read().unwrap()
             .affected_by(node_id)
             .iter()
             .map(|n| crate::search::GraphNodeInfo {
@@ -277,7 +284,7 @@ impl CaduceusEngine {
 
     /// Extract a subgraph for a specific node.
     pub fn code_subgraph(&self, node_id: &str) -> Vec<crate::search::GraphNodeInfo> {
-        let sub = self.code_graph.subgraph(&[node_id]);
+        let sub = self.code_graph.read().unwrap().subgraph(&[node_id]);
         sub.nodes
             .iter()
             .map(|n| crate::search::GraphNodeInfo {
@@ -680,12 +687,12 @@ impl CaduceusEngine {
 
     /// Export the code property graph as Cytoscape-compatible JSON.
     pub fn to_cytoscape_json(&self) -> serde_json::Value {
-        self.code_graph.to_cytoscape_json()
+        self.code_graph.read().unwrap().to_cytoscape_json()
     }
 
     /// Graph statistics: node count, edge count, connected components.
     pub fn stats(&self) -> crate::search::GraphStatsInfo {
-        let s = self.code_graph.stats();
+        let s = self.code_graph.read().unwrap().stats();
         crate::search::GraphStatsInfo {
             node_count: s.node_count,
             edge_count: s.edge_count,

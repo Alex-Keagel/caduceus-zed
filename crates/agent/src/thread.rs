@@ -3352,6 +3352,9 @@ impl Thread {
         if self.is_subagent() || self.messages.len() < 2 {
             return;
         }
+
+        // Update living spec / active context
+        self.update_active_context(cx);
         let last_user = self.messages.iter().rev().find_map(|m| {
             if let Message::User(u) = m {
                 Some(u.content.iter().filter_map(|c| {
@@ -3393,6 +3396,50 @@ impl Thread {
                     })
                     .detach();
             }
+        }
+    }
+
+    /// Update the living active context file (.caduceus/activeContext.md)
+    /// Ephemeral session state — tracks current goal, decisions, modified files.
+    fn update_active_context(&self, cx: &Context<Self>) {
+        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
+            let root = worktree.read(cx).abs_path().to_path_buf();
+            let mode = self.caduceus_mode_from_profile().to_string();
+            let msg_count = self.messages.len();
+
+            // Extract last user message as "current goal"
+            let goal = self.messages.iter().rev().find_map(|m| {
+                if let Message::User(u) = m {
+                    Some(u.content.iter().filter_map(|c| {
+                        if let UserMessageContent::Text(t) = c { Some(t.as_str()) } else { None }
+                    }).collect::<Vec<_>>().join(" "))
+                } else { None }
+            }).unwrap_or_default();
+            let goal_short: String = goal.chars().take(200).collect();
+
+            // Count tool calls as "decisions made"
+            let tool_count: usize = self.messages.iter().filter_map(|m| {
+                if let Message::Agent(a) = m {
+                    Some(a.content.iter().filter(|c| matches!(c, AgentMessageContent::ToolUse(_))).count())
+                } else { None }
+            }).sum();
+
+            cx.background_executor()
+                .spawn(async move {
+                    let ctx_dir = root.join(".caduceus");
+                    let _ = std::fs::create_dir_all(&ctx_dir);
+                    let content = format!(
+                        "# Active Context\n\n\
+                         **Mode**: {}\n\
+                         **Messages**: {}\n\
+                         **Tool calls**: {}\n\n\
+                         ## Current Goal\n{}\n\n\
+                         *Auto-generated — do not commit*\n",
+                        mode, msg_count, tool_count, goal_short
+                    );
+                    let _ = std::fs::write(ctx_dir.join("activeContext.md"), content);
+                })
+                .detach();
         }
     }
 
