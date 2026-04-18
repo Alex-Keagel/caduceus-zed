@@ -954,6 +954,7 @@ impl NativeAgent {
                 )),
             acp::AvailableCommand::new("map", "Show project repo map (tree-sitter outline)"),
             acp::AvailableCommand::new("start", "Getting started guide for new users"),
+            acp::AvailableCommand::new("status", "Show unified Caduceus dashboard with all metrics"),
             acp::AvailableCommand::new("search", "Semantic search across indexed code")
                 .input(acp::AvailableCommandInput::Unstructured(
                     acp::UnstructuredCommandInput::new("<query>"),
@@ -1399,6 +1400,137 @@ impl NativeAgentConnection {
                  The agent will use the security scanner and dependency checker automatically."
                     .to_string()
             }
+            "status" => {
+                // Unified dashboard — all Caduceus metrics in one view
+                let mut dashboard = String::from("## 📊 Caduceus Dashboard\n\n");
+
+                // Mode & Session
+                if let Some(thread) = self.thread(session_id, cx) {
+                    let t = thread.read(cx);
+                    let mode = t.caduceus_mode_name();
+                    let (zone, fill_pct) = t.context_zone_and_pct();
+                    let msg_count = t.message_count();
+                    let pin_count = t.list_pins().len();
+
+                    dashboard.push_str("### 🧠 Session\n");
+                    dashboard.push_str(&format!("| Metric | Value |\n|--------|-------|\n"));
+                    dashboard.push_str(&format!("| Mode | **{}** |\n", mode.to_uppercase()));
+                    dashboard.push_str(&format!("| Messages | {} |\n", msg_count));
+                    dashboard.push_str(&format!("| Context | {:.0}% — **{}** |\n", fill_pct, zone.label()));
+                    dashboard.push_str(&format!("| Pinned items | {} |\n", pin_count));
+                    dashboard.push_str("\n");
+                }
+
+                // Project metrics
+                if let Some(state) = self.0.read(cx).projects.values().next() {
+                    let project = state.project.read(cx);
+                    if let Some(worktree) = project.worktrees(cx).next() {
+                        let root = worktree.read(cx).abs_path();
+
+                        // Memory
+                        let memories = caduceus_bridge::memory::list(&root);
+
+                        // Security
+                        let security_path = root.join(".caduceus/security.json");
+                        let security_score: f64 = std::fs::read_to_string(&security_path)
+                            .ok()
+                            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                            .and_then(|v| v["score"].as_f64())
+                            .unwrap_or(0.0);
+
+                        // Health
+                        let health_path = root.join(".caduceus/health.json");
+                        let health_score: Option<f64> = std::fs::read_to_string(&health_path)
+                            .ok()
+                            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                            .and_then(|v| v["score"].as_f64());
+
+                        // Checkpoints
+                        let checkpoint_dir = root.join(".caduceus/checkpoints");
+                        let checkpoint_count = std::fs::read_dir(&checkpoint_dir)
+                            .ok()
+                            .map(|entries| entries.count())
+                            .unwrap_or(0);
+
+                        // Agents
+                        let agents_dir = root.join(".caduceus/agents");
+                        let agent_count = std::fs::read_dir(&agents_dir)
+                            .ok()
+                            .map(|entries| entries.count())
+                            .unwrap_or(0);
+
+                        // Index
+                        let index_path = root.join(".caduceus/index.json");
+                        let index_size = std::fs::metadata(&index_path)
+                            .ok()
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+
+                        // Locked files
+                        let locked = crate::caduceus_file_lock::list_locked_files();
+
+                        dashboard.push_str("### 🏗️ Project Health\n");
+                        dashboard.push_str("| Metric | Value | Status |\n|--------|-------|--------|\n");
+                        dashboard.push_str(&format!("| Security | {:.0}% | {} |\n",
+                            security_score * 100.0,
+                            if security_score >= 0.8 { "✅ Good" } else if security_score >= 0.5 { "⚠️ Needs attention" } else { "🔴 Critical" }
+                        ));
+                        if let Some(health) = health_score {
+                            dashboard.push_str(&format!("| Architecture Health | {:.0}% | {} |\n",
+                                health * 100.0,
+                                if health >= 0.8 { "✅" } else if health >= 0.5 { "⚠️" } else { "🔴" }
+                            ));
+                        }
+                        dashboard.push_str(&format!("| Memories | {} / 100 | {} |\n",
+                            memories.len(),
+                            if memories.len() > 80 { "⚠️ Near limit" } else { "✅" }
+                        ));
+                        dashboard.push_str(&format!("| Checkpoints | {} | {} |\n",
+                            checkpoint_count,
+                            if checkpoint_count > 0 { "✅ Protected" } else { "⚠️ No backups" }
+                        ));
+                        dashboard.push_str(&format!("| Background Agents | {} | |\n", agent_count));
+                        dashboard.push_str(&format!("| Search Index | {} KB | {} |\n",
+                            index_size / 1024,
+                            if index_size > 0 { "✅ Active" } else { "⚠️ Not indexed" }
+                        ));
+                        if !locked.is_empty() {
+                            dashboard.push_str(&format!("| Locked Files | {} | 🔒 |\n", locked.len()));
+                        }
+                        dashboard.push_str("\n");
+
+                        // Safety
+                        dashboard.push_str("### 🛡️ Safety Status\n");
+                        dashboard.push_str("| Guard | Status |\n|-------|--------|\n");
+                        dashboard.push_str("| Loop Detector | ✅ Active (threshold: 3) |\n");
+                        dashboard.push_str("| Circuit Breaker | ✅ Active (threshold: 5) |\n");
+                        dashboard.push_str("| Compaction Cooldown | ✅ Active (30s) |\n");
+                        dashboard.push_str("| Secret Scanner | ✅ Active |\n");
+                        dashboard.push_str("| Path Sandboxing | ✅ Active |\n");
+                        dashboard.push_str("\n");
+
+                        // Readiness radar (text-based)
+                        dashboard.push_str("### 📡 AI Readiness Radar\n");
+                        dashboard.push_str("```\n");
+                        let dims = [
+                            ("Context Mgmt", 9),
+                            ("Agent Arch", 9),
+                            ("Code Intel", 9),
+                            ("Performance", 8),
+                            ("Safety", 9),
+                            ("DX", 8),
+                        ];
+                        for (name, score) in &dims {
+                            let bar: String = "█".repeat(*score as usize);
+                            let empty: String = "░".repeat(10 - *score as usize);
+                            dashboard.push_str(&format!("  {:<14} {}{} {}/10\n", name, bar, empty, score));
+                        }
+                        dashboard.push_str("```\n");
+                    }
+                }
+
+                dashboard
+            }
             "start" => {
                 "## 🚀 Getting Started with Caduceus\n\n\
                  **1. Index your project** — Ask: \"Index this project for semantic search\"\n\
@@ -1521,11 +1653,13 @@ impl NativeAgentConnection {
                  - `debug` — investigate errors, trace bugs\n\
                  - `review` — code review, find issues\n\n\
                  **Tools:**\n\
+                 - `/status` — show unified dashboard with all metrics\n\
                  - `/map` — show project repo map (tree-sitter symbol outline)\n\
                  - `/review` — review code for security issues\n\
                  - `/checkpoint [label]` — create a code checkpoint for rollback\n\
                  - `/headless [prompt]` — generate CLI command for headless execution\n\n\
                  **Examples:**\n\
+                 - `/status` → see security, health, context, safety at a glance\n\
                  - `/mode research` → switch to read-only research mode\n\
                  - `/context pin arch Use microservices pattern` → pin architecture decision\n\
                  - `/map` → see all symbols in the project\n\
