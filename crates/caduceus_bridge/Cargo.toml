@@ -34,5 +34,9 @@ tree-sitter-go.workspace = true
 tree-sitter-c.workspace = true
 tiktoken-rs.workspace = true
 
+[features]
+default = []
+local-embeddings = ["caduceus-omniscience/local-embeddings"]
+
 [dev-dependencies]
 tempfile = "3"

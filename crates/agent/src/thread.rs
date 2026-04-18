@@ -3748,6 +3748,8 @@ impl Thread {
                 Rules: PERMISSION DENIED = don't retry, ask user to switch mode. \
                 LOOP DETECTED = try a different approach. \
                 Use edit_file for code changes, NOT terminal heredocs.\n\
+                **Verify-after-edit**: After making code changes, ALWAYS run `diagnostics` to check for errors. \
+                If errors are found, fix them before moving on. This is the verify step.\n\
                 Before spawning sub-agents: explain plan, wait for approval.".to_string()
             ));
 

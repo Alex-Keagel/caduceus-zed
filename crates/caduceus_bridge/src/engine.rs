@@ -5,7 +5,7 @@
 
 use caduceus_core::{ToolResult, ToolSpec};
 use caduceus_omniscience::{
-    AstOverlay, CodePropertyGraph, DummyEmbedder, EmbeddingBackend, EmbeddingModelConfig,
+    AstOverlay, CodePropertyGraph, CodeHashEmbedder, DummyEmbedder, EmbeddingBackend, EmbeddingModelConfig,
     EmbeddingSelector, FederatedIndex, OpenAiEmbedder, ParseErrorDownRanker, ProjectIndex,
     ScoredChunk, SemanticIndex, VectorSpaceMap,
 };
@@ -53,8 +53,25 @@ impl CaduceusEngine {
             log::info!("[caduceus] Using OpenAI embeddings");
             Box::new(OpenAiEmbedder::new(api_key))
         } else {
-            log::info!("[caduceus] Using dummy embeddings (set CADUCEUS_EMBEDDING_API_KEY for real semantic search)");
-            Box::new(DummyEmbedder::new(384))
+            // Try local code embedding model via fastembed (ONNX)
+            #[cfg(feature = "local-embeddings")]
+            {
+                match caduceus_omniscience::FastEmbedBackend::new_code() {
+                    Ok(backend) => {
+                        log::info!("[caduceus] Using local Jina Code embeddings (768-dim, ONNX)");
+                        Box::new(backend) as Box<dyn EmbeddingBackend>
+                    }
+                    Err(e) => {
+                        log::warn!("[caduceus] FastEmbed failed: {e} — falling back to code-hash embedder");
+                        Box::new(CodeHashEmbedder::new(384))
+                    }
+                }
+            }
+            #[cfg(not(feature = "local-embeddings"))]
+            {
+                log::info!("[caduceus] Using code-hash local embeddings (set CADUCEUS_EMBEDDING_API_KEY for OpenAI)");
+                Box::new(CodeHashEmbedder::new(384))
+            }
         };
         let mut index = SemanticIndex::new(embedder)
             .with_chunker(crate::tree_sitter::TreeSitterChunker::new());
