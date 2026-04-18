@@ -3818,6 +3818,8 @@ impl Thread {
                 Use edit_file for code changes, NOT terminal heredocs.\n\
                 **Verify-after-edit**: After making code changes, ALWAYS run `diagnostics` to check for errors. \
                 If errors are found, fix them before moving on. This is the verify step.\n\
+                **Show-before-apply**: For large changes (>20 lines), show a brief summary of what you'll change \
+                before applying edits. List files and the type of change (add/modify/delete).\n\
                 Before spawning sub-agents: explain plan, wait for approval.".to_string()
             ));
 
