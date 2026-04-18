@@ -73,6 +73,29 @@ pub(crate) fn truncate_str(s: &str, max_chars: usize) -> &str {
     }
 }
 
+/// Macro to generate the common Text/Error tool output enum + From impl.
+/// Usage: `caduceus_tool_output!(CaduceusMyToolOutput);`
+#[macro_export]
+macro_rules! caduceus_tool_output {
+    ($name:ident) => {
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        #[serde(untagged)]
+        pub enum $name {
+            Text { text: String },
+            Error { error: String },
+        }
+
+        impl From<$name> for language_model::LanguageModelToolResultContent {
+            fn from(output: $name) -> Self {
+                match output {
+                    $name::Text { text } => text.into(),
+                    $name::Error { error } => format!("Error: {error}").into(),
+                }
+            }
+        }
+    };
+}
+
 /// Check if a file path refers to a sensitive/secret file that should not
 /// be sent to the LLM. Blocks .env files, key files, credential stores, etc.
 pub(crate) fn is_sensitive_file(path: &str) -> bool {
