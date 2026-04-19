@@ -24,6 +24,13 @@ pub struct CaduceusEngine {
     /// findings #5/#6/#7 from the bug-pattern audit).
     pub search_index: Arc<SemanticIndex>,
     /// Code property graph for dependency analysis.
+    ///
+    /// Audit finding round-2 (#17): readers/writers used `.unwrap()` which
+    /// panics on poison. We now go through `code_graph_read`/`code_graph_write`
+    /// helpers that recover the inner guard from a poisoned lock — safe here
+    /// because graph rebuilds are idempotent and a panicked writer leaves
+    /// either the previous full graph (no mutation reached) or a partial
+    /// graph that the next index_directory call will overwrite anyway.
     pub code_graph: std::sync::RwLock<CodePropertyGraph>,
     /// SAST security scanner.
     pub security_scanner: SastScanner,
@@ -258,7 +265,7 @@ impl CaduceusEngine {
         // Phase 3: rebuild the code property graph from the snapshot — no
         // search-index lock held, so search remains fully responsive.
         {
-            let mut graph = self.code_graph.write().unwrap();
+            let mut graph = self.code_graph_write();
             graph.build_from_chunks(&chunks);
             let stats = graph.stats();
             log::info!(
@@ -323,9 +330,28 @@ impl CaduceusEngine {
 
     // ── Code Graph ────────────────────────────────────────────────────────
 
+    /// Acquire a poison-tolerant read guard on `code_graph`.
+    /// See field doc on `code_graph` (audit #17): a panicked writer is recoverable.
+    fn code_graph_read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, CodePropertyGraph> {
+        self.code_graph
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Acquire a poison-tolerant write guard on `code_graph`. See `code_graph_read`.
+    fn code_graph_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, CodePropertyGraph> {
+        self.code_graph
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Find code that depends on a symbol.
     pub fn code_neighbors(&self, node_id: &str) -> Vec<crate::search::GraphNodeInfo> {
-        self.code_graph.read().unwrap()
+        self.code_graph_read()
             .neighbors(node_id)
             .iter()
             .map(|n| crate::search::GraphNodeInfo {
@@ -339,7 +365,7 @@ impl CaduceusEngine {
 
     /// Impact analysis — what would be affected by changing a symbol.
     pub fn code_affected_by(&self, node_id: &str) -> Vec<crate::search::GraphNodeInfo> {
-        self.code_graph.read().unwrap()
+        self.code_graph_read()
             .affected_by(node_id)
             .iter()
             .map(|n| crate::search::GraphNodeInfo {
@@ -353,7 +379,7 @@ impl CaduceusEngine {
 
     /// Extract a subgraph for a specific node.
     pub fn code_subgraph(&self, node_id: &str) -> Vec<crate::search::GraphNodeInfo> {
-        let sub = self.code_graph.read().unwrap().subgraph(&[node_id]);
+        let sub = self.code_graph_read().subgraph(&[node_id]);
         sub.nodes
             .iter()
             .map(|n| crate::search::GraphNodeInfo {
@@ -761,12 +787,12 @@ impl CaduceusEngine {
 
     /// Export the code property graph as Cytoscape-compatible JSON.
     pub fn to_cytoscape_json(&self) -> serde_json::Value {
-        self.code_graph.read().unwrap().to_cytoscape_json()
+        self.code_graph_read().to_cytoscape_json()
     }
 
     /// Graph statistics: node count, edge count, connected components.
     pub fn stats(&self) -> crate::search::GraphStatsInfo {
-        let s = self.code_graph.read().unwrap().stats();
+        let s = self.code_graph_read().stats();
         crate::search::GraphStatsInfo {
             node_count: s.node_count,
             edge_count: s.edge_count,
