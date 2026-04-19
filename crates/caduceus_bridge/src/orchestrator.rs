@@ -136,8 +136,60 @@ impl OrchestratorBridge {
 
     // NOTE: semantic_match_score is private in caduceus-orchestrator::instructions — skipped.
 
-    /// Build a full agent harness with tools and instructions.
+    /// Default set of tools that require human-in-the-loop approval before
+    /// execution. These are the tools whose effects are observable outside the
+    /// process (filesystem mutations, shell execution, network writes) and so
+    /// must not run silently. Override per-call via [`build_harness_with_approval`].
+    pub const DEFAULT_APPROVAL_TOOLS: &'static [&'static str] = &[
+        "bash",
+        "shell",
+        "write_file",
+        "edit_file",
+        "delete_file",
+        "create_file",
+        "apply_patch",
+    ];
+
+    /// Build a full agent harness with tools, instructions, and HITL approval
+    /// wired for the [`DEFAULT_APPROVAL_TOOLS`] set.
+    ///
+    /// Returns `(harness, approval_tx)`. Callers **must** route `approval_tx`
+    /// to the IDE permission-prompt UI: when the user approves or denies a
+    /// `PermissionRequest` event, send `(format!("perm_{tool_use_id}"), approved)`
+    /// on this channel. Dropping the sender without responding fails-fast as
+    /// `PermissionOutcome::ChannelClosed` rather than the 300s timeout.
+    ///
+    /// This is the production entry point — it must be used in place of
+    /// [`build_harness_no_approval`] for any flow that touches user data.
     pub fn build_harness(
+        &self,
+        provider: Arc<dyn LlmAdapter>,
+        tools: ToolRegistry,
+        system_prompt: &str,
+    ) -> (AgentHarness, tokio::sync::mpsc::Sender<(String, bool)>) {
+        self.build_harness_with_approval(provider, tools, system_prompt, Self::DEFAULT_APPROVAL_TOOLS)
+    }
+
+    /// Build a harness with a caller-supplied approval set. Pass an empty
+    /// slice for an autopilot harness (escape hatch for tests / headless
+    /// agents); prefer [`build_harness`] in production.
+    pub fn build_harness_with_approval<S: AsRef<str>>(
+        &self,
+        provider: Arc<dyn LlmAdapter>,
+        tools: ToolRegistry,
+        system_prompt: &str,
+        approval_tools: &[S],
+    ) -> (AgentHarness, tokio::sync::mpsc::Sender<(String, bool)>) {
+        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
+            .with_tool_timeout(std::time::Duration::from_secs(120))
+            .with_instructions(&self.project_root);
+        base.with_approval_flow(approval_tools.iter().map(|s| s.as_ref().to_string()))
+    }
+
+    /// Build a harness with HITL approval disabled. Reserved for non-interactive
+    /// surfaces (headless mode, scripted tests). Production UI flows must use
+    /// [`build_harness`].
+    pub fn build_harness_no_approval(
         &self,
         provider: Arc<dyn LlmAdapter>,
         tools: ToolRegistry,
@@ -374,6 +426,44 @@ mod tests {
             "4.",
         );
         assert!(memories.is_empty(), "No preference signal");
+    }
+
+    #[test]
+    fn default_approval_tools_covers_destructive_set() {
+        let set: std::collections::HashSet<_> =
+            OrchestratorBridge::DEFAULT_APPROVAL_TOOLS.iter().copied().collect();
+        // Regression guard: removing any of these silently disables HITL for
+        // a tool that mutates user state. If you intentionally drop one,
+        // delete the assertion together with the constant entry.
+        for required in ["bash", "shell", "write_file", "edit_file", "delete_file", "apply_patch"] {
+            assert!(set.contains(required), "DEFAULT_APPROVAL_TOOLS missing {required}");
+        }
+    }
+
+    #[test]
+    fn build_harness_wires_approval_channel() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools = ToolRegistry::new();
+        let (_harness, approval_tx) = bridge.build_harness(provider, tools, "test");
+        // The bridge MUST hand the sender back; if this regresses to returning
+        // just `AgentHarness`, every PermissionRequest will hang for 300s.
+        assert!(!approval_tx.is_closed(), "approval channel should be live");
+    }
+
+    #[test]
+    fn build_harness_with_approval_empty_set_is_autopilot() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools = ToolRegistry::new();
+        // Empty slice = caller explicitly opts out (e.g. headless mode).
+        // Channel still exists but no tool will ever block on it.
+        let (_h, tx) = bridge.build_harness_with_approval::<&str>(provider, tools, "test", &[]);
+        assert!(!tx.is_closed());
     }
 
     #[test]
