@@ -5,7 +5,7 @@
 
 use caduceus_core::{ToolResult, ToolSpec};
 use caduceus_omniscience::{
-    AstOverlay, CodePropertyGraph, CodeHashEmbedder, DummyEmbedder, EmbeddingBackend, EmbeddingModelConfig,
+    AstOverlay, CodePropertyGraph, CodeHashEmbedder, EmbeddingBackend, EmbeddingModelConfig,
     EmbeddingSelector, FederatedIndex, OpenAiEmbedder, ParseErrorDownRanker, ProjectIndex,
     ScoredChunk, SemanticIndex, VectorSpaceMap,
 };
@@ -13,14 +13,16 @@ use caduceus_permissions::SecretScanner;
 use caduceus_tools::{SastScanner, ToolRegistry};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// The main Caduceus engine instance.
 pub struct CaduceusEngine {
     /// Tool registry with all 38+ agent tools.
     pub tools: ToolRegistry,
-    /// Semantic code search index.
-    pub search_index: Arc<RwLock<SemanticIndex>>,
+    /// Semantic code search index. Internally synchronized — no outer lock
+    /// needed; embed/search/index methods take `&self` and never hold any
+    /// internal lock across `.await` (fix for engine.rs lock-starvation
+    /// findings #5/#6/#7 from the bug-pattern audit).
+    pub search_index: Arc<SemanticIndex>,
     /// Code property graph for dependency analysis.
     pub code_graph: std::sync::RwLock<CodePropertyGraph>,
     /// SAST security scanner.
@@ -73,7 +75,7 @@ impl CaduceusEngine {
                 Box::new(CodeHashEmbedder::new(384))
             }
         };
-        let mut index = SemanticIndex::new(embedder)
+        let index = SemanticIndex::new(embedder)
             .with_chunker(crate::tree_sitter::TreeSitterChunker::new());
 
         // Try loading persisted index
@@ -84,7 +86,7 @@ impl CaduceusEngine {
             }
         }
 
-        let search_index = Arc::new(RwLock::new(index));
+        let search_index = Arc::new(index);
         let code_graph = std::sync::RwLock::new(CodePropertyGraph::new());
         let security_scanner = SastScanner::new();
         let secret_scanner = SecretScanner::new();
@@ -236,30 +238,21 @@ impl CaduceusEngine {
             crate::index_dag::IndexResource::CodeGraph,
             crate::index_dag::AccessKind::Write,
         );
-        // Phase 1: hold the WRITE lock only for the actual mutation, snapshot
-        // the resulting chunks under the same lease (so the graph mirrors
-        // exactly what landed in the index), then drop the writer.
-        let (count, chunks) = {
-            let mut index = self.search_index.write().await;
-            let count = index
-                .index_directory_incremental(path)
-                .await
-                .map_err(|e| e.to_string())?;
-            let chunks: Vec<_> = index.chunks().into_iter().cloned().collect();
-            (count, chunks)
-        };
+        // Internal-sync index: no outer lock; methods take &self and never
+        // hold an internal lock across .await. Concurrent semantic_search
+        // calls run fully in parallel with this reindex (fix #5).
+        let count = self
+            .search_index
+            .index_directory_incremental(path)
+            .await
+            .map_err(|e| e.to_string())?;
+        let chunks = self.search_index.chunks();
 
-        // Phase 2: persist using a READ lock so concurrent semantic_search
-        // calls aren't blocked by disk I/O. Multiple readers can run in
-        // parallel; we only block other writers (which is intentional —
-        // we don't want a competing index_directory racing the on-disk
-        // snapshot to a half-applied state).
+        // Persist using the public snapshot API — also takes only a brief
+        // internal read lock, so concurrent searches are unaffected (fix #5).
         let index_path = self.project_root.join(".caduceus").join("index.json");
-        {
-            let index = self.search_index.read().await;
-            if let Err(e) = index.save_to_file(&index_path) {
-                log::warn!("[caduceus] Failed to persist index: {e}");
-            }
+        if let Err(e) = self.search_index.save_to_file(&index_path) {
+            log::warn!("[caduceus] Failed to persist index: {e}");
         }
 
         // Phase 3: rebuild the code property graph from the snapshot — no
@@ -307,8 +300,11 @@ impl CaduceusEngine {
             crate::index_dag::IndexResource::SemanticIndex,
             crate::index_dag::AccessKind::Read,
         );
-        let index = self.search_index.read().await;
-        index
+        // Internal-sync index: no outer read lock needed. The query embedding
+        // happens inside `search` with no entries lock held, then a brief
+        // internal read lock is taken to score — concurrent reindexes will
+        // not block this call (fix #6).
+        self.search_index
             .search(query, limit)
             .await
             .map(|results| {
@@ -322,7 +318,7 @@ impl CaduceusEngine {
 
     /// Get the number of indexed chunks.
     pub async fn index_chunk_count(&self) -> usize {
-        self.search_index.read().await.chunk_count()
+        self.search_index.chunk_count()
     }
 
     // ── Code Graph ────────────────────────────────────────────────────────
@@ -408,17 +404,22 @@ impl CaduceusEngine {
             .collect()
     }
 
-    /// Re-index a single file (re-read from disk).
+    /// Re-index a single file (re-read from disk). Uses the internal-sync
+    /// index — embeddings happen with no lock held; only the final
+    /// retain+append takes a brief write lock (fix #7).
     pub async fn reindex_file(&self, path: &Path) -> Result<usize, String> {
-        let mut index = self.search_index.write().await;
-        index.reindex_file(path).await.map_err(|e| e.to_string())
+        self.search_index
+            .reindex_file(path)
+            .await
+            .map_err(|e| e.to_string())
     }
 
-    /// Index already-loaded content (no disk I/O).
+    /// Index already-loaded content (no disk I/O). Atomically replaces any
+    /// existing entries for `path` so concurrent searches never observe a
+    /// half-evicted state (fix #7).
     pub async fn index_content(&self, path: &str, content: &str) -> Result<usize, String> {
-        let mut index = self.search_index.write().await;
-        index
-            .index_content(path, content)
+        self.search_index
+            .replace_file_content(path, content)
             .await
             .map_err(|e| e.to_string())
     }
@@ -1686,6 +1687,118 @@ mod tests {
             .filter(|r| r.is_ok())
             .count();
         assert!(ok >= 1, "at least one reindex must succeed under contention");
+    }
+
+    /// Bug #5/#6/#7 hard regression: with the old
+    /// `Arc<tokio::RwLock<SemanticIndex>>` design, an in-flight
+    /// `index_directory` (write guard) would block any concurrent
+    /// `semantic_search` (read guard) for the full duration of the
+    /// indexer's awaited embedding work. This test injects a deliberately
+    /// SLOW embedder so the indexer takes a measurable wall-clock hit, then
+    /// asserts that a concurrent search completes in well under the indexer's
+    /// runtime — which is only possible if the index is internally
+    /// synchronized and never holds an internal lock across `.await`.
+    #[tokio::test]
+    async fn engine_search_overlaps_with_slow_indexer() {
+        use caduceus_omniscience::{EmbeddingBackend, SemanticIndex};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        struct SlowEmbedder {
+            per_text_delay: Duration,
+            dims: usize,
+        }
+        #[async_trait::async_trait]
+        impl EmbeddingBackend for SlowEmbedder {
+            async fn embed(
+                &self,
+                texts: Vec<String>,
+            ) -> caduceus_core::Result<Vec<Vec<f32>>> {
+                // Sleep proportional to batch size so the indexer is the
+                // dominant time-consumer; search should still race past it.
+                tokio::time::sleep(self.per_text_delay * texts.len() as u32).await;
+                Ok(texts
+                    .into_iter()
+                    .map(|t| {
+                        let mut v = vec![0.0f32; self.dims];
+                        for (i, b) in t.bytes().enumerate() {
+                            v[i % self.dims] += b as f32;
+                        }
+                        let n: f32 =
+                            v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+                        v.iter_mut().for_each(|x| *x /= n);
+                        v
+                    })
+                    .collect())
+            }
+            fn dimensions(&self) -> usize {
+                self.dims
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        // 6 small files so the indexer makes at least 6 embedder calls,
+        // each sleeping ~150ms → ~900ms of "embedding" wall time.
+        for i in 0..6 {
+            std::fs::write(
+                tmp.path().join(format!("f{i}.rs")),
+                format!("fn slow_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+
+        // Build a custom engine sharing the same internal-sync SemanticIndex
+        // wiring as production but with our slow embedder.
+        let slow = Box::new(SlowEmbedder {
+            per_text_delay: Duration::from_millis(150),
+            dims: 32,
+        }) as Box<dyn EmbeddingBackend>;
+        let index = Arc::new(SemanticIndex::new(slow));
+        // Prime so search has at least one entry to score against
+        // (uses the same slow path; that one-time cost is paid before the race).
+        index
+            .replace_file_content("seed.rs", "fn seed() {}\n")
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        let i1 = index.clone();
+        let p1 = tmp.path().to_path_buf();
+        let indexer = tokio::spawn(async move {
+            i1.index_directory_incremental(&p1).await
+        });
+
+        // Give the indexer a head start so it's definitely mid-await when
+        // the searcher launches.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let i2 = index.clone();
+        let search_started = Instant::now();
+        let result = i2.search("slow_0", 3).await.expect("search must succeed");
+        let search_elapsed = search_started.elapsed();
+        let _ = result;
+
+        // Search should complete in well under the indexer's wall-clock cost
+        // (~900ms). If it took >= 500ms, the search was almost certainly
+        // serialized behind the indexer — i.e., a regression to the old
+        // outer RwLock design.
+        assert!(
+            search_elapsed < Duration::from_millis(500),
+            "search took {search_elapsed:?} — search appears to be blocked by the indexer (regression of fix #5/#6/#7)"
+        );
+
+        // Indexer must still complete cleanly.
+        let idx_result = tokio::time::timeout(Duration::from_secs(10), indexer)
+            .await
+            .expect("indexer must finish")
+            .expect("indexer task")
+            .expect("indexer result");
+        assert!(idx_result > 0);
+        let total = started.elapsed();
+        // Sanity: total race time < indexer's solo cost would have been if
+        // search had been serialized after it. (Loose bound — main assertion
+        // is the search latency above.)
+        assert!(total < Duration::from_secs(5));
     }
 
     /// Phase C2 resilience: search on a corrupt or absent project root
