@@ -31,7 +31,11 @@ fn project_lock(project_root: &Path) -> std::sync::Arc<Mutex<()>> {
     let key = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
-    let mut map = WRITE_LOCKS.lock().expect("memory write-lock map poisoned");
+    // Audit finding round-3 (#r3-35): poison-tolerant — the inner Mutex<()>
+    // is recoverable since it only protects fs read-modify-write atomicity;
+    // a panicked writer leaves either the prior memory.json (atomic rename)
+    // or no change. Recover the map so callers can continue.
+    let mut map = WRITE_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
     map.entry(key)
         .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
         .clone()
