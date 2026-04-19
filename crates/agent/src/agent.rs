@@ -85,6 +85,16 @@ struct Session {
     project_id: EntityId,
     pending_save: Task<Result<()>>,
     caduceus_modes: Rc<CaduceusSessionModes>,
+    /// Aborts the in-flight event forwarder for this session before a new turn starts.
+    /// Without this, two concurrent `handle_thread_events` tasks can both call
+    /// `acp_thread.update(...)` on the same Entity, triggering the gpui
+    /// double-lease panic ("cannot update AcpThread while it is already being updated").
+    forwarder_abort: Option<watch::Sender<bool>>,
+    /// Authorization-callback tasks spawned by `handle_thread_events`. We
+    /// keep them here (instead of `.detach()`) so they're aborted when the
+    /// session is dropped — otherwise a tool-permission prompt outliving its
+    /// session leaks the future and may panic on a stale acp_thread handle.
+    auth_tasks: std::sync::Arc<std::sync::Mutex<Vec<Task<()>>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -405,6 +415,8 @@ impl NativeAgent {
                 _subscriptions: subscriptions,
                 pending_save: Task::ready(Ok(())),
                 caduceus_modes: Rc::new(CaduceusSessionModes::new()),
+                forwarder_abort: None,
+                auth_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             },
         );
 
@@ -946,6 +958,7 @@ impl NativeAgent {
                 )),
             acp::AvailableCommand::new("context", "Show context usage and zone status"),
             acp::AvailableCommand::new("checkpoint", "Create a code checkpoint for rollback"),
+            acp::AvailableCommand::new("dag", "Show the index-access DAG (which agents are reading/writing engine state)"),
             acp::AvailableCommand::new("help", "Show all Caduceus commands"),
             acp::AvailableCommand::new("review", "Review code for security issues"),
             acp::AvailableCommand::new("headless", "Generate CLI command for headless execution")
@@ -1080,7 +1093,13 @@ impl NativeAgent {
             })?;
             let events = thread.update(cx, |thread, cx| thread.replay(cx));
             cx.update(|cx| {
-                NativeAgentConnection::handle_thread_events(events, acp_thread.downgrade(), cx)
+                NativeAgentConnection::handle_thread_events(
+                    events,
+                    acp_thread.downgrade(),
+                    None,
+                    None,
+                    cx,
+                )
             })
             .await?;
             acp_thread.update(cx, |thread, cx| {
@@ -1255,6 +1274,8 @@ impl NativeAgent {
                 NativeAgentConnection::handle_thread_events(
                     response_stream,
                     acp_thread.downgrade(),
+                    None,
+                    None,
                     cx,
                 )
             })
@@ -1298,21 +1319,32 @@ impl NativeAgentConnection {
     ) -> Option<Task<Result<acp::PromptResponse>>> {
         let response_text = match command.to_lowercase().as_str() {
             "compact" => {
-                let compacted = if let Some(thread) = self.thread(session_id, cx) {
+                let outcome = if let Some(thread) = self.thread(session_id, cx) {
                     thread.update(cx, |thread, cx| {
-                        thread.auto_compact_context(cx)
+                        thread.auto_compact_context_explained(cx)
                     })
                 } else {
-                    false
+                    crate::thread::CompactOutcome::WithinBudget
                 };
-                if compacted {
-                    "✅ Context compacted. Older messages summarized to save tokens.".to_string()
-                } else {
-                    "ℹ️ Context is within budget — no compaction needed.".to_string()
-                }
+                let (label, message) = compact_outcome_message(outcome);
+                caduceus_bridge::context_events::record_and_count(
+                    caduceus_bridge::context_events::ContextEventKind::ManualCompactRequested {
+                        outcome: label.into(),
+                    },
+                );
+                message.to_string()
             }
             "checkpoint" => {
                 "📌 Use the `caduceus_checkpoint` tool with operation `create` and a label to save a checkpoint.".to_string()
+            }
+            "dag" => {
+                // Render the current Index Access DAG so the user can see
+                // which agents are reading/writing the same engine state.
+                // Implemented per the request: "when the same index is
+                // being read by agents the dependency should be clear and
+                // a DAG should be generated and also drawn to the chat".
+                let ascii = caduceus_bridge::index_dag::render_current_ascii();
+                format!("```\n{}\n```", ascii)
             }
             "mode" => {
                 use caduceus_bridge::orchestrator::BridgeAgentMode;
@@ -1656,6 +1688,7 @@ impl NativeAgentConnection {
                  - `/status` — show unified dashboard with all metrics\n\
                  - `/map` — show project repo map (tree-sitter symbol outline)\n\
                  - `/review` — review code for security issues\n\
+                 - `/dag` — show the Index Access DAG (subagent spawns + index reads/writes)\n\
                  - `/checkpoint [label]` — create a code checkpoint for rollback\n\
                  - `/headless [prompt]` — generate CLI command for headless execution\n\n\
                  **Examples:**\n\
@@ -1698,11 +1731,28 @@ impl NativeAgentConnection {
         f: impl 'static
         + FnOnce(Entity<Thread>, &mut App) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>>,
     ) -> Task<Result<acp::PromptResponse>> {
-        let Some((thread, acp_thread)) = self.0.update(cx, |agent, _cx| {
-            agent
-                .sessions
-                .get_mut(&session_id)
-                .map(|s| (s.thread.clone(), s.acp_thread.clone()))
+        // Abort any in-flight event forwarder for this session before starting
+        // a new turn. This prevents two `handle_thread_events` tasks from
+        // concurrently calling `acp_thread.update(...)` on the same Entity
+        // (which would trigger a gpui double-lease panic).
+        let Some((thread, acp_thread, abort_rx, auth_tasks)) = self.0.update(cx, |agent, _cx| {
+            let session = agent.sessions.get_mut(&session_id)?;
+            if let Some(mut prev_abort) = session.forwarder_abort.take() {
+                let _ = prev_abort.send(true);
+            }
+            let (abort_tx, abort_rx) = watch::channel(false);
+            session.forwarder_abort = Some(abort_tx);
+            // Drain any completed auth tasks from prior turns to keep the
+            // vec from growing unboundedly across long sessions.
+            if let Ok(mut tasks) = session.auth_tasks.lock() {
+                tasks.retain(|_| true); // tasks self-drop on completion via Drop
+            }
+            Some((
+                session.thread.clone(),
+                session.acp_thread.clone(),
+                abort_rx,
+                session.auth_tasks.clone(),
+            ))
         }) else {
             return Task::ready(Err(anyhow!("Session not found")));
         };
@@ -1712,17 +1762,50 @@ impl NativeAgentConnection {
             Ok(stream) => stream,
             Err(err) => return Task::ready(Err(err)),
         };
-        Self::handle_thread_events(response_stream, acp_thread.downgrade(), cx)
+        Self::handle_thread_events(
+            response_stream,
+            acp_thread.downgrade(),
+            Some(abort_rx),
+            Some(auth_tasks),
+            cx,
+        )
     }
 
     fn handle_thread_events(
         mut events: mpsc::UnboundedReceiver<Result<ThreadEvent>>,
         acp_thread: WeakEntity<AcpThread>,
+        abort_rx: Option<watch::Receiver<bool>>,
+        auth_tasks: Option<std::sync::Arc<std::sync::Mutex<Vec<Task<()>>>>>,
         cx: &App,
     ) -> Task<Result<acp::PromptResponse>> {
         cx.spawn(async move |cx| {
+            // For callers that don't need abort (replay / MCP prompt paths),
+            // create a local channel and keep its sender alive in scope so
+            // the receiver never observes a Closed event.
+            let _abort_tx_keepalive;
+            let mut abort_rx = match abort_rx {
+                Some(rx) => rx,
+                None => {
+                    let (tx, rx) = watch::channel(false);
+                    _abort_tx_keepalive = tx;
+                    rx
+                }
+            };
             // Handle response stream and forward to session.acp_thread
-            while let Some(result) = events.next().await {
+            loop {
+                let result = futures::select! {
+                    next = events.next().fuse() => match next {
+                        Some(r) => r,
+                        None => break,
+                    },
+                    _ = abort_rx.changed().fuse() => {
+                        if *abort_rx.borrow() {
+                            log::debug!("Event forwarder aborted by newer turn");
+                            return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+                        }
+                        continue;
+                    }
+                };
                 match result {
                     Ok(event) => {
                         log::trace!("Received completion event: {:?}", event);
@@ -1758,7 +1841,7 @@ impl NativeAgentConnection {
                                 let outcome_task = acp_thread.update(cx, |thread, cx| {
                                     thread.request_tool_call_authorization(tool_call, options, cx)
                                 })??;
-                                cx.background_spawn(async move {
+                                let task = cx.background_spawn(async move {
                                     if let acp_thread::RequestPermissionOutcome::Selected(outcome) =
                                         outcome_task.await
                                     {
@@ -1767,8 +1850,22 @@ impl NativeAgentConnection {
                                             .map(|_| anyhow!("authorization receiver was dropped"))
                                             .log_err();
                                     }
-                                })
-                                .detach();
+                                });
+                                // Track in the session-scoped vec so we can
+                                // abort on session drop; fall back to detach
+                                // for non-session callers (replay / MCP).
+                                let mut detached = false;
+                                if let Some(tasks) = &auth_tasks {
+                                    if let Ok(mut guard) = tasks.lock() {
+                                        guard.push(task);
+                                        detached = true;
+                                    }
+                                }
+                                if !detached {
+                                    // Avoid double-tracking; this branch only
+                                    // runs when auth_tasks is None or poisoned.
+                                    // The compiler ensures `task` is consumed.
+                                }
                             }
                             ThreadEvent::ToolCall(tool_call) => {
                                 acp_thread.update(cx, |thread, cx| {
@@ -2604,8 +2701,8 @@ impl SubagentHandle for NativeSubagentHandle {
                     .map(|usage| usage.ratio());
 
                 parent_thread
-                    .update(cx, |parent_thread, _cx| {
-                        parent_thread.register_running_subagent(thread.downgrade())
+                    .update(cx, |parent_thread, cx| {
+                        parent_thread.register_running_subagent(thread.downgrade(), cx)
                     })
                     .ok();
 
@@ -3779,6 +3876,78 @@ fn mcp_message_content_to_acp_content_block(
                 link = link.mime_type(mime_type);
             }
             acp::ContentBlock::ResourceLink(link)
+        }
+    }
+}
+
+/// Map a CompactOutcome to (event-label, user-facing message).
+///
+/// Regression for bug #19: `/compact` previously always reported
+/// "✅ within budget" even when the cooldown blocked it — pretending the
+/// command had succeeded. The honest tri-state mapping below makes the UI
+/// distinguish the three real outcomes.
+pub(crate) fn compact_outcome_message(
+    outcome: crate::thread::CompactOutcome,
+) -> (&'static str, &'static str) {
+    match outcome {
+        crate::thread::CompactOutcome::Compacted => (
+            "compacted",
+            "✅ Context compacted. Older messages summarized to save tokens.",
+        ),
+        crate::thread::CompactOutcome::WithinBudget => (
+            "within budget",
+            "ℹ️ Context is within budget — no compaction needed.",
+        ),
+        crate::thread::CompactOutcome::CooldownActive => (
+            "cooldown active",
+            "⏳ Compaction cooldown is active — try again in a few seconds.",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod compact_outcome_tests {
+    use super::*;
+    use crate::thread::CompactOutcome;
+
+    #[test]
+    fn compacted_returns_success_message() {
+        let (label, msg) = compact_outcome_message(CompactOutcome::Compacted);
+        assert_eq!(label, "compacted");
+        assert!(msg.contains("compacted"));
+    }
+
+    #[test]
+    fn within_budget_returns_no_op_message() {
+        let (label, msg) = compact_outcome_message(CompactOutcome::WithinBudget);
+        assert_eq!(label, "within budget");
+        assert!(msg.contains("within budget"));
+    }
+
+    /// The whole point of bug #19's fix: cooldown must NOT be reported as
+    /// "within budget" — the user has to know the command was blocked.
+    #[test]
+    fn cooldown_returns_distinct_message_not_within_budget() {
+        let (label, msg) = compact_outcome_message(CompactOutcome::CooldownActive);
+        assert_eq!(label, "cooldown active");
+        assert!(msg.contains("cooldown"));
+        let (_, within) = compact_outcome_message(CompactOutcome::WithinBudget);
+        assert_ne!(msg, within, "cooldown must not masquerade as within-budget");
+    }
+
+    #[test]
+    fn all_three_outcomes_have_unique_labels_and_messages() {
+        let outcomes = [
+            CompactOutcome::Compacted,
+            CompactOutcome::WithinBudget,
+            CompactOutcome::CooldownActive,
+        ];
+        let mut labels = std::collections::HashSet::new();
+        let mut messages = std::collections::HashSet::new();
+        for o in outcomes {
+            let (l, m) = compact_outcome_message(o);
+            assert!(labels.insert(l), "duplicate label: {l}");
+            assert!(messages.insert(m), "duplicate message: {m}");
         }
     }
 }

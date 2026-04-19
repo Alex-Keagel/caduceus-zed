@@ -27,5 +27,7 @@ pub mod providers;
 pub mod runtime;
 pub mod safety;
 pub mod tree_sitter;
+pub mod context_events;
+pub mod index_dag;
 
 pub use engine::CaduceusEngine;

@@ -330,3 +330,75 @@ tools! {
     UpdatePlanTool,
     WebSearchTool,
 }
+
+#[cfg(test)]
+mod sensitive_file_tests {
+    use super::{is_sensitive_file, redact_if_sensitive};
+
+    /// Bug C10a covers `is_sensitive_file` being bypassed in tree_sitter
+    /// (and several other tools) — every variant below MUST be flagged so
+    /// the model never sees secret bytes.
+    #[test]
+    fn flags_dotenv_variants() {
+        for p in [".env", ".env.local", ".env.production", ".env.staging",
+                  "src/.env", "/abs/path/.env.test", "deep/nested/.env"] {
+            assert!(is_sensitive_file(p), "{p} should be sensitive");
+        }
+    }
+
+    #[test]
+    fn flags_credential_files() {
+        for p in ["credentials.json", "service-account.json", ".npmrc",
+                  ".netrc", "id_rsa", "id_ed25519", ".pgpass"] {
+            assert!(is_sensitive_file(p), "{p}");
+            assert!(is_sensitive_file(&format!("foo/bar/{p}")));
+        }
+    }
+
+    #[test]
+    fn flags_key_extensions() {
+        for p in ["server.pem", "auth.key", "store.p12", "ca.pfx", "android.jks"] {
+            assert!(is_sensitive_file(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn flags_secret_directories() {
+        assert!(is_sensitive_file("/home/u/.ssh/id_foo"));
+        assert!(is_sensitive_file(".ssh/known_hosts"));
+        assert!(is_sensitive_file("project/.aws/credentials"));
+        assert!(is_sensitive_file("nested/.gnupg/secring.gpg"));
+        assert!(is_sensitive_file(".kube/config"));
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert!(is_sensitive_file("/PROJECT/.ENV"));
+        assert!(is_sensitive_file("ID_RSA"));
+        assert!(is_sensitive_file("Credentials.JSON"));
+    }
+
+    #[test]
+    fn does_not_flag_normal_files() {
+        for p in ["main.rs", "README.md", "Cargo.toml", "envvars.md",
+                  "credentials_template.md", "src/keystore_handler.rs"] {
+            assert!(!is_sensitive_file(p), "{p} should NOT be sensitive");
+        }
+    }
+
+    /// C8 / C10a sibling: redact_if_sensitive is the user-facing layer
+    /// that routes through is_sensitive_file. Verify the redaction string
+    /// itself doesn't leak the original bytes.
+    #[test]
+    fn redact_replaces_sensitive_content() {
+        let r = redact_if_sensitive(".env", "API_KEY=topsecret123");
+        assert!(!r.contains("topsecret123"));
+        assert!(r.contains("REDACTED"));
+    }
+
+    #[test]
+    fn redact_passes_through_normal_content() {
+        let original = "fn main() {}";
+        assert_eq!(redact_if_sensitive("main.rs", original), original);
+    }
+}

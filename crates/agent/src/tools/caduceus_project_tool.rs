@@ -224,13 +224,18 @@ impl AgentTool for CaduceusProjectTool {
                     language,
                     description,
                 } => {
-                    self.load_config().and_then(|mut config| {
-                        config.repos.insert(
-                            name.clone(),
-                            RepoEntry { path, role, language, description },
-                        );
-                        self.save_config(&config).map(|_| format!("Repo '{name}' added"))
-                    })
+                    // Validate path is inside the project root before storing.
+                    if let Err(e) = resolve_repo_path(&self.project_root, &path) {
+                        Err(format!("Invalid repo path: {e}"))
+                    } else {
+                        self.load_config().and_then(|mut config| {
+                            config.repos.insert(
+                                name.clone(),
+                                RepoEntry { path, role, language, description },
+                            );
+                            self.save_config(&config).map(|_| format!("Repo '{name}' added"))
+                        })
+                    }
                 }
                 ProjectOperation::RemoveRepo { name } => {
                     self.load_config().and_then(|mut config| {
@@ -328,12 +333,17 @@ pub fn load_project_config(project_root: &std::path::Path) -> Result<ProjectConf
     serde_json::from_str(&data).map_err(|e| format!("Failed to parse project.json: {e}"))
 }
 
-/// Shared repo path resolver with containment check.
+/// Shared repo path resolver with strict containment check.
+///
+/// A repo path is valid only if it (after canonicalization) lives under the
+/// project root. The earlier `$HOME` allowlist exposed sensitive directories
+/// like `~/.ssh`, `~/Documents`, etc. and is no longer accepted — repos must
+/// either be relative paths inside the project, absolute paths inside the
+/// project root, or symlinks that resolve inside the project root.
 pub fn resolve_repo_path(
     project_root: &std::path::Path,
     repo_path: &str,
 ) -> Result<std::path::PathBuf, String> {
-    // Reject obvious traversal attempts
     if repo_path.contains("..") {
         return Err(format!("Repo path '{}' contains '..' — path traversal not allowed", repo_path));
     }
@@ -345,32 +355,92 @@ pub fn resolve_repo_path(
         project_root.join(repo_path)
     };
 
-    // Canonicalize to resolve symlinks and relative components
     let canonical = resolved.canonicalize().map_err(|e| {
         format!("Cannot resolve repo path '{}': {}", repo_path, e)
     })?;
 
-    // Must be under project root or user's home directory
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
-    let project_canonical = project_root.canonicalize().unwrap_or_else(|_| project_root.to_path_buf());
+    let project_canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
 
-    if !canonical.starts_with(&project_canonical) && !canonical.starts_with(&home) {
+    if !canonical.starts_with(&project_canonical) {
         return Err(format!(
-            "Repo path '{}' resolves outside project and home directory — access denied",
+            "Repo path '{}' resolves outside the project root — access denied",
             repo_path
         ));
     }
 
-    // Block system directories even under home (e.g., ~/../../etc)
-    let forbidden_prefixes = [
-        "/etc", "/var", "/usr", "/bin", "/sbin", "/root", "/proc", "/sys", "/dev",
-    ];
-    let canonical_str = canonical.to_string_lossy();
-    for prefix in &forbidden_prefixes {
-        if canonical_str.starts_with(prefix) {
-            return Err(format!("Repo path '{}' points to a system directory", repo_path));
+    Ok(canonical)
+}
+
+#[cfg(test)]
+mod resolve_repo_path_tests {
+    use super::resolve_repo_path;
+    use tempfile::tempdir;
+
+    /// Bug C9: an earlier version accepted any path under `$HOME` as a
+    /// "repo path", which exposed `~/.ssh`, `~/Documents`, etc. The fix
+    /// restricts repo paths to the project root only.
+    #[test]
+    fn rejects_path_outside_project_root() {
+        let project = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_str = outside.path().to_string_lossy().to_string();
+        let result = resolve_repo_path(project.path(), &outside_str);
+        assert!(result.is_err(), "outside-project path must be rejected");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("outside the project root"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn accepts_relative_path_inside_project() {
+        let project = tempdir().unwrap();
+        let sub = project.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        let result = resolve_repo_path(project.path(), "subdir");
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn accepts_absolute_path_inside_project() {
+        let project = tempdir().unwrap();
+        let sub = project.path().join("inner");
+        std::fs::create_dir(&sub).unwrap();
+        let abs = sub.to_string_lossy().to_string();
+        assert!(resolve_repo_path(project.path(), &abs).is_ok());
+    }
+
+    #[test]
+    fn rejects_dotdot_traversal() {
+        let project = tempdir().unwrap();
+        let result = resolve_repo_path(project.path(), "../etc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains(".."));
+    }
+
+    #[test]
+    fn rejects_home_ssh_style_path() {
+        let project = tempdir().unwrap();
+        if let Some(home) = std::env::var_os("HOME") {
+            let ssh = std::path::PathBuf::from(home).join(".ssh");
+            if ssh.exists() {
+                let s = ssh.to_string_lossy().to_string();
+                let result = resolve_repo_path(project.path(), &s);
+                assert!(result.is_err(), "~/.ssh must NOT be allowed as a repo path");
+            }
         }
     }
 
-    Ok(canonical)
+    /// A symlink that points outside the project must be rejected
+    /// (containment must be checked AFTER canonicalization).
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escaping_project() {
+        let project = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let link = project.path().join("escape");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let result = resolve_repo_path(project.path(), "escape");
+        assert!(result.is_err(), "symlink escape must be blocked");
+    }
 }

@@ -766,6 +766,12 @@ pub struct AgentPanel {
     _base_view_observation: Option<Subscription>,
     caduceus_stats_cache: CaduceusStatsCache,
     _caduceus_stats_refresh_task: Option<Task<()>>,
+    /// Sonnet #3: periodic poll task that drives `refresh_caduceus_stats`
+    /// on a 5-sec cadence regardless of whether the panel is rendering.
+    /// Without this, the chip freezes whenever the user is idle even
+    /// though background agents may be actively spawning subagents and
+    /// reading indexes.
+    _caduceus_stats_poll_task: Option<Task<()>>,
 }
 
 /// Data computed by the background I/O task for Caduceus stats.
@@ -783,6 +789,33 @@ struct CaduceusStatsSnapshot {
     memory_tooltip: String,
     bg_agent_tooltip: String,
     security_tooltip: String,
+    locked_file_count: usize,
+    lock_tooltip: String,
+    /// Recent compaction/eviction events from caduceus_bridge::context_events.
+    /// Newest first. Empty list when total_recorded == 0 means automatic
+    /// context maintenance has never fired in this session — surface a
+    /// warning indicator if conversation is long but this is empty.
+    context_events: Vec<caduceus_bridge::context_events::ContextEvent>,
+    context_events_total: usize,
+    /// Pre-rendered ASCII Index Access DAG. Refreshed by the same 5-sec
+    /// background task as the rest of this snapshot so the panel chip
+    /// reflects live agent + index activity without per-render I/O.
+    /// `None` means the DAG version counter was unchanged since the
+    /// previous refresh — the cache should retain its existing DAG fields
+    /// (F2 fast-path: skip the snapshot+render work entirely).
+    dag: Option<DagBundle>,
+}
+
+/// Coalesced DAG fields, applied atomically. Bundling lets the io_task
+/// short-circuit on `version() == last` without leaving stale chip data
+/// half-applied.
+#[derive(Debug, Clone)]
+struct DagBundle {
+    version: u64,
+    ascii: String,
+    contention_count: usize,
+    spawn_count: usize,
+    access_count: usize,
 }
 
 /// Cached Caduceus stats to avoid synchronous filesystem I/O on every render.
@@ -804,6 +837,17 @@ struct CaduceusStatsCache {
     bg_agent_tooltip: String,
     security_tooltip: String,
     memory_tooltip: String,
+    context_events: Vec<caduceus_bridge::context_events::ContextEvent>,
+    context_events_total: usize,
+    /// Live Index Access DAG (rendered ASCII + counts) — refreshed on the
+    /// same 5-sec cycle as the rest of the snapshot.
+    dag_ascii: String,
+    dag_contention_count: usize,
+    dag_spawn_count: usize,
+    dag_access_count: usize,
+    /// Last DAG version observed by the io_task. Used to short-circuit
+    /// re-rendering when the underlying registry hasn't changed (F2).
+    last_dag_version: u64,
     last_refresh: Instant,
 }
 
@@ -825,7 +869,49 @@ impl Default for CaduceusStatsCache {
             bg_agent_tooltip: "No background agents".to_string(),
             security_tooltip: "Security score based on last scan".to_string(),
             memory_tooltip: "No memories stored".to_string(),
+            context_events: Vec::new(),
+            context_events_total: 0,
+            dag_ascii: String::new(),
+            dag_contention_count: 0,
+            dag_spawn_count: 0,
+            dag_access_count: 0,
+            last_dag_version: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
+        }
+    }
+}
+
+impl CaduceusStatsCache {
+    /// Bug #17 fix: apply a freshly-built snapshot atomically.
+    /// Centralizing the assignment guarantees no field can be updated in
+    /// isolation — every render either sees the previous coherent snapshot
+    /// or the new coherent snapshot, never a half-merged mix.
+    fn apply_snapshot(&mut self, snap: CaduceusStatsSnapshot) {
+        self.automation_count = snap.automation_count;
+        self.background_agent_count = snap.background_agent_count;
+        self.evolved_skill_count = snap.evolved_skill_count;
+        self.security_score = snap.security_score;
+        self.project_name = snap.project_name;
+        self.project_repo_count = snap.project_repo_count;
+        self.api_count = snap.api_count;
+        self.health_score = snap.health_score;
+        self.memory_count = snap.memory_count;
+        self.memory_entries = snap.memory_entries;
+        self.memory_tooltip = snap.memory_tooltip;
+        self.bg_agent_tooltip = snap.bg_agent_tooltip;
+        self.security_tooltip = snap.security_tooltip;
+        self.locked_file_count = snap.locked_file_count;
+        self.lock_tooltip = snap.lock_tooltip;
+        self.context_events = snap.context_events;
+        self.context_events_total = snap.context_events_total;
+        // F2: only update DAG fields when the io_task actually re-rendered.
+        // None means the version counter was unchanged → keep prior values.
+        if let Some(dag) = snap.dag {
+            self.dag_ascii = dag.ascii;
+            self.dag_contention_count = dag.contention_count;
+            self.dag_spawn_count = dag.spawn_count;
+            self.dag_access_count = dag.access_count;
+            self.last_dag_version = dag.version;
         }
     }
 }
@@ -1171,7 +1257,35 @@ impl AgentPanel {
             _base_view_observation: None,
             caduceus_stats_cache: CaduceusStatsCache::default(),
             _caduceus_stats_refresh_task: None,
+            _caduceus_stats_poll_task: None,
         };
+
+        // Sonnet #3: spawn a 5-sec periodic poll so the chip stays live
+        // even when the user is idle. This is the single source of "now"
+        // for refresh_caduceus_stats; the render-path call is kept only
+        // as a first-frame primer.
+        panel._caduceus_stats_poll_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(5))
+                    .await;
+                if this
+                    .update(cx, |panel, cx| {
+                        // Force-refresh: invalidate the TTL guard so the
+                        // 5-sec timer is the actual cadence. Otherwise
+                        // a render-path call could starve the poll.
+                        panel.caduceus_stats_cache.last_refresh =
+                            Instant::now() - Duration::from_secs(60);
+                        panel.refresh_caduceus_stats(cx);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    // panel dropped — exit the loop
+                    break;
+                }
+            }
+        }));
 
         // Initial sync of agent servers from extensions
         panel.sync_agent_servers_from_extensions(cx);
@@ -4635,6 +4749,130 @@ impl AgentPanel {
                         .tooltip(Tooltip::text(lock_tooltip)),
                 )
             })
+            .child({
+                // Auto-context activity chip. Always rendered so the user can
+                // confirm the system is alive: ♻ N shows recent
+                // compaction/eviction count; ⚠ ♻ 0 means no auto-maintenance
+                // has fired this session — usually a misconfiguration signal
+                // when the conversation is non-trivial.
+                let total = self.caduceus_stats_cache.context_events_total;
+                let recent: Vec<_> = self
+                    .caduceus_stats_cache
+                    .context_events
+                    .iter()
+                    .take(8)
+                    .collect();
+                let label = if total == 0 {
+                    "⚠ ♻ 0".to_string()
+                } else {
+                    format!("♻ {}", total)
+                };
+                let color = if total == 0 { Color::Warning } else { Color::Muted };
+                let tooltip = if recent.is_empty() {
+                    "No automatic context events yet.\n\
+                     Auto-compaction fires when the context fills past the \
+                     yellow zone. If your conversation is long and this is \
+                     still 0, check the model's max_context, the compaction \
+                     cooldown, or the zone thresholds."
+                        .to_string()
+                } else {
+                    use caduceus_bridge::context_events::ContextEventKind;
+                    let mut tip =
+                        format!("Last {} context event(s) (newest first):\n", recent.len());
+                    for ev in &recent {
+                        let secs_ago = ev
+                            .at
+                            .elapsed()
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let line = match &ev.kind {
+                            ContextEventKind::AutoCompacted {
+                                messages_compacted,
+                                tokens_freed,
+                                fill_pct,
+                                zone,
+                                keep_recent,
+                            } => format!(
+                                "  {}s ago · ✅ auto-compact: {} msgs → kept {}, ~{} tok freed ({:.0}% full, zone {})",
+                                secs_ago, messages_compacted, keep_recent, tokens_freed, fill_pct, zone
+                            ),
+                            ContextEventKind::CompactionSkipped {
+                                reason,
+                                fill_pct,
+                                msg_count,
+                            } => format!(
+                                "  {}s ago · ⏭ skipped: {} ({:.0}% full, {} msgs)",
+                                secs_ago, reason, fill_pct, msg_count
+                            ),
+                            ContextEventKind::MessageEvicted { count, reason } => format!(
+                                "  {}s ago · 🗑 evicted {} msg(s): {}",
+                                secs_ago, count, reason
+                            ),
+                            ContextEventKind::ManualCompactRequested { outcome } => format!(
+                                "  {}s ago · 👤 /compact: {}",
+                                secs_ago, outcome
+                            ),
+                        };
+                        tip.push_str(&line);
+                        tip.push('\n');
+                    }
+                    tip
+                };
+                div()
+                    .id("caduceus-context-events-badge")
+                    .child(Label::new(label).size(LabelSize::Small).color(color))
+                    .tooltip(Tooltip::text(tooltip))
+            })
+            .child({
+                // Index-Access DAG chip. Always rendered: shows live agent ↔
+                // index resource activity. Warning color when ≥1 contention
+                // point (same resource touched by >1 agent → potential race
+                // / stale-read territory). Tooltip is the full ASCII DAG
+                // (Agent Spawn Tree + Index Access sections), refreshed by
+                // the same 5-sec snapshot cycle as the rest of the chips.
+                let spawns = self.caduceus_stats_cache.dag_spawn_count;
+                let accesses = self.caduceus_stats_cache.dag_access_count;
+                let contention = self.caduceus_stats_cache.dag_contention_count;
+                let label = if contention > 0 {
+                    format!("⚠ ⛓ {}/{}/{}", spawns, accesses, contention)
+                } else {
+                    format!("⛓ {}/{}", spawns, accesses)
+                };
+                let color = if contention > 0 { Color::Warning } else { Color::Muted };
+                let dag_ascii = self.caduceus_stats_cache.dag_ascii.clone();
+                // F6: cap tooltip ASCII to avoid running off-screen on
+                // long sessions (256 events × N agents). Hard limit ~30
+                // lines + a hint to use /dag for the full view.
+                const MAX_TOOLTIP_LINES: usize = 30;
+                let dag_ascii = if dag_ascii.lines().count() > MAX_TOOLTIP_LINES {
+                    let kept: Vec<&str> =
+                        dag_ascii.lines().take(MAX_TOOLTIP_LINES).collect();
+                    let dropped = dag_ascii.lines().count() - MAX_TOOLTIP_LINES;
+                    format!(
+                        "{}\n... ({} more line(s) — run /dag for the full view)",
+                        kept.join("\n"),
+                        dropped
+                    )
+                } else {
+                    dag_ascii
+                };
+                let tooltip = if dag_ascii.trim().is_empty() {
+                    "Index Access DAG: no agent ↔ index activity recorded yet.\n\
+                     This becomes populated when an agent calls index_directory, \
+                     semantic_search, or spawns a subagent."
+                        .to_string()
+                } else {
+                    format!(
+                        "Index Access DAG (live, refreshed every 5s)\n\
+                         spawns: {}  accesses: {}  contention: {}\n\n{}",
+                        spawns, accesses, contention, dag_ascii
+                    )
+                };
+                div()
+                    .id("caduceus-dag-badge")
+                    .child(Label::new(label).size(LabelSize::Small).color(color))
+                    .tooltip(Tooltip::text(tooltip))
+            })
             .when(api_count > 0, |this| {
                 this.child(
                     Label::new(format!("🔌 {} APIs", api_count))
@@ -4691,18 +4929,10 @@ impl AgentPanel {
         // again before the task completes).
         self.caduceus_stats_cache.last_refresh = Instant::now();
 
-        // In-process lock list — no I/O, safe on the UI thread.
-        let locked = agent::caduceus_file_lock::list_locked_files();
-        self.caduceus_stats_cache.locked_file_count = locked.len();
-        if locked.is_empty() {
-            self.caduceus_stats_cache.lock_tooltip = "No files locked".to_string();
-        } else {
-            let mut tip = format!("🔒 {} files locked:\n", locked.len());
-            for path in locked.iter().take(5) {
-                tip.push_str(&format!("  {}\n", path.display()));
-            }
-            self.caduceus_stats_cache.lock_tooltip = tip;
-        }
+        // F2: snapshot the last DAG version observed by the UI cache so the
+        // io_task can short-circuit the snapshot+render work when the
+        // registry hasn't advanced since the previous refresh.
+        let last_dag_version = self.caduceus_stats_cache.last_dag_version;
 
         // Grab the worktree root (cheap — reads from in-memory model).
         let root_opt = self
@@ -4713,10 +4943,76 @@ impl AgentPanel {
             .map(|wt| wt.read(cx).abs_path());
 
         // All filesystem I/O runs on the background executor so the UI thread
-        // is never blocked.
+        // is never blocked. We also collect lock-file state inside the task
+        // so the entire snapshot lands atomically — no partial cache state
+        // is observable mid-refresh (SEC-17).
         let io_task = cx.background_spawn(async move {
+            // Lock list — cheap (in-memory) but moved here so the UI cache
+            // is updated atomically with the rest of the snapshot.
+            let locked = agent::caduceus_file_lock::list_locked_files();
+            let locked_file_count = locked.len();
+            let lock_tooltip = if locked.is_empty() {
+                "No files locked".to_string()
+            } else {
+                let mut tip = format!("🔒 {} files locked:\n", locked.len());
+                for path in locked.iter().take(5) {
+                    tip.push_str(&format!("  {}\n", path.display()));
+                }
+                tip
+            };
+
+            // SEC-17: snapshot context-event ring buffer in this same I/O
+            // task so the merge step gets it atomically with everything else.
+            let context_events = caduceus_bridge::context_events::snapshot();
+            let context_events_total = caduceus_bridge::context_events::total_recorded();
+
+            // Live Index Access DAG snapshot. NOTE (gpt-5.4 #2): we
+            // intentionally rebuild every refresh rather than skipping
+            // when version() is unchanged — events age out after 5 min
+            // (EVENT_TTL) without bumping the version, so a fast-path
+            // skip would freeze the chip on a stale DAG. Cost is two
+            // mutex acquisitions + a small clone, well within the 5-sec
+            // refresh budget.
+            let current_dag_version = caduceus_bridge::index_dag::version();
+            let dag_events = caduceus_bridge::index_dag::snapshot();
+            let dag_spawns = caduceus_bridge::index_dag::spawn_snapshot();
+            let dag = caduceus_bridge::index_dag::Dag::from_snapshots(
+                &dag_events,
+                &dag_spawns,
+            );
+            let access_count: usize =
+                dag.edges.iter().map(|e| e.count as usize).sum();
+            let dag_bundle = Some(DagBundle {
+                version: current_dag_version,
+                ascii: dag.to_ascii(),
+                contention_count: dag.contention_points().len(),
+                spawn_count: dag.spawns.len(),
+                access_count,
+            });
+            // version unused but kept on the bundle for diagnostics.
+            let _ = last_dag_version;
+
             let Some(root) = root_opt else {
-                return None;
+                return Some(CaduceusStatsSnapshot {
+                    automation_count: 0,
+                    background_agent_count: 0,
+                    evolved_skill_count: 0,
+                    security_score: 0.0,
+                    project_name: None,
+                    project_repo_count: 0,
+                    api_count: 0,
+                    health_score: None,
+                    memory_count: 0,
+                    memory_entries: Vec::new(),
+                    memory_tooltip: String::new(),
+                    bg_agent_tooltip: "No background agents".to_string(),
+                    security_tooltip: String::new(),
+                    locked_file_count,
+                    lock_tooltip,
+                    context_events,
+                    context_events_total,
+                    dag: dag_bundle,
+                });
             };
 
             // Automations count
@@ -4879,39 +5175,23 @@ impl AgentPanel {
                 memory_tooltip,
                 bg_agent_tooltip,
                 security_tooltip,
+                locked_file_count,
+                lock_tooltip,
+                context_events,
+                context_events_total,
+                dag: dag_bundle,
             })
         });
 
         // Merge the snapshot back into the cache on the UI thread once done.
+        // The entire merge happens inside one `update` closure → render can
+        // never observe a half-applied snapshot (SEC-17).
         self._caduceus_stats_refresh_task = Some(cx.spawn(async move |this, cx| {
             let snapshot = io_task.await;
             this.update(cx, |this, cx| {
                 this._caduceus_stats_refresh_task = None;
                 if let Some(snap) = snapshot {
-                    let cache = &mut this.caduceus_stats_cache;
-                    cache.automation_count = snap.automation_count;
-                    cache.background_agent_count = snap.background_agent_count;
-                    cache.evolved_skill_count = snap.evolved_skill_count;
-                    cache.security_score = snap.security_score;
-                    cache.project_name = snap.project_name;
-                    cache.project_repo_count = snap.project_repo_count;
-                    cache.api_count = snap.api_count;
-                    cache.health_score = snap.health_score;
-                    cache.memory_count = snap.memory_count;
-                    cache.memory_entries = snap.memory_entries;
-                    cache.memory_tooltip = snap.memory_tooltip;
-                    cache.bg_agent_tooltip = snap.bg_agent_tooltip;
-                    cache.security_tooltip = snap.security_tooltip;
-                } else {
-                    let cache = &mut this.caduceus_stats_cache;
-                    cache.automation_count = 0;
-                    cache.background_agent_count = 0;
-                    cache.evolved_skill_count = 0;
-                    cache.security_score = 0.0;
-                    cache.project_name = None;
-                    cache.project_repo_count = 0;
-                    cache.api_count = 0;
-                    cache.health_score = None;
+                    this.caduceus_stats_cache.apply_snapshot(snap);
                 }
                 cx.notify();
             })
@@ -8190,5 +8470,178 @@ mod tests {
                  (not matched to nested_repo inside it)"
             );
         });
+    }
+
+    // ========================================================================
+    // Bug #17 regression: stats cache atomic snapshot
+    // The cache must NEVER show a half-merged state. apply_snapshot is the
+    // single chokepoint — every field must be assigned in the same call.
+    // ========================================================================
+
+    fn make_snapshot(tag: u8) -> super::CaduceusStatsSnapshot {
+        let n = tag as usize;
+        super::CaduceusStatsSnapshot {
+            automation_count: n + 1,
+            background_agent_count: n + 2,
+            evolved_skill_count: n + 3,
+            security_score: (n as f64) + 0.5,
+            project_name: Some(format!("project-{tag}")),
+            project_repo_count: n + 4,
+            api_count: n + 5,
+            health_score: Some((n as f64) * 1.5),
+            memory_count: n + 6,
+            memory_entries: vec![(format!("k-{tag}"), format!("v-{tag}"))],
+            memory_tooltip: format!("mem-tip-{tag}"),
+            bg_agent_tooltip: format!("bg-tip-{tag}"),
+            security_tooltip: format!("sec-tip-{tag}"),
+            locked_file_count: n + 7,
+            lock_tooltip: format!("lock-tip-{tag}"),
+            context_events: Vec::new(),
+            context_events_total: n + 8,
+            dag: Some(super::DagBundle {
+                version: (n as u64) + 100,
+                ascii: format!("dag-ascii-{tag}"),
+                contention_count: n + 9,
+                spawn_count: n + 10,
+                access_count: n + 11,
+            }),
+        }
+    }
+
+    #[test]
+    fn caduceus_bug17_apply_snapshot_assigns_every_field() {
+        let mut cache = super::CaduceusStatsCache::default();
+        let snap = make_snapshot(7);
+        cache.apply_snapshot(snap);
+
+        assert_eq!(cache.automation_count, 8);
+        assert_eq!(cache.background_agent_count, 9);
+        assert_eq!(cache.evolved_skill_count, 10);
+        assert_eq!(cache.security_score, 7.5);
+        assert_eq!(cache.project_name.as_deref(), Some("project-7"));
+        assert_eq!(cache.project_repo_count, 11);
+        assert_eq!(cache.api_count, 12);
+        assert_eq!(cache.health_score, Some(10.5));
+        assert_eq!(cache.memory_count, 13);
+        assert_eq!(cache.memory_entries, vec![("k-7".to_string(), "v-7".to_string())]);
+        assert_eq!(cache.memory_tooltip, "mem-tip-7");
+        assert_eq!(cache.bg_agent_tooltip, "bg-tip-7");
+        assert_eq!(cache.security_tooltip, "sec-tip-7");
+        assert_eq!(cache.locked_file_count, 14);
+        assert_eq!(cache.lock_tooltip, "lock-tip-7");
+        assert_eq!(cache.context_events_total, 15);
+        assert_eq!(cache.dag_ascii, "dag-ascii-7");
+        assert_eq!(cache.dag_contention_count, 16);
+        assert_eq!(cache.dag_spawn_count, 17);
+        assert_eq!(cache.dag_access_count, 18);
+    }
+
+    #[test]
+    fn caduceus_bug17_no_field_bleed_between_snapshots() {
+        // Bug #17 regression: applying snapshot B must NEVER leave any field
+        // from snapshot A. If we ever see "project-1" after applying snap-2,
+        // the merge missed a field — a real-world half-snapshot would be
+        // observable to the user.
+        let mut cache = super::CaduceusStatsCache::default();
+        cache.apply_snapshot(make_snapshot(1));
+        cache.apply_snapshot(make_snapshot(2));
+
+        assert_eq!(cache.automation_count, 3);
+        assert_eq!(cache.background_agent_count, 4);
+        assert_eq!(cache.evolved_skill_count, 5);
+        assert_eq!(cache.security_score, 2.5);
+        assert_eq!(cache.project_name.as_deref(), Some("project-2"));
+        assert_eq!(cache.api_count, 7);
+        assert_eq!(cache.health_score, Some(3.0));
+        assert_eq!(cache.memory_entries, vec![("k-2".to_string(), "v-2".to_string())]);
+        assert_eq!(cache.memory_tooltip, "mem-tip-2");
+        assert_eq!(cache.bg_agent_tooltip, "bg-tip-2");
+        assert_eq!(cache.security_tooltip, "sec-tip-2");
+        assert_eq!(cache.lock_tooltip, "lock-tip-2");
+        assert_eq!(cache.context_events_total, 10);
+        assert_eq!(cache.dag_ascii, "dag-ascii-2");
+        assert_eq!(cache.dag_contention_count, 11);
+        assert_eq!(cache.dag_spawn_count, 12);
+        assert_eq!(cache.dag_access_count, 13);
+    }
+
+    #[test]
+    fn caduceus_bug17_default_cache_is_zeroed() {
+        // Sanity check: a freshly-defaulted cache exposes no stale data
+        // on the very first render before any snapshot has applied.
+        let cache = super::CaduceusStatsCache::default();
+        assert_eq!(cache.automation_count, 0);
+        assert_eq!(cache.background_agent_count, 0);
+        assert_eq!(cache.api_count, 0);
+        assert_eq!(cache.context_events_total, 0);
+        assert!(cache.context_events.is_empty());
+        assert!(cache.project_name.is_none());
+        assert!(cache.health_score.is_none());
+        assert!(cache.dag_ascii.is_empty());
+        assert_eq!(cache.dag_contention_count, 0);
+        assert_eq!(cache.dag_spawn_count, 0);
+        assert_eq!(cache.dag_access_count, 0);
+    }
+
+    // ========================================================================
+    // DAG panel chip — verify apply_snapshot wires DAG fields into the cache,
+    // that explicit zeroed bundles overwrite (no bleed), and that None
+    // bundles trigger F2 fast-path (preserve prior DAG values).
+    // ========================================================================
+    #[test]
+    fn caduceus_dag_panel_snapshot_bleed_check() {
+        let mut cache = super::CaduceusStatsCache::default();
+        cache.apply_snapshot(make_snapshot(3));
+        assert_eq!(cache.dag_ascii, "dag-ascii-3");
+        assert_eq!(cache.dag_contention_count, 12);
+        assert_eq!(cache.dag_spawn_count, 13);
+        assert_eq!(cache.dag_access_count, 14);
+        assert_eq!(cache.last_dag_version, 103);
+
+        // Explicit zeroed DAG bundle (the registry was cleared between
+        // refreshes) — old DAG data must NOT linger in the cache.
+        let mut zero_snap = make_snapshot(4);
+        zero_snap.dag = Some(super::DagBundle {
+            version: 200,
+            ascii: String::new(),
+            contention_count: 0,
+            spawn_count: 0,
+            access_count: 0,
+        });
+        cache.apply_snapshot(zero_snap);
+
+        assert!(
+            cache.dag_ascii.is_empty(),
+            "stale DAG ASCII bled through: {:?}",
+            cache.dag_ascii
+        );
+        assert_eq!(cache.dag_contention_count, 0);
+        assert_eq!(cache.dag_spawn_count, 0);
+        assert_eq!(cache.dag_access_count, 0);
+        assert_eq!(cache.last_dag_version, 200);
+    }
+
+    #[test]
+    fn caduceus_dag_panel_none_bundle_preserves_prior_state() {
+        // apply_snapshot must treat dag: None as "no change" so any
+        // future fast-path optimization (currently disabled per gpt-5.4
+        // #2 due to TTL semantics) cannot accidentally zero out the chip.
+        // This is a contract test for apply_snapshot itself.
+        let mut cache = super::CaduceusStatsCache::default();
+        cache.apply_snapshot(make_snapshot(5));
+        assert_eq!(cache.dag_ascii, "dag-ascii-5");
+        assert_eq!(cache.last_dag_version, 105);
+
+        let mut none_snap = make_snapshot(6);
+        none_snap.dag = None;
+        cache.apply_snapshot(none_snap);
+
+        // DAG fields preserved from snapshot 5 — non-DAG fields updated to 6.
+        assert_eq!(cache.dag_ascii, "dag-ascii-5");
+        assert_eq!(cache.dag_contention_count, 14);
+        assert_eq!(cache.dag_spawn_count, 15);
+        assert_eq!(cache.dag_access_count, 16);
+        assert_eq!(cache.last_dag_version, 105);
+        assert_eq!(cache.automation_count, 7); // tag=6 → +1
     }
 }

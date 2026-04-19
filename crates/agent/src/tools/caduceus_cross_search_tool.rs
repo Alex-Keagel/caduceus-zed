@@ -196,7 +196,15 @@ impl AgentTool for CaduceusCrossSearchTool {
                         };
                         let engine =
                             caduceus_bridge::engine::CaduceusEngine::new(&repo_path);
-                        match engine.semantic_search(&query, 5).await {
+                        match engine
+                            .semantic_search_as(
+                                format!("tool:caduceus_cross_search:{name}"),
+                                caduceus_bridge::index_dag::AgentKind::Tool,
+                                &query,
+                                5,
+                            )
+                            .await
+                        {
                             Ok(hits) => {
                                 for (content, score) in hits {
                                     let path = content
@@ -264,7 +272,14 @@ impl AgentTool for CaduceusCrossSearchTool {
                     })?;
                     let engine =
                         caduceus_bridge::engine::CaduceusEngine::new(&repo_path);
-                    match engine.index_directory(&repo_path).await {
+                    match engine
+                        .index_directory_as(
+                            format!("tool:caduceus_cross_search:index:{name}"),
+                            caduceus_bridge::index_dag::AgentKind::Tool,
+                            &repo_path,
+                        )
+                        .await
+                    {
                         Ok(count) => Ok(CaduceusCrossSearchToolOutput::Indexed {
                             message: format!(
                                 "Indexed repo '{name}' at {} — {count} chunks",

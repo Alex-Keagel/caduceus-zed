@@ -24,6 +24,17 @@ pub struct CaduceusSemanticSearchToolInput {
     pub top_k: usize,
 }
 
+/// Maximum number of semantic search results we will ever return in a single
+/// call. Anything higher risks unbounded allocation (a malformed request with
+/// `top_k = usize::MAX` would OOM the index walk).
+pub(crate) const MAX_TOP_K: usize = 100;
+
+/// Clamp the requested `top_k` to a safe range. Exposed for direct unit tests
+/// so the safety bound can be verified without spinning up an engine.
+pub(crate) fn clamp_top_k(requested: usize) -> usize {
+    requested.clamp(1, MAX_TOP_K)
+}
+
 fn default_top_k() -> usize {
     10
 }
@@ -115,7 +126,18 @@ impl AgentTool for CaduceusSemanticSearchTool {
                 }
             })?;
 
-            match engine.semantic_search(&input.query, input.top_k).await {
+            // Clamp top_k so a malformed/malicious request can't allocate
+            // an unbounded result vector (usize::MAX would OOM the index walk).
+            let top_k = clamp_top_k(input.top_k);
+            match engine
+                .semantic_search_as(
+                    "tool:caduceus_semantic_search",
+                    caduceus_bridge::index_dag::AgentKind::Tool,
+                    &input.query,
+                    top_k,
+                )
+                .await
+            {
                 Ok(hits) => {
                     let results: Vec<SearchHit> = hits
                         .into_iter()
@@ -136,5 +158,35 @@ impl AgentTool for CaduceusSemanticSearchTool {
                 }),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for bug #22: `top_k` could be set to `usize::MAX`, which
+    /// would let the index walk attempt to allocate billions of result slots
+    /// and OOM the process. The clamp must hold the upper bound.
+    #[test]
+    fn top_k_clamped_to_max() {
+        assert_eq!(clamp_top_k(usize::MAX), MAX_TOP_K);
+        assert_eq!(clamp_top_k(MAX_TOP_K + 1), MAX_TOP_K);
+        assert_eq!(clamp_top_k(1_000_000), MAX_TOP_K);
+    }
+
+    /// Regression for bug #22: a request with `top_k = 0` previously returned
+    /// no results at best, panicked at worst (some downstream search backends
+    /// assume `top_k >= 1`). Clamp the lower bound to 1.
+    #[test]
+    fn top_k_clamped_to_min() {
+        assert_eq!(clamp_top_k(0), 1);
+    }
+
+    #[test]
+    fn top_k_passthrough_in_range() {
+        assert_eq!(clamp_top_k(1), 1);
+        assert_eq!(clamp_top_k(10), 10);
+        assert_eq!(clamp_top_k(MAX_TOP_K), MAX_TOP_K);
     }
 }

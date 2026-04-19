@@ -75,6 +75,20 @@ pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_SUBAGENT_DEPTH: u8 = 1;
 
 /// Returned when a turn is attempted but no language model has been selected.
+/// Outcome of an explicit /compact request — distinguishes between the
+/// three reasons compaction may not have produced a visible change so the
+/// UI can give the user honest feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactOutcome {
+    /// Compaction ran and shrank the message log.
+    Compacted,
+    /// Context is currently within budget; compaction was a no-op by design.
+    WithinBudget,
+    /// Compaction was skipped because the cooldown is still active —
+    /// surfacing this lets the UI say so instead of pretending we ran.
+    CooldownActive,
+}
+
 #[derive(Debug)]
 pub struct NoModelConfiguredError;
 
@@ -687,6 +701,70 @@ pub enum ThreadEvent {
     Stop(acp::StopReason),
 }
 
+/// Synthetic guardrail prefixes the agent emits in place of a real tool
+/// result when it has rejected the call itself (permission, circuit
+/// breaker, loop detector, missing tool, etc). Counting these as failures
+/// in the circuit breaker is a feedback loop: a single guardrail trip
+/// would itself trip the breaker on the next turn. Pulled out so the
+/// prefix list can be unit-tested without spinning up a Thread.
+pub(crate) const SYNTHETIC_GUARDRAIL_PREFIXES: &[&str] = &[
+    "PERMISSION DENIED:",
+    "CIRCUIT BREAKER:",
+    "LOOP DETECTED:",
+    "RUNAWAY LOOP:",
+    "No tool named ",
+];
+
+pub(crate) fn is_synthetic_guardrail_text(text: &str) -> bool {
+    SYNTHETIC_GUARDRAIL_PREFIXES
+        .iter()
+        .any(|p| text.starts_with(p))
+}
+
+/// Bug C6 helper: atomic file write. Writes `bytes` to a sibling tempfile
+/// in the same directory, fsync's it, then `rename`s into `path`. On POSIX
+/// the rename is atomic on the same filesystem, so a concurrent reader
+/// either sees the previous full file or the new full file — never a
+/// half-written one. The previous code used `std::fs::write` which can
+/// produce a partial file if the writer is interrupted or interleaved
+/// with another writer.
+pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "atomic_write: path has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(dir)?;
+    // Build a unique sibling tmp name. Using thread id + nanosecond
+    // counter is sufficient since (a) single-process and (b) the rename
+    // step is what makes the operation atomic. Avoids pulling tempfile
+    // into agent's runtime dependency graph.
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let pid = std::process::id();
+    let nonce = ATOMIC_WRITE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = dir.join(format!(".{}.{}.{}.atomic-tmp", stem, pid, nonce));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+static ATOMIC_WRITE_NONCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug)]
 pub struct NewTerminal {
     pub command: String,
@@ -1002,6 +1080,9 @@ pub struct Thread {
     cached_project_instructions: Option<String>,
     /// Loop detection: blocks Nth consecutive same-tool call
     loop_detector: caduceus_bridge::safety::LoopDetector,
+    /// Escalation counter — number of consecutive loop detections without recovery.
+    /// After hitting `LOOP_ESCALATION_THRESHOLD`, the entire turn is hard-cancelled.
+    loop_escalation_count: usize,
     /// Circuit breaker: trips after N consecutive tool failures
     circuit_breaker: caduceus_bridge::safety::CircuitBreaker,
     /// Compaction cooldown: prevents double-fire within cooldown window
@@ -1014,8 +1095,21 @@ pub struct Thread {
     context_pins: caduceus_bridge::orchestrator::ContextManager,
     /// Task DAG for multi-agent decomposition (per-thread, not global)
     task_dag: std::sync::Arc<std::sync::Mutex<caduceus_bridge::orchestrator::TaskDAG>>,
-    /// Cached total token estimate (invalidated on message changes)
-    cached_token_estimate: Option<u32>,
+    /// Cached total token estimate (invalidated on message changes).
+    /// `Cell` allows population from `&self` callers — the cached value is
+    /// observation-only state and never affects logical equality of Thread.
+    cached_token_estimate: std::cell::Cell<Option<u32>>,
+    /// Set true by `cancel()`; cleared at the start of `run_turn()`. Used by
+    /// `flush_pending_message` to skip auto-memory extraction (which races
+    /// with the next turn's `activeContext.md` writes) when the flush was
+    /// triggered by a cancellation rather than a normal turn end.
+    last_turn_cancelled: bool,
+    /// Monotonic counter bumped on every cancel/new-turn boundary.
+    /// `pub(crate)` accessor below for test visibility.
+    /// Deferred async work captures the value at scheduling time and bails
+    /// out if the counter has advanced — preventing stale callbacks from
+    /// the previous turn from clobbering state in a fresh turn.
+    turn_generation: u64,
 }
 
 impl Thread {
@@ -1138,7 +1232,8 @@ impl Thread {
             running_subagents: Vec::new(),
             caduceus_mode: None,
             cached_project_instructions: None,
-            loop_detector: caduceus_bridge::safety::LoopDetector::new(3),
+            loop_detector: caduceus_bridge::safety::LoopDetector::new(5),
+            loop_escalation_count: 0,
             circuit_breaker: caduceus_bridge::safety::CircuitBreaker::new(5),
             compaction_cooldown: caduceus_bridge::safety::CompactionCooldown::new(
                 std::time::Duration::from_secs(30),
@@ -1147,7 +1242,9 @@ impl Thread {
             context_compacted_this_turn: false,
             context_pins: caduceus_bridge::orchestrator::ContextManager::new(128000),
             task_dag: std::sync::Arc::new(std::sync::Mutex::new(caduceus_bridge::orchestrator::TaskDAG::new())),
-            cached_token_estimate: None,
+            cached_token_estimate: std::cell::Cell::new(None),
+            turn_generation: 0,
+            last_turn_cancelled: false,
         }
     }
 
@@ -1384,7 +1481,8 @@ impl Thread {
             running_subagents: Vec::new(),
             caduceus_mode: None,
             cached_project_instructions: None,
-            loop_detector: caduceus_bridge::safety::LoopDetector::new(3),
+            loop_detector: caduceus_bridge::safety::LoopDetector::new(5),
+            loop_escalation_count: 0,
             circuit_breaker: caduceus_bridge::safety::CircuitBreaker::new(5),
             compaction_cooldown: caduceus_bridge::safety::CompactionCooldown::new(
                 std::time::Duration::from_secs(30),
@@ -1393,7 +1491,9 @@ impl Thread {
             context_compacted_this_turn: false,
             context_pins: caduceus_bridge::orchestrator::ContextManager::new(128000),
             task_dag: std::sync::Arc::new(std::sync::Mutex::new(caduceus_bridge::orchestrator::TaskDAG::new())),
-            cached_token_estimate: None,
+            cached_token_estimate: std::cell::Cell::new(None),
+            turn_generation: 0,
+            last_turn_cancelled: false,
         }
     }
 
@@ -1636,24 +1736,13 @@ impl Thread {
     }
 
     /// Caduceus: estimate total tokens across all messages (DRY helper).
-    fn estimate_total_tokens(&self) -> u32 {
-        if let Some(cached) = self.cached_token_estimate {
+    /// `pub(crate)` for test visibility — bug C5 tests verify the cache
+    /// is invalidated when messages change. Populates the cache on read
+    /// via `Cell` interior mutability so subsequent calls are O(1).
+    pub(crate) fn estimate_total_tokens(&self) -> u32 {
+        if let Some(cached) = self.cached_token_estimate.get() {
             return cached;
         }
-        use caduceus_bridge::orchestrator::count_tokens_exact as estimate_tokens;
-        self.messages.iter().map(|m| match m {
-            Message::User(u) => u.content.iter().map(|c| match c {
-                UserMessageContent::Text(t) => caduceus_bridge::orchestrator::count_tokens_exact(t),
-                _ => 10,
-            }).sum::<u32>(),
-            Message::Agent(a) => caduceus_bridge::orchestrator::count_tokens_exact(&a.to_markdown()),
-            Message::Resume => 0,
-        }).sum()
-    }
-
-    /// Recompute and cache the token estimate (call after message changes)
-    fn refresh_token_cache(&mut self) {
-        use caduceus_bridge::orchestrator::count_tokens_exact as estimate_tokens;
         let total: u32 = self.messages.iter().map(|m| match m {
             Message::User(u) => u.content.iter().map(|c| match c {
                 UserMessageContent::Text(t) => caduceus_bridge::orchestrator::count_tokens_exact(t),
@@ -1662,12 +1751,32 @@ impl Thread {
             Message::Agent(a) => caduceus_bridge::orchestrator::count_tokens_exact(&a.to_markdown()),
             Message::Resume => 0,
         }).sum();
-        self.cached_token_estimate = Some(total);
+        self.cached_token_estimate.set(Some(total));
+        total
     }
 
-    /// Invalidate cached token estimate (call when messages change)
-    fn invalidate_token_cache(&mut self) {
-        self.cached_token_estimate = None;
+    /// Invalidate cached token estimate (call when messages change).
+    /// `pub(crate)` for test visibility — see C5 regression tests.
+    pub(crate) fn invalidate_token_cache(&mut self) {
+        self.cached_token_estimate.set(None);
+    }
+
+    /// Test-only: read whether the last turn was cancelled (Bug #14 gate).
+    #[cfg(test)]
+    pub(crate) fn last_turn_cancelled_for_test(&self) -> bool {
+        self.last_turn_cancelled
+    }
+
+    /// Test-only: read the current turn generation counter (Bug C2).
+    #[cfg(test)]
+    pub(crate) fn turn_generation_for_test(&self) -> u64 {
+        self.turn_generation
+    }
+
+    /// Test-only: peek at cached token estimate without recomputing.
+    #[cfg(test)]
+    pub(crate) fn cached_token_estimate_for_test(&self) -> Option<u32> {
+        self.cached_token_estimate.get()
     }
 
     /// Caduceus: estimate current context zone based on token usage.
@@ -1685,6 +1794,24 @@ impl Thread {
     pub(crate) fn auto_compact_context(&mut self, cx: &mut Context<Self>) -> bool {
         let zone = self.current_context_zone();
         self.auto_compact_context_with_zone(zone, cx)
+    }
+
+    /// Same as `auto_compact_context` but distinguishes between the three
+    /// possible outcomes so UI/slash-command handlers can give the user
+    /// honest feedback (e.g. "didn't run because cooldown" vs "ran but
+    /// nothing to do").
+    pub(crate) fn auto_compact_context_explained(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> CompactOutcome {
+        if !self.compaction_cooldown.can_compact() {
+            return CompactOutcome::CooldownActive;
+        }
+        if self.auto_compact_context(cx) {
+            CompactOutcome::Compacted
+        } else {
+            CompactOutcome::WithinBudget
+        }
     }
 
     /// Same as auto_compact_context but accepts a pre-computed zone to avoid recomputation.
@@ -1706,7 +1833,6 @@ impl Thread {
         let fill_pct = if max_context == 0 { 0.0 } else { (total_tokens as f64 / max_context as f64) * 100.0 };
 
         let msg_count = self.messages.len();
-
         // Decide whether to compact based on zone + message count
         let (should_compact, keep_recent) = match zone {
             ContextZone::Green => {
@@ -1743,6 +1869,13 @@ impl Thread {
         // Guard: zero-budget means model lookup failed — don't compact
         let budget = if max_context == 0 {
             log::warn!("[caduceus] max_context is 0 — skipping compaction");
+            caduceus_bridge::context_events::record_and_count(
+                caduceus_bridge::context_events::ContextEventKind::CompactionSkipped {
+                    reason: "zero budget (model max_context unknown)".into(),
+                    fill_pct,
+                    msg_count,
+                },
+            );
             return false;
         } else {
             (max_context as usize) / 4
@@ -1810,6 +1943,13 @@ impl Thread {
             || summary.lines().all(|l| l.contains("[tool calls executed]") || l.contains("[session resumed]"))
         {
             log::warn!("[caduceus] Compaction produced degenerate summary — aborting");
+            caduceus_bridge::context_events::record_and_count(
+                caduceus_bridge::context_events::ContextEventKind::CompactionSkipped {
+                    reason: "degenerate summary (only tool/system messages)".into(),
+                    fill_pct,
+                    msg_count,
+                },
+            );
             return false;
         }
 
@@ -1860,6 +2000,18 @@ impl Thread {
 
         self.compaction_cooldown.record_compaction();
         self.context_compacted_this_turn = true;
+        let tokens_freed = total_tokens.saturating_sub(
+            caduceus_bridge::orchestrator::count_tokens_exact(&summary),
+        ) as usize;
+        caduceus_bridge::context_events::record_and_count(
+            caduceus_bridge::context_events::ContextEventKind::AutoCompacted {
+                messages_compacted: messages_to_compact,
+                tokens_freed,
+                fill_pct,
+                zone: format!("{:?}", zone),
+                keep_recent,
+            },
+        );
         true
     }
 
@@ -2104,6 +2256,16 @@ impl Thread {
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        // Reset safety counters so the next turn starts fresh
+        self.loop_escalation_count = 0;
+        // Mark this turn as cancelled so flush_pending_message skips
+        // auto-memory extraction (it would race the next turn's
+        // activeContext.md writer).
+        self.last_turn_cancelled = true;
+        // Bump generation: any in-flight callbacks scheduled before this point
+        // will see a stale generation and bail out instead of mutating new-turn state.
+        self.turn_generation = self.turn_generation.wrapping_add(1);
+        let cancel_generation = self.turn_generation;
         for subagent in self.running_subagents.drain(..) {
             if let Some(subagent) = subagent.upgrade() {
                 subagent.update(cx, |thread, cx| thread.cancel(cx)).detach();
@@ -2120,7 +2282,11 @@ impl Thread {
         cx.spawn(async move |this, cx| {
             turn_task.await;
             this.update(cx, |this, cx| {
-                this.flush_pending_message(cx);
+                // Only flush if no new turn started in the meantime — otherwise
+                // we'd flush the *new* turn's pending message into history.
+                if this.turn_generation == cancel_generation {
+                    this.flush_pending_message(cx);
+                }
             })
             .ok();
         })
@@ -2156,6 +2322,7 @@ impl Thread {
             return Err(anyhow!("Message not found"));
         };
 
+        let evicted_count = self.messages.len() - position;
         for message in self.messages.drain(position..) {
             match message {
                 Message::User(message) => {
@@ -2164,6 +2331,15 @@ impl Thread {
                 Message::Agent(_) | Message::Resume => {}
             }
         }
+        if evicted_count > 0 {
+            caduceus_bridge::context_events::record_and_count(
+                caduceus_bridge::context_events::ContextEventKind::MessageEvicted {
+                    count: evicted_count,
+                    reason: "user truncated to earlier message".into(),
+                },
+            );
+        }
+        self.invalidate_token_cache();
         self.clear_summary();
         cx.notify();
         Ok(())
@@ -2243,6 +2419,7 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
         self.messages.push(Message::Resume);
+        self.invalidate_token_cache();
         cx.notify();
 
         log::debug!("Total messages in thread: {}", self.messages.len());
@@ -2266,6 +2443,7 @@ impl Thread {
 
         self.messages
             .push(Message::User(UserMessage { id, content }));
+        self.invalidate_token_cache();
         cx.notify();
 
         self.send_existing(cx)
@@ -2299,6 +2477,7 @@ impl Thread {
             .collect::<Vec<_>>();
         self.messages
             .push(Message::User(UserMessage { id, content }));
+        self.invalidate_token_cache();
         cx.notify();
     }
 
@@ -2320,6 +2499,7 @@ impl Thread {
             content: vec![AgentMessageContent::Text(text)],
             ..Default::default()
         }));
+        self.invalidate_token_cache();
         cx.notify();
     }
 
@@ -2329,12 +2509,24 @@ impl Thread {
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
         // Reset per-turn UI state
         self.context_compacted_this_turn = false;
+        // Bump generation: flagged callbacks scheduled by the prior turn (cancel
+        // cleanup, auto-extract, etc.) will see a stale generation and exit.
+        self.turn_generation = self.turn_generation.wrapping_add(1);
         // Clean stale guardrail alert from memory
         if self.guardrail_alert.as_ref().is_some_and(|(_, _, ts)| {
             ts.elapsed() >= std::time::Duration::from_secs(10)
         }) {
             self.guardrail_alert = None;
         }
+
+        // Flush the old pending message synchronously before cancelling, so the
+        // detached cancel task can't flush stale state into the new turn.
+        // This must happen BEFORE auto_compact so any in-flight tool_results
+        // become part of a complete message and don't get orphaned by the drain
+        // (compaction would otherwise leave tool_results without their owning
+        // ToolUse, producing invalid LLM requests).
+        self.flush_pending_message(cx);
+        self.cancel(cx).detach();
 
         // Caduceus: check context zone and warn user
         let zone = self.current_context_zone();
@@ -2345,19 +2537,18 @@ impl Thread {
             _ => {}
         }
 
-        // Caduceus: auto-compact context — pass pre-computed zone to avoid recomputation
+        // Caduceus: auto-compact context — pass pre-computed zone to avoid recomputation.
+        // Runs AFTER flush so message history is consistent (no orphan tool_results).
         self.auto_compact_context_with_zone(zone, cx);
-
-        // Flush the old pending message synchronously before cancelling,
-        // to avoid a race where the detached cancel task might flush the NEW
-        // turn's pending message instead of the old one.
-        self.flush_pending_message(cx);
-        self.cancel(cx).detach();
 
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream(events_tx);
         let message_ix = self.messages.len().saturating_sub(1);
         self.clear_summary();
+        // Clear the cancelled-flag so that this turn ending normally will be
+        // allowed to extract auto-memories. (Set by `cancel()` if a previous
+        // turn was aborted.)
+        self.last_turn_cancelled = false;
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
         self.running_turn = Some(RunningTurn {
             event_stream: event_stream.clone(),
@@ -2641,9 +2832,11 @@ impl Thread {
         this.update(cx, |this, _cx| {
             // Caduceus: track consecutive failures for circuit breaker.
             // Skip synthetic guardrail results (permission denied, circuit breaker,
-            // loop detected) — these are not real tool failures.
+            // loop detected, missing tool) — these are not real tool failures.
+            // Counting them feeds back into the breaker: a single guardrail
+            // trip would itself trip the breaker on the next turn.
             let is_synthetic_guardrail = if let LanguageModelToolResultContent::Text(t) = &tool_result.content {
-                t.starts_with("PERMISSION DENIED:") || t.starts_with("CIRCUIT BREAKER:") || t.starts_with("LOOP DETECTED:")
+                is_synthetic_guardrail_text(t)
             } else {
                 false
             };
@@ -2891,28 +3084,76 @@ impl Thread {
             }));
         }
 
-        // Caduceus: loop detection — prevent same tool being called too many times consecutively
+        // Caduceus: loop detection — prevent same tool being called too many times consecutively.
+        // Escalation: after LOOP_ESCALATION_THRESHOLD consecutive loop detections without recovery,
+        // hard-cancel the entire turn to avoid runaway tool storms.
+        const LOOP_ESCALATION_THRESHOLD: usize = 3;
         {
             let tool_name = tool_use.name.as_ref();
-            if let caduceus_bridge::safety::LoopCheckResult::LoopDetected(name) =
-                self.loop_detector.record_tool(tool_name)
-            {
-                log::warn!("[caduceus] Loop detected: {} called too many times consecutively", name);
-                self.guardrail_alert = Some((
-                    format!("⚠️ Loop detected: {} called too many times — trying different approach", name),
-                    AlertSeverity::Warning,
-                    std::time::Instant::now(),
-                ));
-                cx.notify();
-                return Some(Task::ready(LanguageModelToolResult {
-                    content: LanguageModelToolResultContent::Text(Arc::from(
-                        format!("LOOP DETECTED: {} called too many times in a row. Try a different approach.", name)
-                    )),
-                    tool_use_id: tool_use.id,
-                    tool_name: tool_use.name,
-                    is_error: true,
-                    output: None,
-                }));
+            let input_repr = tool_use.input.to_string();
+            match self.loop_detector.record_call(tool_name, &input_repr) {
+                caduceus_bridge::safety::LoopCheckResult::LoopDetected(name) => {
+                    self.loop_escalation_count += 1;
+                    log::warn!(
+                        "[caduceus] Loop detected: {} called too many times consecutively (escalation {}/{})",
+                        name, self.loop_escalation_count, LOOP_ESCALATION_THRESHOLD
+                    );
+
+                    if self.loop_escalation_count >= LOOP_ESCALATION_THRESHOLD {
+                        // Hard stop: cancel the entire turn on next tick to avoid reentrancy.
+                        log::error!(
+                            "[caduceus] Loop escalation limit reached ({}× in a row) — cancelling turn",
+                            self.loop_escalation_count
+                        );
+                        self.guardrail_alert = Some((
+                            format!(
+                                "🛑 Runaway loop: {} fired {}× — turn cancelled. Try a different prompt.",
+                                name, self.loop_escalation_count
+                            ),
+                            AlertSeverity::Error,
+                            std::time::Instant::now(),
+                        ));
+                        self.loop_escalation_count = 0;
+                        cx.notify();
+                        // Defer cancel to next tick so we don't reenter the running update.
+                        cx.spawn(async move |this, cx| {
+                            this.update(cx, |this, cx| {
+                                this.cancel(cx).detach();
+                            })
+                            .ok();
+                        })
+                        .detach();
+                        return Some(Task::ready(LanguageModelToolResult {
+                            content: LanguageModelToolResultContent::Text(Arc::from(
+                                format!("RUNAWAY LOOP: {} called repeatedly. Turn cancelled by safety guardrail. Wait for the user to provide a new prompt.", name)
+                            )),
+                            tool_use_id: tool_use.id,
+                            tool_name: tool_use.name,
+                            is_error: true,
+                            output: None,
+                        }));
+                    }
+
+                    self.guardrail_alert = Some((
+                        format!("⚠️ Loop detected: {} called too many times — trying different approach", name),
+                        AlertSeverity::Warning,
+                        std::time::Instant::now(),
+                    ));
+                    cx.notify();
+                    return Some(Task::ready(LanguageModelToolResult {
+                        content: LanguageModelToolResultContent::Text(Arc::from(
+                            format!("LOOP DETECTED: {} called too many times in a row. Try a different approach.", name)
+                        )),
+                        tool_use_id: tool_use.id,
+                        tool_name: tool_use.name,
+                        is_error: true,
+                        output: None,
+                    }));
+                }
+                caduceus_bridge::safety::LoopCheckResult::Ok => {
+                    // Recovery: any successful tool dispatch resets escalation.
+                    self.loop_escalation_count = 0;
+                }
             }
         }
 
@@ -3338,8 +3579,11 @@ impl Thread {
         self.clear_summary();
         self.invalidate_token_cache();
 
-        // Only extract memories from complete turns (not cancellations)
-        if self.running_turn.is_none() {
+        // Only extract memories from clean, non-cancelled turn ends.
+        // Both gates required: running_turn must be cleared (turn over) AND
+        // the previous turn must not have been cancelled (otherwise the
+        // background extractor races the next turn's activeContext.md writes).
+        if self.running_turn.is_none() && !self.last_turn_cancelled {
             self.auto_extract_memories(cx);
         }
 
@@ -3437,7 +3681,10 @@ impl Thread {
                          *Auto-generated — do not commit*\n",
                         mode, msg_count, tool_count, goal_short
                     );
-                    let _ = std::fs::write(ctx_dir.join("activeContext.md"), content);
+                    // Bug C6: write atomically (tmp + rename) so a reader
+                    // (or a racing writer from a sibling subagent) never
+                    // observes a half-written activeContext.md.
+                    let _ = atomic_write(&ctx_dir.join("activeContext.md"), content.as_bytes());
                 })
                 .detach();
         }
@@ -3620,7 +3867,35 @@ impl Thread {
         self.tools.keys().cloned().collect()
     }
 
-    pub(crate) fn register_running_subagent(&mut self, subagent: WeakEntity<Thread>) {
+    pub(crate) fn register_running_subagent(
+        &mut self,
+        subagent: WeakEntity<Thread>,
+        cx: &App,
+    ) {
+        // Record parent → child spawn in the global Index DAG so the IDE
+        // panel can show the full agent tree (not just resource accesses).
+        let parent_id = self.id.0.to_string();
+        let parent_kind = if self.is_subagent() {
+            caduceus_bridge::index_dag::AgentKind::Subagent
+        } else {
+            caduceus_bridge::index_dag::AgentKind::User
+        };
+        // Sonnet #1: child id MUST be the SessionId (same id-space as the
+        // child's index access events) — otherwise spawn edges and access
+        // edges live in disjoint id namespaces and the DAG cannot join
+        // "user spawned X" with "X read semantic_index". Only fall back
+        // to entity_id when the child has been dropped — preserves the
+        // edge but flags the divergence in the label so it's debuggable.
+        let child_id = subagent
+            .upgrade()
+            .map(|s| s.read(cx).id().0.to_string())
+            .unwrap_or_else(|| format!("entity:{}", subagent.entity_id().as_u64()));
+        caduceus_bridge::index_dag::record_spawn(
+            parent_id,
+            parent_kind,
+            child_id,
+            caduceus_bridge::index_dag::AgentKind::Subagent,
+        );
         self.running_subagents.push(subagent);
     }
 
@@ -3629,6 +3904,11 @@ impl Thread {
         subagent_session_id: &acp::SessionId,
         cx: &App,
     ) {
+        // Sonnet #7: prune the spawn edge for this child so the DAG
+        // doesn't show a ghost edge for an agent that's no longer running.
+        // Using SessionId here matches the id-space chosen in
+        // register_running_subagent (Sonnet #1).
+        caduceus_bridge::index_dag::remove_spawn(&subagent_session_id.0.to_string());
         self.running_subagents.retain(|s| {
             s.upgrade()
                 .map_or(false, |s| s.read(cx).id() != subagent_session_id)
@@ -5022,8 +5302,8 @@ mod tests {
             let mut subagents = Vec::new();
             for _ in 0..count {
                 let subagent = cx.new(|cx| Thread::new_subagent(parent, cx));
-                parent.update(cx, |thread, _cx| {
-                    thread.register_running_subagent(subagent.downgrade());
+                parent.update(cx, |thread, cx| {
+                    thread.register_running_subagent(subagent.downgrade(), cx);
                 });
                 subagents.push(subagent);
             }
@@ -5291,5 +5571,167 @@ mod tests {
             );
             assert!(last_message.tool_results.contains_key(&tool_use_id));
         })
+    }
+}
+
+#[cfg(test)]
+mod synthetic_guardrail_tests {
+    use super::*;
+
+    /// Regression for bug #13: the circuit breaker used to count synthetic
+    /// guardrail responses (RUNAWAY LOOP, No tool named, etc.) as real tool
+    /// failures. A single guardrail trip would then immediately trip the
+    /// breaker on the next turn, hard-stopping the agent for what was
+    /// effectively self-caused. The classifier must recognize all of these.
+    #[test]
+    fn classifies_runaway_loop_as_synthetic() {
+        assert!(is_synthetic_guardrail_text(
+            "RUNAWAY LOOP: edit_file called repeatedly. Turn cancelled by safety guardrail."
+        ));
+    }
+
+    #[test]
+    fn classifies_no_tool_named_as_synthetic() {
+        assert!(is_synthetic_guardrail_text("No tool named foobar exists"));
+    }
+
+    #[test]
+    fn classifies_loop_detected_as_synthetic() {
+        assert!(is_synthetic_guardrail_text(
+            "LOOP DETECTED: input hash repeated 5 times"
+        ));
+    }
+
+    #[test]
+    fn classifies_circuit_breaker_as_synthetic() {
+        assert!(is_synthetic_guardrail_text(
+            "CIRCUIT BREAKER: 5 consecutive tool failures"
+        ));
+    }
+
+    #[test]
+    fn classifies_permission_denied_as_synthetic() {
+        assert!(is_synthetic_guardrail_text("PERMISSION DENIED: foo"));
+    }
+
+    /// Real tool errors must NOT be misclassified as synthetic — otherwise
+    /// the circuit breaker would never trip and an agent stuck on a broken
+    /// tool would loop forever.
+    #[test]
+    fn does_not_misclassify_real_tool_errors() {
+        assert!(!is_synthetic_guardrail_text("Failed to read file: not found"));
+        assert!(!is_synthetic_guardrail_text("HTTP 500: upstream error"));
+        assert!(!is_synthetic_guardrail_text(""));
+        assert!(!is_synthetic_guardrail_text(
+            "  PERMISSION DENIED: leading whitespace shouldn't trigger"
+        ));
+    }
+
+    /// Strings that mention guardrail keywords but don't begin with the
+    /// exact prefix must not collide. The fix uses `starts_with`, not
+    /// `contains`, on purpose.
+    #[test]
+    fn requires_prefix_match_not_contains() {
+        assert!(!is_synthetic_guardrail_text(
+            "Tool output mentioned RUNAWAY LOOP: in passing"
+        ));
+        assert!(!is_synthetic_guardrail_text(
+            "Some message ending in CIRCUIT BREAKER: foo"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::atomic_write;
+
+    /// Bug C6: a basic write must produce the exact bytes.
+    #[test]
+    fn writes_bytes_to_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ctx.md");
+        atomic_write(&p, b"hello").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+    }
+
+    /// Atomic write must replace an existing file in-place — and the
+    /// reader must see only the OLD or only the NEW content, never
+    /// a partial mix.
+    #[test]
+    fn replaces_existing_file_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ctx.md");
+        std::fs::write(&p, b"old content original").unwrap();
+        atomic_write(&p, b"new").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new");
+    }
+
+    /// Concurrent atomic_write calls from many threads must each leave
+    /// the file in a fully-written state (one of the inputs, never a
+    /// truncation or a mix). This is exactly the regression bug C6
+    /// targets — the old `std::fs::write` could leave a half-written
+    /// file when interleaved.
+    #[test]
+    fn concurrent_writers_never_produce_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ctx.md");
+        let payloads: Vec<Vec<u8>> = (0..16)
+            .map(|i| format!("payload-{i:04}-{}", "x".repeat(2048)).into_bytes())
+            .collect();
+
+        let path_arc = std::sync::Arc::new(p);
+        let payloads_arc = std::sync::Arc::new(payloads.clone());
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let p = path_arc.clone();
+                let pl = payloads_arc.clone();
+                std::thread::spawn(move || {
+                    atomic_write(&p, &pl[i]).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Final file must be byte-equal to ONE of the payloads.
+        let final_bytes = std::fs::read(&*path_arc).unwrap();
+        assert!(
+            payloads.iter().any(|p| p == &final_bytes),
+            "atomic_write produced a partial / mixed file (len {})",
+            final_bytes.len()
+        );
+    }
+
+    /// Concurrent reader-during-writer: a reader that opens the file
+    /// while a writer is renaming over it must see the OLD bytes (or
+    /// the NEW bytes) — never a truncated read.
+    #[test]
+    fn reader_during_write_sees_full_old_or_full_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ctx.md");
+        let old = vec![b'A'; 4096];
+        let new = vec![b'B'; 4096];
+        std::fs::write(&p, &old).unwrap();
+
+        let p_writer = p.clone();
+        let new_for_writer = new.clone();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..50 {
+                atomic_write(&p_writer, &new_for_writer).unwrap();
+            }
+        });
+
+        for _ in 0..200 {
+            if let Ok(bytes) = std::fs::read(&p) {
+                assert!(
+                    bytes == old || bytes == new,
+                    "reader saw partial file: len={}",
+                    bytes.len()
+                );
+            }
+        }
+        writer.join().unwrap();
     }
 }

@@ -369,12 +369,28 @@ impl AgentTool for CaduceusApiRegistryTool {
                         }
                         text.push_str(&format!("- **Endpoints**: {}\n", api.endpoint_count));
 
-                        // Try to show a preview of the schema file
-                        let path = PathBuf::from(&api.file_path);
-                        if path.exists() {
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                let preview: String = content.chars().take(1000).collect();
-                                text.push_str(&format!("\n### Preview\n```\n{preview}\n```\n"));
+                        // Try to show a preview of the schema file —
+                        // canonicalize and contain to project root before reading
+                        // so that an attacker who edits .caduceus/apis.json (or
+                        // a symlink it points at) cannot make us read /etc/passwd.
+                        let raw = PathBuf::from(&api.file_path);
+                        let project_canonical = self
+                            .project_root
+                            .canonicalize()
+                            .unwrap_or_else(|_| self.project_root.clone());
+                        let candidate = if raw.is_absolute() {
+                            raw.clone()
+                        } else {
+                            self.project_root.join(&raw)
+                        };
+                        if let Ok(canonical) = candidate.canonicalize() {
+                            if canonical.starts_with(&project_canonical)
+                                && !crate::tools::is_sensitive_file(&canonical.to_string_lossy())
+                            {
+                                if let Ok(content) = std::fs::read_to_string(&canonical) {
+                                    let preview: String = content.chars().take(1000).collect();
+                                    text.push_str(&format!("\n### Preview\n```\n{preview}\n```\n"));
+                                }
                             }
                         }
 

@@ -7,18 +7,21 @@ use std::time::{Duration, Instant};
 
 // ── Loop Detector ──────────────────────────────────────────────────────────────
 
-/// Detects when the same tool is called too many times consecutively.
+/// Detects when the same tool is called too many times consecutively
+/// **with identical inputs**. Different inputs (e.g. parallel `edit_file`
+/// on different files) are treated as legitimate concurrent work.
 ///
 /// Semantics: the detector fires when the count reaches `threshold`.
 /// The count starts at 1 on the first call and increments on each
-/// consecutive call of the same tool. A different tool resets the count.
+/// consecutive call of the same `(tool_name, input_hash)`. Any change
+/// to either name or input hash resets the count.
 ///
 /// In `thread.rs`, the check happens BEFORE incrementing, so:
-/// - threshold=3 means the 4th consecutive call is blocked
+/// - threshold=3 means the 4th identical call is blocked
 ///   (count=3 when checked → blocked, then reset)
 #[derive(Debug, Clone)]
 pub struct LoopDetector {
-    current_tool: Option<String>,
+    current_key: Option<(String, u64)>,
     consecutive_count: usize,
     threshold: usize,
 }
@@ -36,19 +39,36 @@ impl LoopDetector {
     pub fn new(threshold: usize) -> Self {
         assert!(threshold > 0, "LoopDetector threshold must be > 0");
         Self {
-            current_tool: None,
+            current_key: None,
             consecutive_count: 0,
             threshold,
         }
     }
 
-    /// Record a tool call. Returns `LoopDetected` if the same tool has been
-    /// called `threshold` times consecutively (checked BEFORE this call
-    /// increments the counter — matching thread.rs semantics).
+    /// Hash the tool input — used to distinguish parallel calls with
+    /// different inputs from genuine retry loops.
+    fn hash_input(input: &str) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        input.hash(&mut h);
+        h.finish()
+    }
+
+    /// Record a tool call by name only (legacy — assumes empty input).
+    /// Prefer `record_call(name, input)` for accurate loop detection.
     pub fn record_tool(&mut self, tool_name: &str) -> LoopCheckResult {
-        // Check BEFORE incrementing (thread.rs semantics)
-        let is_loop = match &self.current_tool {
-            Some(prev) => prev == tool_name && self.consecutive_count >= self.threshold,
+        self.record_call(tool_name, "")
+    }
+
+    /// Record a tool call with its serialized input. Returns `LoopDetected`
+    /// only if the same `(tool_name, input)` pair has been seen `threshold`
+    /// times consecutively.
+    pub fn record_call(&mut self, tool_name: &str, input: &str) -> LoopCheckResult {
+        let key = (tool_name.to_string(), Self::hash_input(input));
+
+        let is_loop = match &self.current_key {
+            Some(prev) => *prev == key && self.consecutive_count >= self.threshold,
             None => false,
         };
 
@@ -57,13 +77,12 @@ impl LoopDetector {
             return LoopCheckResult::LoopDetected(tool_name.to_string());
         }
 
-        // Update tracking
-        match &self.current_tool {
-            Some(prev) if prev == tool_name => {
+        match &self.current_key {
+            Some(prev) if *prev == key => {
                 self.consecutive_count += 1;
             }
             _ => {
-                self.current_tool = Some(tool_name.to_string());
+                self.current_key = Some(key);
                 self.consecutive_count = 1;
             }
         }
@@ -73,11 +92,11 @@ impl LoopDetector {
 
     /// Reset the detector (called internally after loop detection).
     fn reset(&mut self) {
-        self.current_tool = None;
+        self.current_key = None;
         self.consecutive_count = 0;
     }
 
-    /// Current consecutive count for the active tool.
+    /// Current consecutive count for the active (tool, input) pair.
     pub fn consecutive_count(&self) -> usize {
         self.consecutive_count
     }
@@ -259,6 +278,47 @@ mod tests {
     #[should_panic(expected = "threshold must be > 0")]
     fn loop_detector_rejects_zero_threshold() {
         LoopDetector::new(0);
+    }
+
+    #[test]
+    fn loop_detector_parallel_different_inputs_not_a_loop() {
+        // Modern LLMs return parallel tool calls (e.g. edit_file on 5 different files).
+        // These must NOT be flagged as a loop.
+        let mut ld = LoopDetector::new(3);
+        assert_eq!(
+            ld.record_call("edit_file", r#"{"path":"a.rs","old":"x","new":"y"}"#),
+            LoopCheckResult::Ok
+        );
+        assert_eq!(
+            ld.record_call("edit_file", r#"{"path":"b.rs","old":"x","new":"y"}"#),
+            LoopCheckResult::Ok
+        );
+        assert_eq!(
+            ld.record_call("edit_file", r#"{"path":"c.rs","old":"x","new":"y"}"#),
+            LoopCheckResult::Ok
+        );
+        assert_eq!(
+            ld.record_call("edit_file", r#"{"path":"d.rs","old":"x","new":"y"}"#),
+            LoopCheckResult::Ok
+        );
+        assert_eq!(
+            ld.record_call("edit_file", r#"{"path":"e.rs","old":"x","new":"y"}"#),
+            LoopCheckResult::Ok
+        );
+    }
+
+    #[test]
+    fn loop_detector_identical_input_is_a_loop() {
+        // Same tool, identical input N times = real retry loop.
+        let mut ld = LoopDetector::new(3);
+        let input = r#"{"path":"a.rs","old":"x","new":"y"}"#;
+        assert_eq!(ld.record_call("edit_file", input), LoopCheckResult::Ok); // 1
+        assert_eq!(ld.record_call("edit_file", input), LoopCheckResult::Ok); // 2
+        assert_eq!(ld.record_call("edit_file", input), LoopCheckResult::Ok); // 3
+        assert_eq!(
+            ld.record_call("edit_file", input),
+            LoopCheckResult::LoopDetected("edit_file".to_string())
+        ); // 4 → blocked
     }
 
     // ── CircuitBreaker ─────────────────────────────────────────────────────

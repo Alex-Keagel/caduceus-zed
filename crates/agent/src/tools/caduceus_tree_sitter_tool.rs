@@ -208,6 +208,11 @@ impl AgentTool for CaduceusTreeSitterTool {
                             error: "Path traversal or absolute paths not allowed".to_string(),
                         });
                     }
+                    if crate::tools::is_sensitive_file(&path) {
+                        return Err(CaduceusTreeSitterToolOutput::Error {
+                            error: format!("Cannot read sensitive file: {path}"),
+                        });
+                    }
                     let content = std::fs::read_to_string(&path).map_err(|e| {
                         CaduceusTreeSitterToolOutput::Error {
                             error: format!("Cannot read {path}: {e}"),

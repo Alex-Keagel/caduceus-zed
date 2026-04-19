@@ -126,23 +126,69 @@ impl CaduceusProjectWikiTool {
     }
 
     fn list_pages_recursive(&self, dir: &Path, prefix: &str) -> Vec<String> {
-        let mut pages = Vec::new();
+        // Bounded DFS with symlink-loop guard. We cap directory recursion at
+        // MAX_DEPTH segments and skip any entry whose canonical path we've
+        // already visited (defends against `a -> b -> a` symlink cycles and
+        // pathologically deep trees). Without these guards a malicious project
+        // wiki can pin a CPU and exhaust the stack.
+        const MAX_DEPTH: usize = 16;
+        let mut visited = std::collections::HashSet::new();
+        if let Ok(c) = dir.canonicalize() {
+            visited.insert(c);
+        }
+        let mut out = Vec::new();
+        self.list_pages_recursive_inner(dir, prefix, 0, MAX_DEPTH, &mut visited, &mut out);
+        out
+    }
+
+    fn list_pages_recursive_inner(
+        &self,
+        dir: &Path,
+        prefix: &str,
+        depth: usize,
+        max_depth: usize,
+        visited: &mut std::collections::HashSet<std::path::PathBuf>,
+        pages: &mut Vec<String>,
+    ) {
+        if depth > max_depth {
+            return;
+        }
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
-            Err(_) => return pages,
+            Err(_) => return,
         };
         let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if path.is_dir() {
+            // Use symlink_metadata so we don't follow into a symlinked dir blindly.
+            let meta = match entry.path().symlink_metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                if let Ok(canon) = path.canonicalize() {
+                    if !visited.insert(canon) {
+                        continue;
+                    }
+                }
                 let sub_prefix = if prefix.is_empty() {
                     name.clone()
                 } else {
                     format!("{prefix}/{name}")
                 };
-                pages.extend(self.list_pages_recursive(&path, &sub_prefix));
+                self.list_pages_recursive_inner(
+                    &path,
+                    &sub_prefix,
+                    depth + 1,
+                    max_depth,
+                    visited,
+                    pages,
+                );
             } else if name.ends_with(".md") {
                 let page_name = name.trim_end_matches(".md");
                 let full = if prefix.is_empty() {
@@ -153,7 +199,6 @@ impl CaduceusProjectWikiTool {
                 pages.push(full);
             }
         }
-        pages
     }
 
     fn search_pages(&self, query: &str) -> Result<Vec<(String, Vec<String>)>, String> {
@@ -381,5 +426,79 @@ impl AgentTool for CaduceusProjectWikiTool {
                 Err(e) => Err(CaduceusProjectWikiToolOutput::Error { error: e }),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for bug #21: list_pages_recursive used to follow symlinks
+    /// freely. A wiki containing `.caduceus/wiki/loop -> ..` would recurse
+    /// forever and pin a CPU. The fix uses symlink_metadata + a canonical
+    /// visited set + a depth cap. This test creates the worst-case loop and
+    /// proves it returns in bounded time without panic or stack overflow.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_loop_does_not_diverge() {
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let wiki = project_root.join(".caduceus/wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::write(wiki.join("home.md"), "hi").unwrap();
+
+        // Build a sibling subdirectory that symlinks back to the wiki root —
+        // a classic infinite-loop trap.
+        let sub = wiki.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        symlink(&wiki, sub.join("loop")).unwrap();
+
+        let tool = CaduceusProjectWikiTool::new(project_root);
+        let start = Instant::now();
+        let pages = tool.list_pages_recursive(&wiki, "");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "list_pages_recursive should bail on symlink loops quickly; took {elapsed:?}"
+        );
+        assert!(
+            pages.iter().any(|p| p == "home"),
+            "should still surface real pages alongside the loop guard; got {pages:?}"
+        );
+    }
+
+    /// Regression for bug #21: pathologically deep directories used to be
+    /// walked unboundedly. The MAX_DEPTH cap (16) must stop us long before
+    /// stack exhaustion.
+    #[test]
+    fn deep_tree_capped_by_max_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let wiki = project_root.join(".caduceus/wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+
+        // Build a 50-deep nested directory tree (well over MAX_DEPTH=16).
+        let mut deep = wiki.clone();
+        for i in 0..50 {
+            deep = deep.join(format!("d{i}"));
+            std::fs::create_dir(&deep).unwrap();
+        }
+        // Drop a page at the very bottom — it should NOT appear in the result.
+        std::fs::write(deep.join("buried.md"), "x").unwrap();
+        // Drop a page near the top — it SHOULD appear.
+        std::fs::write(wiki.join("shallow.md"), "y").unwrap();
+
+        let tool = CaduceusProjectWikiTool::new(project_root);
+        let pages = tool.list_pages_recursive(&wiki, "");
+
+        assert!(pages.iter().any(|p| p == "shallow"));
+        assert!(
+            !pages.iter().any(|p| p.ends_with("buried")),
+            "MAX_DEPTH should have stopped us before reaching the buried page; got {pages:?}"
+        );
     }
 }

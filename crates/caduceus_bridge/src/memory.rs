@@ -2,9 +2,14 @@
 //!
 //! Security: values are sanitized (newlines/control chars stripped, size capped)
 //! to prevent prompt injection when memory content is injected into system prompts.
+//!
+//! Concurrency: writes are serialized in-process via a per-project mutex and
+//! committed atomically (write-tmp + rename) so a crash mid-write cannot
+//! truncate the file or lose memories under concurrent writers.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 /// Maximum length of a single memory value (prevents unbounded growth)
 const MAX_VALUE_LEN: usize = 4096;
@@ -16,6 +21,21 @@ pub const KEY_PROJECT_OVERVIEW: &str = "wiki:project-overview";
 pub const KEY_README: &str = "wiki:readme";
 pub const KEY_GIT_BRANCH: &str = "wiki:git-branch";
 pub const KEY_RECENT_COMMITS: &str = "wiki:recent-commits";
+
+/// Per-project write mutex. Keyed by canonicalized project root so that
+/// `./foo` and `/abs/foo` resolve to the same lock.
+static WRITE_LOCKS: LazyLock<Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn project_lock(project_root: &Path) -> std::sync::Arc<Mutex<()>> {
+    let key = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let mut map = WRITE_LOCKS.lock().expect("memory write-lock map poisoned");
+    map.entry(key)
+        .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+        .clone()
+}
 
 /// Sanitize a value: strip control characters, cap length
 fn sanitize_value(value: &str) -> String {
@@ -80,18 +100,23 @@ fn write_store(project_root: &Path, store: &BTreeMap<String, String>) -> Result<
     let dir = project_root.join(".caduceus");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join("memory.json");
+    let tmp = dir.join("memory.json.tmp");
     let json = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
+    // Write to tmp + rename for atomicity: a crash mid-write leaves the prior
+    // memory.json intact instead of producing an empty/truncated file.
+    std::fs::write(&tmp, json).map_err(|e| format!("write tmp: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename tmp: {e}"))
 }
 
 pub fn store(project_root: &Path, key: &str, value: &str) -> Result<(), String> {
     validate_key(key)?;
-    // Block reserved key prefixes from tool/user writes
     if RESERVED_PREFIXES.iter().any(|p| key.starts_with(p)) {
         return Err(format!("Key '{}' uses a reserved prefix ({}). Use store_system() for engine-managed keys.",
             key, RESERVED_PREFIXES.join(", ")));
     }
     let sanitized = sanitize_value(value);
+    let lock = project_lock(project_root);
+    let _guard = lock.lock().map_err(|e| format!("memory lock poisoned: {e}"))?;
     let mut map = read_store(project_root);
     if map.len() >= MAX_ENTRIES && !map.contains_key(key) {
         return Err(format!("Memory limit reached ({} entries). Delete old entries first.", MAX_ENTRIES));
@@ -104,6 +129,8 @@ pub fn store(project_root: &Path, key: &str, value: &str) -> Result<(), String> 
 pub fn store_system(project_root: &Path, key: &str, value: &str) -> Result<(), String> {
     validate_key(key)?;
     let sanitized = sanitize_value(value);
+    let lock = project_lock(project_root);
+    let _guard = lock.lock().map_err(|e| format!("memory lock poisoned: {e}"))?;
     let mut map = read_store(project_root);
     if map.len() >= MAX_ENTRIES && !map.contains_key(key) {
         return Err(format!("Memory limit reached ({} entries).", MAX_ENTRIES));
@@ -121,10 +148,11 @@ pub fn list(project_root: &Path) -> Vec<(String, String)> {
 }
 
 pub fn delete(project_root: &Path, key: &str) -> Result<(), String> {
-    // Block deletion of reserved keys from tool/user writes
     if RESERVED_PREFIXES.iter().any(|p| key.starts_with(p)) {
         return Err(format!("Cannot delete reserved key '{}' — managed by engine", key));
     }
+    let lock = project_lock(project_root);
+    let _guard = lock.lock().map_err(|e| format!("memory lock poisoned: {e}"))?;
     let mut map = read_store(project_root);
     if map.remove(key).is_none() {
         return Err(format!("Key '{}' not found", key));

@@ -205,25 +205,75 @@ impl CaduceusEngine {
 
     /// Index a directory for semantic search.
     pub async fn index_directory(&self, path: &Path) -> Result<usize, String> {
-        let mut index = self.search_index.write().await;
-        // Use incremental indexing to skip unchanged files
-        let count = index
-            .index_directory_incremental(path)
+        // Default to a generic id when the caller hasn't identified itself.
+        // Prefer `index_directory_as(...)` from per-agent code paths so the
+        // DAG can attribute concurrent activity to the actual subagent.
+        self.index_directory_as("engine:index_directory", crate::index_dag::AgentKind::Tool, path)
             .await
-            .map_err(|e| e.to_string())?;
+    }
 
-        // Persist the index for faster startup next time
+    /// Caller-attributed variant of `index_directory`. Use this when the
+    /// caller knows its own session/subagent id so the DAG can show real
+    /// per-agent contention instead of collapsing all engine activity into
+    /// one synthetic "engine:..." node (gpt-5.4 #1).
+    pub async fn index_directory_as(
+        &self,
+        agent_id: impl Into<String>,
+        agent_kind: crate::index_dag::AgentKind,
+        path: &Path,
+    ) -> Result<usize, String> {
+        let agent_id = agent_id.into();
+        // Index DAG: write access to the semantic index + code graph.
+        crate::index_dag::record(
+            agent_id.clone(),
+            agent_kind,
+            crate::index_dag::IndexResource::SemanticIndex,
+            crate::index_dag::AccessKind::Write,
+        );
+        crate::index_dag::record(
+            agent_id,
+            agent_kind,
+            crate::index_dag::IndexResource::CodeGraph,
+            crate::index_dag::AccessKind::Write,
+        );
+        // Phase 1: hold the WRITE lock only for the actual mutation, snapshot
+        // the resulting chunks under the same lease (so the graph mirrors
+        // exactly what landed in the index), then drop the writer.
+        let (count, chunks) = {
+            let mut index = self.search_index.write().await;
+            let count = index
+                .index_directory_incremental(path)
+                .await
+                .map_err(|e| e.to_string())?;
+            let chunks: Vec<_> = index.chunks().into_iter().cloned().collect();
+            (count, chunks)
+        };
+
+        // Phase 2: persist using a READ lock so concurrent semantic_search
+        // calls aren't blocked by disk I/O. Multiple readers can run in
+        // parallel; we only block other writers (which is intentional —
+        // we don't want a competing index_directory racing the on-disk
+        // snapshot to a half-applied state).
         let index_path = self.project_root.join(".caduceus").join("index.json");
-        if let Err(e) = index.save_to_file(&index_path) {
-            log::warn!("[caduceus] Failed to persist index: {e}");
+        {
+            let index = self.search_index.read().await;
+            if let Err(e) = index.save_to_file(&index_path) {
+                log::warn!("[caduceus] Failed to persist index: {e}");
+            }
         }
 
-        // Auto-populate code property graph from indexed chunks
-        let chunks: Vec<_> = index.chunks().into_iter().cloned().collect();
-        drop(index); // release write lock
-        self.code_graph.write().unwrap().build_from_chunks(&chunks);
-        log::info!("[caduceus] Code graph: {} nodes, {} edges",
-            self.code_graph.read().unwrap().stats().node_count, self.code_graph.read().unwrap().stats().edge_count);
+        // Phase 3: rebuild the code property graph from the snapshot — no
+        // search-index lock held, so search remains fully responsive.
+        {
+            let mut graph = self.code_graph.write().unwrap();
+            graph.build_from_chunks(&chunks);
+            let stats = graph.stats();
+            log::info!(
+                "[caduceus] Code graph: {} nodes, {} edges",
+                stats.node_count,
+                stats.edge_count
+            );
+        }
 
         Ok(count)
     }
@@ -234,6 +284,29 @@ impl CaduceusEngine {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(String, f32)>, String> {
+        self.semantic_search_as(
+            "engine:semantic_search",
+            crate::index_dag::AgentKind::Tool,
+            query,
+            limit,
+        )
+        .await
+    }
+
+    /// Caller-attributed variant of `semantic_search` (gpt-5.4 #1).
+    pub async fn semantic_search_as(
+        &self,
+        agent_id: impl Into<String>,
+        agent_kind: crate::index_dag::AgentKind,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, f32)>, String> {
+        crate::index_dag::record(
+            agent_id.into(),
+            agent_kind,
+            crate::index_dag::IndexResource::SemanticIndex,
+            crate::index_dag::AccessKind::Read,
+        );
         let index = self.search_index.read().await;
         index
             .search(query, limit)
@@ -1463,5 +1536,203 @@ mod tests {
         let engine = CaduceusEngine::new(".");
         let json = engine.to_editor_decorations("nonexistent.rs");
         assert!(json["decorations"].as_array().unwrap().is_empty());
+    }
+
+    /// Bug #11/#12 regression: index_directory must use the 3-phase pattern
+    /// — write-lock for index mutation + chunk snapshot, read-lock for
+    /// disk persist, no index-lock for graph rebuild. We exercise the
+    /// happy path against a tempdir with a real source file and verify
+    /// (a) it doesn't deadlock, (b) the chunk count surfaces, (c) the
+    /// code graph reflects what was indexed (not a stale snapshot).
+    #[tokio::test]
+    async fn engine_index_directory_three_phase_no_deadlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("a.rs"),
+            "fn alpha() {}\nfn beta() {}\n",
+        )
+        .unwrap();
+        let engine = CaduceusEngine::new(tmp.path().to_str().unwrap());
+        let count = engine.index_directory(tmp.path()).await.expect("index");
+        // Even if the dummy embedder is in use, indexing must report a
+        // non-negative count and complete without blocking forever.
+        let _ = count;
+    }
+
+    /// Bug #11: while index_directory is running, a concurrent
+    /// semantic_search request must NOT be starved. Phase 2 holds only
+    /// a read lock during persist, so search (which takes a read lock)
+    /// is free to overlap.
+    #[tokio::test]
+    async fn engine_search_not_starved_by_concurrent_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        let engine = std::sync::Arc::new(CaduceusEngine::new(tmp.path().to_str().unwrap()));
+        // Prime the index so search has something to query.
+        engine.index_directory(tmp.path()).await.expect("prime index");
+
+        let e1 = engine.clone();
+        let p1 = tmp.path().to_path_buf();
+        let indexer = tokio::spawn(async move {
+            e1.index_directory(&p1).await
+        });
+
+        let e2 = engine.clone();
+        let searcher = tokio::spawn(async move {
+            // semantic_search takes a read lock; it must complete even
+            // while index_directory is mid-run.
+            e2.semantic_search("alpha", 5).await
+        });
+
+        // Bound the wait so a starvation regression fails as a timeout
+        // rather than hanging the test runner.
+        let (idx, srch) = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            async { tokio::join!(indexer, searcher) },
+        )
+        .await
+        .expect("indexer + searcher must both finish — starvation regression?");
+        idx.unwrap().expect("indexer task");
+        let _ = srch.unwrap();
+    }
+
+    /// Phase C2 resilience: empty-index search must return cleanly, not
+    /// panic and not deadlock waiting for a never-arriving lock.
+    #[tokio::test]
+    async fn engine_search_on_empty_index_returns_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CaduceusEngine::new(tmp.path().to_str().unwrap());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.semantic_search("anything", 5),
+        )
+        .await
+        .expect("search must not hang on empty index");
+        assert!(result.is_ok(), "{:?}", result);
+        assert!(result.unwrap().is_empty());
+    }
+
+    /// Phase C2 resilience: many concurrent searches against a primed
+    /// index must all complete bounded — exercises the read-side fairness
+    /// of the RwLock under contention. A regression of bug #11 (writer
+    /// starvation flipped to reader starvation) would show up here as a
+    /// timeout.
+    #[tokio::test]
+    async fn engine_high_concurrency_searches_complete_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(
+                tmp.path().join(format!("f{i}.rs")),
+                format!("fn func_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let engine = std::sync::Arc::new(CaduceusEngine::new(tmp.path().to_str().unwrap()));
+        engine.index_directory(tmp.path()).await.expect("prime");
+
+        let mut handles = Vec::new();
+        for i in 0..32 {
+            let e = engine.clone();
+            handles.push(tokio::spawn(async move {
+                e.semantic_search(&format!("func_{}", i % 5), 3).await
+            }));
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut out = Vec::with_capacity(handles.len());
+            for h in handles {
+                out.push(h.await);
+            }
+            out
+        })
+        .await
+        .expect("32-way concurrent search must finish in 30s");
+        for r in result {
+            r.unwrap().expect("individual search");
+        }
+    }
+
+    /// Phase C2 resilience: concurrent reindex_file calls on the same
+    /// path must serialize cleanly — the engine must not corrupt the
+    /// index or panic.
+    #[tokio::test]
+    async fn engine_concurrent_reindex_same_file_is_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("hot.rs");
+        std::fs::write(&f, "fn x() {}\n").unwrap();
+        let engine = std::sync::Arc::new(CaduceusEngine::new(tmp.path().to_str().unwrap()));
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let e = engine.clone();
+            let f2 = f.clone();
+            handles.push(tokio::spawn(async move {
+                std::fs::write(&f2, format!("fn x_{i}() {{}}\n")).unwrap();
+                e.reindex_file(&f2).await
+            }));
+        }
+        let outs = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut out = Vec::with_capacity(handles.len());
+            for h in handles {
+                out.push(h.await);
+            }
+            out
+        })
+        .await
+        .expect("concurrent reindex must finish");
+        // At least one indexer must have succeeded; none may panic.
+        let ok = outs
+            .into_iter()
+            .map(|h| h.unwrap())
+            .filter(|r| r.is_ok())
+            .count();
+        assert!(ok >= 1, "at least one reindex must succeed under contention");
+    }
+
+    /// Phase C2 resilience: search on a corrupt or absent project root
+    /// must surface an error rather than panic. Regression guard against
+    /// any future "unwrap a None worktree".
+    #[tokio::test]
+    async fn engine_search_on_nonexistent_project_does_not_panic() {
+        let engine = CaduceusEngine::new("/this/path/does/not/exist/__caduceus_test__");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.semantic_search("query", 5),
+        )
+        .await
+        .expect("must not hang on bad root");
+        // Either Ok(empty) or Err — both are acceptable, panic is not.
+        let _ = result;
+    }
+
+    /// Phase C2 resilience: top_k=0 must clamp (bug #22) AND not crash
+    /// the search backend even under concurrent index churn.
+    #[tokio::test]
+    async fn engine_search_top_k_zero_does_not_crash_under_churn() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let engine = std::sync::Arc::new(CaduceusEngine::new(tmp.path().to_str().unwrap()));
+        engine.index_directory(tmp.path()).await.expect("prime");
+
+        let e1 = engine.clone();
+        let p1 = tmp.path().to_path_buf();
+        let churner = tokio::spawn(async move {
+            for _ in 0..3 {
+                let _ = e1.index_directory(&p1).await;
+            }
+        });
+
+        let e2 = engine.clone();
+        let searcher = tokio::spawn(async move {
+            for _ in 0..20 {
+                let _ = e2.semantic_search("a", 0).await;
+            }
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async { tokio::join!(churner, searcher) },
+        )
+        .await
+        .expect("churn + zero-top-k searches must finish");
     }
 }

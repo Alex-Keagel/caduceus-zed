@@ -248,16 +248,40 @@ fn list_checkpoints(project_root: &std::path::Path) -> Result<String, String> {
     Ok(format!("{} checkpoint(s):\n{}", entries.len(), lines.join("\n")))
 }
 
+fn validate_checkpoint_id(checkpoint_id: &str) -> Result<(), String> {
+    if checkpoint_id.is_empty() {
+        return Err("Checkpoint id cannot be empty".to_string());
+    }
+    let p = std::path::Path::new(checkpoint_id);
+    if p.is_absolute() {
+        return Err("Checkpoint id must not be absolute".to_string());
+    }
+    let mut components = 0usize;
+    for c in p.components() {
+        match c {
+            std::path::Component::Normal(_) => components += 1,
+            _ => return Err("Checkpoint id must be a single non-traversing path segment".to_string()),
+        }
+    }
+    if components != 1 {
+        return Err("Checkpoint id must be a single path segment".to_string());
+    }
+    Ok(())
+}
+
 fn restore_checkpoint(
     project_root: &std::path::Path,
     checkpoint_id: &str,
 ) -> Result<String, String> {
+    validate_checkpoint_id(checkpoint_id)?;
     let checkpoint_dir = checkpoints_dir(project_root).join(checkpoint_id);
 
-    // Prevent path traversal
+    // Prevent path traversal — canonicalize REQUIRES existence; if the dir
+    // does not exist, the id is invalid (we already rejected traversal above).
     let base = checkpoints_dir(project_root);
     let _ = std::fs::create_dir_all(&base);
-    let resolved = checkpoint_dir.canonicalize().unwrap_or(checkpoint_dir.clone());
+    let resolved = checkpoint_dir.canonicalize()
+        .map_err(|_| format!("Checkpoint '{checkpoint_id}' not found."))?;
     let base_resolved = base.canonicalize().unwrap_or(base.clone());
     if !resolved.starts_with(&base_resolved) {
         return Err("Invalid checkpoint id: path traversal detected".to_string());
@@ -317,12 +341,15 @@ fn diff_checkpoint(
     project_root: &std::path::Path,
     checkpoint_id: &str,
 ) -> Result<String, String> {
+    validate_checkpoint_id(checkpoint_id)?;
     let checkpoint_dir = checkpoints_dir(project_root).join(checkpoint_id);
 
-    // Prevent path traversal
+    // Prevent path traversal — fail if the dir doesn't exist rather than
+    // silently falling back to the un-canonicalized path.
     let base = checkpoints_dir(project_root);
     let _ = std::fs::create_dir_all(&base);
-    let resolved = checkpoint_dir.canonicalize().unwrap_or(checkpoint_dir.clone());
+    let resolved = checkpoint_dir.canonicalize()
+        .map_err(|_| format!("Checkpoint '{checkpoint_id}' not found."))?;
     let base_resolved = base.canonicalize().unwrap_or(base.clone());
     if !resolved.starts_with(&base_resolved) {
         return Err("Invalid checkpoint id: path traversal detected".to_string());
@@ -368,4 +395,51 @@ fn diff_checkpoint(
         "Diff against checkpoint '{checkpoint_id}':\n{}",
         diffs.join("\n")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for bug C10b: checkpoint ids were used as path segments
+    /// without validation, so `..`, absolute paths, multi-segment ids, or
+    /// embedded path separators all let a caller break out of the
+    /// `.caduceus/checkpoints/` jail. `validate_checkpoint_id` must reject
+    /// every one of these adversarial inputs.
+    #[test]
+    fn rejects_path_traversal() {
+        assert!(validate_checkpoint_id("..").is_err());
+        assert!(validate_checkpoint_id("../escape").is_err());
+        assert!(validate_checkpoint_id("foo/../bar").is_err());
+    }
+
+    #[test]
+    fn rejects_absolute_paths() {
+        assert!(validate_checkpoint_id("/etc/passwd").is_err());
+        // Windows-style absolute roots also count as components other than Normal
+        // on platforms that recognize them.
+    }
+
+    #[test]
+    fn rejects_multi_segment_ids() {
+        assert!(validate_checkpoint_id("foo/bar").is_err());
+        assert!(validate_checkpoint_id("a/b/c").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_id() {
+        assert!(validate_checkpoint_id("").is_err());
+    }
+
+    #[test]
+    fn rejects_current_dir() {
+        assert!(validate_checkpoint_id(".").is_err());
+    }
+
+    #[test]
+    fn accepts_normal_single_segment() {
+        assert!(validate_checkpoint_id("checkpoint-2024-01-01").is_ok());
+        assert!(validate_checkpoint_id("abc123").is_ok());
+        assert!(validate_checkpoint_id("snapshot_v1").is_ok());
+    }
 }

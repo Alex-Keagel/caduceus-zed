@@ -27,6 +27,24 @@ use util::rel_path::RelPath;
 
 const DEFAULT_UI_TEXT: &str = "Editing file";
 
+/// Bug #15 / SEC-15: returns true when the on-disk mtime indicates the
+/// file was modified between the agent's last read and the moment we're
+/// about to write. The MTime newtype intentionally has no Ord because
+/// system clocks can move backwards — so we treat *any* difference
+/// (forward or backward) as "stale, abort". Returning false when either
+/// side is None matches the "skip the check" pessimistic-permissive
+/// behavior used at the call site (we'd rather miss a stale-write than
+/// spuriously block an edit on a filesystem with no mtime).
+pub(crate) fn mtime_changed(
+    last_read: Option<fs::MTime>,
+    current: Option<fs::MTime>,
+) -> bool {
+    match (last_read, current) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
 /// This is a tool for creating a new file or editing an existing file. For moving or renaming files, you should generally use the `move_path` tool instead.
 ///
 /// Before using this tool:
@@ -340,18 +358,12 @@ impl AgentTool for EditFileTool {
                     }
 
                     // Check if the file was modified on disk since we last read it
-                    if let (Some(last_read), Some(current)) = (last_read_mtime, current_mtime) {
-                        // MTime can be unreliable for comparisons, so our newtype intentionally
-                        // doesn't support comparing them. If the mtime at all different
-                        // (which could be because of a modification or because e.g. system clock changed),
-                        // we pessimistically assume it was modified.
-                        if current != last_read {
-                            anyhow::bail!(
-                                "The file {} has been modified since you last read it. \
-                                Please read the file again to get the current state before editing it.",
-                                input.path.display()
-                            );
-                        }
+                    if mtime_changed(last_read_mtime, current_mtime) {
+                        anyhow::bail!(
+                            "The file {} has been modified since you last read it. \
+                            Please read the file again to get the current state before editing it.",
+                            input.path.display()
+                        );
                     }
                 }
 
@@ -446,6 +458,33 @@ impl AgentTool for EditFileTool {
                     format_task.await.log_err();
                 }
 
+                // SEC-15: Re-check mtime AFTER the LLM finished streaming edits
+                // but BEFORE we save. The window between the initial read at
+                // line 307 and this save can be many seconds (LLM stream +
+                // format) and an external editor or user save during that
+                // window would be silently overwritten otherwise. If the
+                // on-disk mtime has moved since our last read, we abort and
+                // ask the model to re-read.
+                if let Some(abs_path) = abs_path.as_ref() {
+                    let last_read_mtime =
+                        action_log.read_with(cx, |log, _| log.file_read_time(abs_path));
+                    let pre_save_mtime = buffer.read_with(cx, |buffer, _| {
+                        buffer.file().and_then(|f| f.disk_state().mtime())
+                    });
+                    // Both reads collapse Result<Option<MTime>> via the same
+                    // pattern used at line 307. If the entity is gone, treat
+                    // the mtime as unknown and skip the check (turn is dying
+                    // anyway, the bail message would never reach the user).
+                    if mtime_changed(last_read_mtime, pre_save_mtime) {
+                        anyhow::bail!(
+                            "{} was modified on disk while the edit was in progress. \
+                            Refusing to save to avoid clobbering external changes — please \
+                            re-read the file and reapply your edit if it's still needed.",
+                            input.path.display()
+                        );
+                    }
+                }
+
                 project
                     .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
                     .await?;
@@ -468,31 +507,29 @@ impl AgentTool for EditFileTool {
                     .await;
 
                 let input_path = input.path.display();
-                if unified_diff.is_empty() {
-                    anyhow::ensure!(
-                        !hallucinated_old_text,
+                anyhow::ensure!(
+                    !hallucinated_old_text,
+                    formatdoc! {"
+                        Some edits were produced but none of them could be applied.
+                        Read the relevant sections of {input_path} again so that
+                        I can perform the requested edits.
+                    "}
+                );
+                anyhow::ensure!(
+                    ambiguous_ranges.is_empty(),
+                    {
+                        let line_numbers = ambiguous_ranges
+                            .iter()
+                            .map(|range| range.start.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         formatdoc! {"
-                            Some edits were produced but none of them could be applied.
-                            Read the relevant sections of {input_path} again so that
-                            I can perform the requested edits.
+                            <old_text> matches more than one position in the file (lines: {line_numbers}). Read the
+                            relevant sections of {input_path} again and extend <old_text> so
+                            that I can perform the requested edits.
                         "}
-                    );
-                    anyhow::ensure!(
-                        ambiguous_ranges.is_empty(),
-                        {
-                            let line_numbers = ambiguous_ranges
-                                .iter()
-                                .map(|range| range.start.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            formatdoc! {"
-                                <old_text> matches more than one position in the file (lines: {line_numbers}). Read the
-                                relevant sections of {input_path} again and extend <old_text> so
-                                that I can perform the requested edits.
-                            "}
-                        }
-                    );
-                }
+                    }
+                );
 
                 anyhow::Ok(EditFileToolOutput::Success {
                     input_path: input.path,
@@ -2635,5 +2672,51 @@ mod tests {
             "Path outside config dir should not be detected as sensitive: {:?}",
             path
         );
+    }
+}
+
+#[cfg(test)]
+mod mtime_changed_tests {
+    use super::mtime_changed;
+    use fs::MTime;
+
+    fn at(secs: u64) -> MTime {
+        MTime::from_seconds_and_nanos(secs, 0)
+    }
+
+    #[test]
+    fn unchanged_returns_false() {
+        assert!(!mtime_changed(Some(at(1000)), Some(at(1000))));
+    }
+
+    #[test]
+    fn forward_change_returns_true() {
+        assert!(mtime_changed(Some(at(1000)), Some(at(2000))));
+    }
+
+    /// Bug #15 detail: clocks can move backwards (NTP, dual boot, VM clock
+    /// skew). The fix treats *any* difference as "stale" — including
+    /// backwards-moving mtimes — because we cannot trust the order.
+    #[test]
+    fn backward_change_returns_true() {
+        assert!(mtime_changed(Some(at(2000)), Some(at(1000))));
+    }
+
+    /// When mtime is unavailable on either side (e.g. fs without mtime
+    /// support, file just deleted, action log entity gone), we fall back
+    /// to the permissive "skip the check" behavior — better to allow a
+    /// write than spuriously block on missing metadata.
+    #[test]
+    fn missing_either_side_returns_false() {
+        assert!(!mtime_changed(None, Some(at(1000))));
+        assert!(!mtime_changed(Some(at(1000)), None));
+        assert!(!mtime_changed(None, None));
+    }
+
+    #[test]
+    fn nanosecond_precision_difference_counts_as_changed() {
+        let a = MTime::from_seconds_and_nanos(1000, 0);
+        let b = MTime::from_seconds_and_nanos(1000, 1);
+        assert!(mtime_changed(Some(a), Some(b)));
     }
 }

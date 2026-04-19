@@ -111,7 +111,13 @@ impl AgentTool for CaduceusIndexTool {
             let result = if path.is_file() {
                 engine.reindex_file(&path).await
             } else {
-                engine.index_directory(&path).await
+                engine
+                    .index_directory_as(
+                        "tool:caduceus_index",
+                        caduceus_bridge::index_dag::AgentKind::Tool,
+                        &path,
+                    )
+                    .await
             };
 
             match result {

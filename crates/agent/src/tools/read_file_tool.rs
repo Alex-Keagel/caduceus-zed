@@ -23,6 +23,28 @@ use super::tool_permissions::{
 };
 use crate::{AgentTool, ToolCallEventStream, ToolInput, outline};
 
+/// Maximum number of lines a single `read_file` ranged request may pull in.
+/// Without this bound a model could request `start_line=1, end_line=u32::MAX`
+/// and force the buffer to materialise an arbitrarily large slice into a
+/// single String — pinning RAM and stalling the turn.
+pub(crate) const MAX_RANGED_LINES: u32 = 2000;
+
+/// Compute the clamped `end_row` for a ranged read given the user's
+/// `start_row` (0-based) and `requested_end` (0-based, exclusive,
+/// `u32::MAX` when the model passed nothing). Pulled out of the buffer
+/// closure so the cap can be unit-tested without spinning up a buffer.
+pub(crate) fn clamp_ranged_end(start_row: u32, requested_end: u32) -> u32 {
+    let mut end_row = requested_end;
+    if end_row <= start_row {
+        end_row = start_row + 1;
+    }
+    let max_end = start_row.saturating_add(MAX_RANGED_LINES);
+    if end_row > max_end {
+        end_row = max_end;
+    }
+    end_row
+}
+
 /// Reads the content of the given file in the project.
 ///
 /// - Never attempt to read a path that hasn't been previously mentioned.
@@ -269,10 +291,13 @@ impl AgentTool for ReadFileTool {
                         anchor = Some(buffer.anchor_before(Point::new(start_row, column)));
                     }
 
-                    let mut end_row = input.end_line.unwrap_or(u32::MAX);
-                    if end_row <= start_row {
-                        end_row = start_row + 1; // read at least one lines
-                    }
+                    // Bug #16: end_row must be capped or a model can request
+                    // `end_line=u32::MAX` and force materialisation of the
+                    // entire buffer into a single String.
+                    let end_row = clamp_ranged_end(
+                        start_row,
+                        input.end_line.unwrap_or(u32::MAX),
+                    );
                     let start = buffer.anchor_before(Point::new(start_row, 0));
                     let end = buffer.anchor_before(Point::new(end_row, 0));
                     buffer.text_for_range(start..end).collect::<String>()
@@ -1325,5 +1350,55 @@ mod test {
             ),
             "No authorization should be requested when validation fails before read",
         );
+    }
+}
+
+#[cfg(test)]
+mod ranged_cap_tests {
+    use super::*;
+
+    /// Regression for bug #16: a model that passes `end_line=u32::MAX` used
+    /// to be allowed to materialise the entire file (potentially gigabytes)
+    /// into a single String. The cap must hold the read window to
+    /// `MAX_RANGED_LINES` lines.
+    #[test]
+    fn caps_at_max_ranged_lines() {
+        let start = 0;
+        let end = clamp_ranged_end(start, u32::MAX);
+        assert_eq!(end, MAX_RANGED_LINES);
+    }
+
+    /// Regression for bug #16: arithmetic must saturate. A request for
+    /// `start_row = u32::MAX - 5` should not panic on overflow.
+    #[test]
+    fn saturates_near_u32_max() {
+        let start = u32::MAX - 5;
+        let end = clamp_ranged_end(start, u32::MAX);
+        // start_row + MAX_RANGED_LINES would overflow → saturating_add
+        // pins it at u32::MAX, so end_row should equal u32::MAX.
+        assert_eq!(end, u32::MAX);
+    }
+
+    #[test]
+    fn passes_through_small_window() {
+        // Reasonable request: read 10 lines starting at line 100.
+        let end = clamp_ranged_end(100, 110);
+        assert_eq!(end, 110);
+    }
+
+    #[test]
+    fn promotes_zero_width_window_to_one_line() {
+        // Models sometimes pass start == end. Read at least one line so the
+        // result isn't an empty string with no signal about why.
+        let end = clamp_ranged_end(50, 50);
+        assert_eq!(end, 51);
+        let end = clamp_ranged_end(50, 30); // end < start
+        assert_eq!(end, 51);
+    }
+
+    #[test]
+    fn caps_huge_window_starting_mid_file() {
+        let end = clamp_ranged_end(500, 5_000_000);
+        assert_eq!(end, 500 + MAX_RANGED_LINES);
     }
 }

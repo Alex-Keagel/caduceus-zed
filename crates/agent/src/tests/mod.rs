@@ -3202,7 +3202,7 @@ async fn test_building_request_with_pending_tools(cx: &mut TestAppContext) {
 
     // Ensure pending tools are skipped when building a request.
     let request = thread
-        .read_with(cx, |thread, cx| {
+        .update(cx, |thread, cx| {
             thread.build_completion_request(CompletionIntent::EditFile, cx)
         })
         .unwrap();
@@ -5304,7 +5304,8 @@ async fn test_subagent_thread_inherits_parent_thread_properties(cx: &mut TestApp
             subagent_thread.parent_thread_id(),
             Some(parent_thread.read(cx).id().clone())
         );
-
+    });
+    subagent_thread.update(cx, |subagent_thread, cx| {
         let request = subagent_thread
             .build_completion_request(CompletionIntent::UserPrompt, cx)
             .unwrap();
@@ -5392,8 +5393,8 @@ async fn test_parent_cancel_stops_subagent(cx: &mut TestAppContext) {
 
     let subagent = cx.new(|cx| Thread::new_subagent(&parent, cx));
 
-    parent.update(cx, |thread, _cx| {
-        thread.register_running_subagent(subagent.downgrade());
+    parent.update(cx, |thread, cx| {
+        thread.register_running_subagent(subagent.downgrade(), cx);
     });
 
     subagent
@@ -6854,4 +6855,427 @@ async fn test_mid_turn_model_and_settings_refresh(cx: &mut TestAppContext) {
 
     // Thinking should now be enabled.
     assert!(model_b_completions[0].thinking_allowed);
+}
+
+// ============================================================================
+// Caduceus deferred regression tests — gpui Thread integration harness
+// Bugs covered: C5 (token cache invalidation), #14 (auto-extract after cancel),
+// C2 (turn generation token blocks stale events)
+// ============================================================================
+
+/// Bug C5: Sending a new message must invalidate the cached token estimate
+/// so the next read recomputes — otherwise the agent reports stale context%.
+#[gpui::test]
+async fn test_caduceus_c5_token_cache_invalidates_on_send(cx: &mut TestAppContext) {
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    // Initial state: cache is empty (None).
+    let cached0 = thread.read_with(cx, |t, _| t.cached_token_estimate_for_test());
+    assert_eq!(cached0, None, "fresh thread should have no cached estimate");
+
+    // Drive a first turn end-to-end so messages are materialized in history.
+    let events = thread
+        .update(cx, |t, cx| {
+            t.send(UserMessageId::new(), ["First user message — short."], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake_model.send_last_completion_stream_text_chunk("ok-1");
+    fake_model.send_last_completion_stream_event(
+        LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+    );
+    fake_model.end_last_completion_stream();
+    let _ = events.collect::<Vec<_>>().await;
+
+    // Read the estimate — this populates the cache.
+    let est1 = thread.update(cx, |t, _| t.estimate_total_tokens());
+    let cached1 = thread.read_with(cx, |t, _| t.cached_token_estimate_for_test());
+    assert!(est1 > 0, "after one exchange estimate must be > 0, got {}", est1);
+    assert_eq!(
+        cached1,
+        Some(est1),
+        "cache should be populated after estimate_total_tokens()"
+    );
+
+    // Send a much longer second message.
+    let long_text =
+        "This is a substantially longer second message intended to materially \
+         change the token count so the cache, if not invalidated, would report a \
+         stale value below the true total.";
+    let events = thread
+        .update(cx, |t, cx| t.send(UserMessageId::new(), [long_text], cx))
+        .unwrap();
+    cx.run_until_parked();
+    fake_model.send_last_completion_stream_text_chunk("ok-2");
+    fake_model.send_last_completion_stream_event(
+        LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+    );
+    fake_model.end_last_completion_stream();
+    let _ = events.collect::<Vec<_>>().await;
+
+    // After append-and-flush, cache MUST have been invalidated by send().
+    // Reading the estimate again must return a STRICTLY larger value.
+    let est2 = thread.update(cx, |t, _| t.estimate_total_tokens());
+    assert!(
+        est2 > est1,
+        "Bug C5 regression: token cache not invalidated on append. \
+         est1={est1}, est2={est2} (expected est2 > est1)"
+    );
+}
+
+/// Bug #14: After cancellation, auto-extract memories MUST NOT race the next
+/// turn's `activeContext.md` writer. The gate is `!last_turn_cancelled`.
+/// Verifies the flag is set on cancel and cleared on the next run_turn().
+#[gpui::test]
+async fn test_caduceus_bug14_extract_gated_on_cancel(cx: &mut TestAppContext) {
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    // Baseline: not cancelled, gen 0.
+    let (cancelled0, gen0) = thread.read_with(cx, |t, _| {
+        (t.last_turn_cancelled_for_test(), t.turn_generation_for_test())
+    });
+    assert!(!cancelled0, "fresh thread should not be flagged as cancelled");
+    assert_eq!(gen0, 0);
+
+    // Start a turn but cancel mid-stream (no Stop event sent → still in-flight).
+    let _events = thread
+        .update(cx, |t, cx| {
+            t.send(UserMessageId::new(), ["mid-stream cancel test"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    // Stream a chunk so there IS a pending agent message that flush() would
+    // commit — exactly the scenario where the racing extractor was firing.
+    fake_model.send_last_completion_stream_text_chunk("partial...");
+
+    let cancel_task = thread.update(cx, |t, cx| t.cancel(cx));
+    cx.run_until_parked();
+    cancel_task.await;
+    cx.run_until_parked();
+
+    // After cancel: flag is set, generation bumped — extraction is gated off.
+    let (cancelled1, gen1) = thread.read_with(cx, |t, _| {
+        (t.last_turn_cancelled_for_test(), t.turn_generation_for_test())
+    });
+    assert!(
+        cancelled1,
+        "Bug #14 regression: cancel() must set last_turn_cancelled = true \
+         to gate auto_extract_memories"
+    );
+    assert!(
+        gen1 > gen0,
+        "Bug C2 regression: cancel() must bump turn_generation \
+         (got {gen1}, expected > {gen0})"
+    );
+
+    // Start a fresh turn — flag clears so legitimate extraction is allowed.
+    let events = thread
+        .update(cx, |t, cx| {
+            t.send(UserMessageId::new(), ["clean follow-up turn"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake_model.send_last_completion_stream_text_chunk("done");
+    fake_model.send_last_completion_stream_event(
+        LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+    );
+    fake_model.end_last_completion_stream();
+    let _ = events.collect::<Vec<_>>().await;
+
+    let (cancelled2, gen2) = thread.read_with(cx, |t, _| {
+        (t.last_turn_cancelled_for_test(), t.turn_generation_for_test())
+    });
+    assert!(
+        !cancelled2,
+        "Bug #14 regression: starting a new turn must clear last_turn_cancelled"
+    );
+    assert!(gen2 > gen1, "turn_generation must advance on each new turn");
+}
+
+/// Bug C2: every cancel/new-turn boundary must bump `turn_generation`
+/// monotonically — deferred async work captured the value at scheduling
+/// time and bails out if generation has advanced.
+#[gpui::test]
+async fn test_caduceus_c2_turn_generation_monotonic(cx: &mut TestAppContext) {
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    let mut last_gen = thread.read_with(cx, |t, _| t.turn_generation_for_test());
+
+    for i in 0..3 {
+        let events = thread
+            .update(cx, |t, cx| {
+                t.send(
+                    UserMessageId::new(),
+                    [format!("turn {i}").as_str()],
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+        fake_model.send_last_completion_stream_text_chunk("x");
+        fake_model.send_last_completion_stream_event(
+            LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+        );
+        fake_model.end_last_completion_stream();
+        let _ = events.collect::<Vec<_>>().await;
+
+        let g = thread.read_with(cx, |t, _| t.turn_generation_for_test());
+        assert!(
+            g > last_gen,
+            "Bug C2 regression: turn_generation must advance every turn \
+             (turn {i}: was {last_gen}, now {g})"
+        );
+        last_gen = g;
+    }
+
+    // And cancel also bumps it.
+    let _events = thread
+        .update(cx, |t, cx| {
+            t.send(UserMessageId::new(), ["to be cancelled"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let cancel_task = thread.update(cx, |t, cx| t.cancel(cx));
+    cancel_task.await;
+    let g_final = thread.read_with(cx, |t, _| t.turn_generation_for_test());
+    assert!(
+        g_final > last_gen,
+        "Bug C2 regression: cancel() must also bump turn_generation \
+         (was {last_gen}, now {g_final})"
+    );
+}
+
+/// Bug #20: detached auth tasks must NOT outlive their session. The fix
+/// stores them in a session-scoped `Vec<Task<()>>` so dropping the Vec
+/// drops (and therefore aborts) the in-flight tasks. This test proves the
+/// gpui Task drop semantics our patch relies on actually work.
+#[gpui::test]
+async fn test_caduceus_bug20_session_scoped_tasks_abort_on_drop(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let started = std::sync::Arc::new(AtomicUsize::new(0));
+    let completed = std::sync::Arc::new(AtomicBool::new(false));
+
+    let tasks: std::sync::Arc<std::sync::Mutex<Vec<gpui::Task<()>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // Spawn a task that yields and would set `completed` if allowed to run.
+    {
+        let started = started.clone();
+        let completed = completed.clone();
+        let bg = cx.background_executor.clone();
+        let task = cx.background_executor.spawn(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            // A real timer is a true yield point — the executor reclaims
+            // control between the .await and the next instruction. If our
+            // Task handle has been dropped meanwhile, the future is aborted
+            // here and `completed` is never set.
+            bg.timer(std::time::Duration::from_millis(50)).await;
+            completed.store(true, Ordering::SeqCst);
+        });
+        tasks.lock().unwrap().push(task);
+    }
+
+    // Let the task start (poll once, hit the timer, suspend).
+    cx.run_until_parked();
+    assert!(
+        started.load(Ordering::SeqCst) >= 1,
+        "task should have polled at least once"
+    );
+
+    // Drop the Vec — this is the session-drop equivalent. Every Task<()>
+    // inside is dropped, and gpui aborts on drop.
+    drop(std::sync::Arc::try_unwrap(tasks).map(|m| m.into_inner().unwrap()).ok());
+
+    // Advance the executor past the timer deadline. If the bug is back
+    // (.detach() leaks the future), `completed` would flip to true.
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_millis(500));
+    for _ in 0..10 {
+        cx.run_until_parked();
+    }
+
+    assert!(
+        !completed.load(Ordering::SeqCst),
+        "Bug #20 regression: task continued after the holding Vec was dropped. \
+         The session-scoped Vec<Task<()>> pattern relies on gpui Task::drop \
+         aborting the future."
+    );
+}
+
+/// Bug C4: pinned context must survive compaction with stable, FIFO ordering.
+/// The Thread-side guarantee is that `list_pins()` returns items in the
+/// order they were pinned, even after many message exchanges that would
+/// have triggered a compaction round.
+#[gpui::test]
+async fn test_caduceus_c4_pin_ordering_survives_messages(cx: &mut TestAppContext) {
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    // Pin three items in a known order.
+    thread.update(cx, |t, _| {
+        t.pin_context("alpha", "first pinned content");
+        t.pin_context("bravo", "second pinned content");
+        t.pin_context("charlie", "third pinned content");
+    });
+
+    let labels0: Vec<String> = thread.read_with(cx, |t, _| {
+        t.list_pins().iter().map(|p| p.label.clone()).collect()
+    });
+    assert_eq!(
+        labels0,
+        vec!["alpha".to_string(), "bravo".to_string(), "charlie".to_string()],
+        "pins must be FIFO at insertion time"
+    );
+
+    // Drive a few turns — each one mutates messages and could conceivably
+    // touch context_pins if a future change wires compaction wrongly.
+    for i in 0..5 {
+        let events = thread
+            .update(cx, |t, cx| {
+                t.send(
+                    UserMessageId::new(),
+                    [format!("turn {i} ............................").as_str()],
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+        fake_model.send_last_completion_stream_text_chunk("ack");
+        fake_model.send_last_completion_stream_event(
+            LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+        );
+        fake_model.end_last_completion_stream();
+        let _ = events.collect::<Vec<_>>().await;
+    }
+
+    let labels1: Vec<String> = thread.read_with(cx, |t, _| {
+        t.list_pins().iter().map(|p| p.label.clone()).collect()
+    });
+    assert_eq!(
+        labels1, labels0,
+        "Bug C4 regression: pin ordering changed after message exchanges. \
+         Pins must survive compaction with their original FIFO order intact."
+    );
+
+    // Re-pinning an existing label should NOT split insertion order:
+    // it must update in place (or move to end) without dropping siblings.
+    thread.update(cx, |t, _| {
+        t.pin_context("bravo", "updated content");
+    });
+    let labels2: Vec<String> = thread.read_with(cx, |t, _| {
+        t.list_pins().iter().map(|p| p.label.clone()).collect()
+    });
+    assert!(
+        labels2.contains(&"alpha".to_string())
+            && labels2.contains(&"bravo".to_string())
+            && labels2.contains(&"charlie".to_string()),
+        "Bug C4 regression: re-pinning dropped a sibling pin. labels = {labels2:?}"
+    );
+    assert_eq!(
+        labels2.len(),
+        3,
+        "re-pinning the same label must dedupe, not duplicate. labels = {labels2:?}"
+    );
+
+    // Unpinning removes only the named one.
+    let removed = thread.update(cx, |t, _| t.unpin_context("alpha"));
+    assert!(removed, "unpin_context should report success");
+    let labels3: Vec<String> = thread.read_with(cx, |t, _| {
+        t.list_pins().iter().map(|p| p.label.clone()).collect()
+    });
+    assert!(!labels3.contains(&"alpha".to_string()));
+    assert_eq!(labels3.len(), 2);
+}
+
+// ========================================================================
+// DAG integration: register_running_subagent must emit a record_spawn
+// edge into caduceus_bridge::index_dag. Direct-module tests cover
+// record_spawn() in isolation; this test guards the wiring between Thread
+// and the DAG so regressions cannot silently break the panel/`/dag` view.
+// ========================================================================
+#[gpui::test]
+async fn test_caduceus_register_running_subagent_records_dag_spawn(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_store =
+        project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+    let model = Arc::new(FakeLanguageModel::default());
+
+    let parent = cx.new(|cx| {
+        Thread::new(
+            project.clone(),
+            project_context.clone(),
+            context_server_registry.clone(),
+            Templates::new(),
+            Some(model.clone()),
+            cx,
+        )
+    });
+    let subagent = cx.new(|cx| Thread::new_subagent(&parent, cx));
+    // Sonnet #1: child_id is now the SessionId (matches access-event id-space).
+    let child_session_id = subagent.read_with(cx, |t, _| t.id().0.to_string());
+
+    // Snapshot version & spawn list BEFORE — other tests may share the
+    // global registry, so we assert deltas, not absolute counts.
+    let version_before = caduceus_bridge::index_dag::version();
+    let spawns_before = caduceus_bridge::index_dag::spawn_snapshot();
+    let had_pair_before = spawns_before
+        .iter()
+        .any(|e| e.child_id == child_session_id);
+    assert!(
+        !had_pair_before,
+        "fresh subagent SessionId should not already have a spawn edge"
+    );
+
+    parent.update(cx, |thread, cx| {
+        thread.register_running_subagent(subagent.downgrade(), cx);
+    });
+
+    let spawns_after = caduceus_bridge::index_dag::spawn_snapshot();
+    assert!(
+        spawns_after.iter().any(|e| e.child_id == child_session_id),
+        "register_running_subagent did not emit a record_spawn for child {child_session_id} \
+         (DAG panel + `/dag` view would silently miss subagent edges)"
+    );
+    assert!(
+        caduceus_bridge::index_dag::version() > version_before,
+        "DAG version counter must advance on spawn — auto-refresh poller \
+         relies on this to detect changes"
+    );
+
+    // Sonnet #7: unregister must prune the spawn edge so terminated
+    // subagents don't ghost the DAG for up to 5 minutes.
+    let child_id_for_unregister = subagent.read_with(cx, |t, _| t.id().clone());
+    let version_after_register = caduceus_bridge::index_dag::version();
+    parent.update(cx, |thread, cx| {
+        thread.unregister_running_subagent(&child_id_for_unregister, cx);
+    });
+    let spawns_after_unregister = caduceus_bridge::index_dag::spawn_snapshot();
+    assert!(
+        !spawns_after_unregister
+            .iter()
+            .any(|e| e.child_id == child_session_id),
+        "unregister_running_subagent did not prune the spawn edge for {child_session_id} — \
+         DAG would show a ghost edge for an agent that's no longer running"
+    );
+    assert!(
+        caduceus_bridge::index_dag::version() > version_after_register,
+        "remove_spawn must bump the version counter so the auto-refresh \
+         poller redraws after a subagent exits"
+    );
 }
