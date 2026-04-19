@@ -77,17 +77,21 @@ pub fn snapshot() -> Vec<ContextEvent> {
 /// Total events ever recorded since process start (including evicted ones).
 /// Useful for the "if zero, something is off" sanity signal.
 pub fn total_recorded() -> usize {
-    static COUNTER: OnceLock<std::sync::atomic::AtomicUsize> = OnceLock::new();
-    COUNTER
-        .get_or_init(|| std::sync::atomic::AtomicUsize::new(0))
-        .load(std::sync::atomic::Ordering::Relaxed)
+    counter().load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn bump_counter() {
+    counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Shared module-level counter. `total_recorded` and `bump_counter` previously
+/// each declared their own function-scope `static OnceLock<AtomicUsize>`, which
+/// made them two distinct statics — `bump_counter` incremented one, while
+/// `total_recorded` read the other (always 0). The shared accessor here ensures
+/// both observe the same atomic.
+fn counter() -> &'static std::sync::atomic::AtomicUsize {
     static COUNTER: OnceLock<std::sync::atomic::AtomicUsize> = OnceLock::new();
-    COUNTER
-        .get_or_init(|| std::sync::atomic::AtomicUsize::new(0))
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    COUNTER.get_or_init(|| std::sync::atomic::AtomicUsize::new(0))
 }
 
 pub fn record_and_count(kind: ContextEventKind) {
@@ -133,5 +137,25 @@ mod tests {
         if let (Some(a), Some(b)) = (idx_first, idx_second) {
             assert!(b < a, "newest should appear before older in snapshot");
         }
+    }
+
+    #[test]
+    fn record_and_count_increments_observable_total() {
+        // Regression for: total_recorded() and bump_counter() previously
+        // declared two distinct function-scope OnceLock<AtomicUsize> statics,
+        // so total_recorded always returned 0. After unifying via counter()
+        // they must share state.
+        let before = total_recorded();
+        for i in 0..3 {
+            record_and_count(ContextEventKind::MessageEvicted {
+                count: i,
+                reason: "counter-regression".into(),
+            });
+        }
+        let after = total_recorded();
+        assert!(
+            after >= before + 3,
+            "total_recorded must reflect bump_counter writes (before={before}, after={after})"
+        );
     }
 }
