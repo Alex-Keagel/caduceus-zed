@@ -3820,6 +3820,9 @@ impl Thread {
                 If errors are found, fix them before moving on. This is the verify step.\n\
                 **Show-before-apply**: For large changes (>20 lines), show a brief summary of what you'll change \
                 before applying edits. List files and the type of change (add/modify/delete).\n\
+                **Work incrementally**: Create files ONE AT A TIME, not all at once. \
+                After each file, confirm it was created successfully before moving to the next. \
+                Never try to create an entire project in a single response — break it into steps.\n\
                 Before spawning sub-agents: explain plan, wait for approval.".to_string()
             ));
 
