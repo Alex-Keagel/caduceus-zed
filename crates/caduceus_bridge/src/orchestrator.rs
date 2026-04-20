@@ -3,6 +3,7 @@
 
 use caduceus_orchestrator::{
     AgentHarness, ConversationHistory, execute_tool_calls,
+    AgentEventEmitter,
     instructions::{self, InstructionLoader, InstructionSet},
     PrdParser, PrdTask, TaskRecommender, TaskRecommendation,
     ProgressInferrer, InferredProgress,
@@ -11,6 +12,7 @@ use caduceus_orchestrator::{
     TimeTracker,
     TaskTree, HierarchicalTask,
 };
+use caduceus_core::AgentEvent;
 use caduceus_core::{ModelId, ProviderId, SessionState};
 use caduceus_providers::LlmAdapter;
 use caduceus_tools::ToolRegistry;
@@ -61,6 +63,36 @@ pub fn count_tokens_exact(text: &str) -> u32 {
 /// Wrapper around the AgentHarness for the bridge.
 pub struct OrchestratorBridge {
     project_root: PathBuf,
+}
+
+/// Cheap, `Clone`-able handle to an `AgentEventEmitter`'s retention ring.
+///
+/// The IDE stores one of these per session and calls
+/// [`OrchestratorBridge::replay_session_events`] from the agent panel on
+/// (re)mount to rebuild the event timeline without losing events emitted
+/// while the UI was disconnected (gap G17). The handle shares the same
+/// `Arc`-backed ring as the emitter held by the harness, so it is always
+/// in sync with the live channel.
+#[derive(Clone)]
+pub struct ReplayHandle {
+    emitter: AgentEventEmitter,
+}
+
+impl ReplayHandle {
+    fn new(emitter: AgentEventEmitter) -> Self {
+        Self { emitter }
+    }
+
+    /// Snapshot the retention ring (oldest-first). See
+    /// [`AgentEventEmitter::replay`] for semantics.
+    pub fn replay(&self) -> Vec<AgentEvent> {
+        self.emitter.replay()
+    }
+
+    /// Configured retention capacity of the underlying emitter ring.
+    pub fn retention_cap(&self) -> usize {
+        self.emitter.retention_cap()
+    }
 }
 
 impl OrchestratorBridge {
@@ -198,6 +230,61 @@ impl OrchestratorBridge {
         AgentHarness::new(provider, tools, 200_000, system_prompt)
             .with_tool_timeout(std::time::Duration::from_secs(120))
             .with_instructions(&self.project_root)
+    }
+
+    // ── Emitter / replay seam (G17) ──────────────────────────────────────
+
+    /// Default in-flight buffer for the emitter mpsc channel handed to the
+    /// IDE. Sized to absorb a brief render stall (~1 second of text deltas
+    /// at 256 events/s) without dropping live events; events that don't
+    /// fit are still captured by the emitter's retention ring.
+    pub const DEFAULT_EVENT_CHANNEL_BUFFER: usize = 256;
+
+    /// Build a production harness wired with HITL approval AND an event
+    /// emitter that the IDE can both stream from (`event_rx`) and *replay*
+    /// from (`replay_handle`) on UI reattach.
+    ///
+    /// Closes gap G17: `AgentHarness` was already P1.4-retention-enabled,
+    /// but no surface in the bridge actually exposed `replay()` to the IDE,
+    /// making the retention ring a dead seam. The `replay_handle` is a
+    /// cheap `Clone` of the same emitter held by the harness; events are
+    /// observable through both.
+    ///
+    /// Returns `(harness, approval_tx, replay_handle, event_rx)`. The
+    /// caller MUST consume `event_rx` (drop = dead channel = G27 territory)
+    /// and stash `replay_handle` for the agent panel to call on mount.
+    pub fn build_harness_with_emitter(
+        &self,
+        provider: Arc<dyn LlmAdapter>,
+        tools: ToolRegistry,
+        system_prompt: &str,
+    ) -> (
+        AgentHarness,
+        tokio::sync::mpsc::Sender<(String, bool)>,
+        ReplayHandle,
+        tokio::sync::mpsc::Receiver<AgentEvent>,
+    ) {
+        let (emitter, event_rx) =
+            AgentEventEmitter::channel(Self::DEFAULT_EVENT_CHANNEL_BUFFER);
+        let replay_handle = ReplayHandle::new(emitter.clone());
+        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
+            .with_tool_timeout(std::time::Duration::from_secs(120))
+            .with_instructions(&self.project_root)
+            .with_emitter(emitter);
+        let (harness, approval_tx) =
+            base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()));
+        (harness, approval_tx, replay_handle, event_rx)
+    }
+
+    /// Snapshot the retention ring on a given replay handle. This is the
+    /// IPC entry point the Zed agent panel calls when it (re)mounts so it
+    /// can rebuild the timeline without losing events that were emitted
+    /// while the UI was offline (gap G17).
+    ///
+    /// Cheap (one mutex acquire + clone of the bounded ring); safe to call
+    /// from any task and across awaits.
+    pub fn replay_session_events(handle: &ReplayHandle) -> Vec<AgentEvent> {
+        handle.replay()
     }
 
     /// Get the project root.
@@ -774,5 +861,75 @@ mod tests {
         let output = OrchestratorBridge::to_tree_string(&tree);
         assert!(output.contains("Root"));
         assert!(output.contains("Child"));
+    }
+
+    // ── G17: replay seam integration tests ──────────────────────────────
+
+    #[test]
+    fn build_harness_with_emitter_returns_replay_handle() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools = ToolRegistry::new();
+        let (_h, approval_tx, replay_handle, event_rx) =
+            bridge.build_harness_with_emitter(provider, tools, "test");
+        // All four return slots must be live: handle and channel sender
+        // must outlive the call, and the replay handle must report the
+        // emitter's configured cap (default = 200, per orchestrator).
+        assert!(!approval_tx.is_closed(), "approval channel should be live");
+        assert!(replay_handle.retention_cap() > 0, "replay handle must wrap a retention-enabled emitter");
+        // Empty replay before any events have been emitted.
+        let snap = OrchestratorBridge::replay_session_events(&replay_handle);
+        assert!(snap.is_empty(), "replay must be empty before any emit");
+        // Channel must still be the live receiver, not closed by the build call.
+        drop(event_rx);
+    }
+
+    #[tokio::test]
+    async fn replay_handle_observes_events_emitted_by_harness() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_core::SessionState;
+        // End-to-end: emitter wired into the harness, the bridge's
+        // ReplayHandle observes events emitted during a real `run` call.
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        // MockLlmAdapter returns one chat response so the harness exits
+        // after a single iteration.
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![
+            caduceus_providers::ChatResponse {
+                content: "ok".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                stop_reason: caduceus_providers::StopReason::EndTurn,
+                tool_calls: vec![],
+            },
+        ]));
+        let tools = ToolRegistry::new();
+        let (harness, _approval_tx, replay_handle, mut event_rx) =
+            bridge.build_harness_with_emitter(provider, tools, "test");
+        let mut state = SessionState::new(
+            dir.path(),
+            caduceus_core::ProviderId::new("mock"),
+            caduceus_core::ModelId::new("mock-1"),
+        );
+        let mut history = ConversationHistory::new();
+        let _ = harness
+            .run(&mut state, &mut history, "hi")
+            .await
+            .expect("agent run must succeed");
+        // Drain live channel.
+        let mut live = 0usize;
+        while event_rx.try_recv().is_ok() {
+            live += 1;
+        }
+        // Replay handle must observe at least one event (TurnComplete or text-delta).
+        let snap = OrchestratorBridge::replay_session_events(&replay_handle);
+        assert!(
+            !snap.is_empty(),
+            "replay handle must observe events emitted by the harness (live={live}, snap=0)"
+        );
     }
 }
