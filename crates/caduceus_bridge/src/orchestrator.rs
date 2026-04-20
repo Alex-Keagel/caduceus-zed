@@ -53,6 +53,15 @@ pub use caduceus_orchestrator::checkpoint::{
     CheckpointId as BridgeCheckpointId, CheckpointStore as BridgeCheckpointStore,
     FileSnapshot as BridgeFileSnapshot, ToolBatchCheckpoint as BridgeToolBatchCheckpoint,
 };
+pub use caduceus_orchestrator::broadcast_bus::{
+    BroadcastBus as BridgeBroadcastBus, BusError as BridgeBusError,
+    BusMessage as BridgeBusMessage,
+};
+pub use caduceus_orchestrator::notifications::{
+    self as bridge_notifications, NOTIFICATIONS_CHANNEL as BRIDGE_NOTIFICATIONS_CHANNEL,
+    Notification as BridgeNotification, Severity as BridgeNotificationSeverity,
+};
+pub use caduceus_orchestrator::automations::AutomationResult as BridgeAutomationResult;
 pub use caduceus_core::ModelId as BridgeModelId;
 
 /// P3.1 — Apply a [`BridgePlanAmendment`] to a [`BridgeActionPlan`] from the
@@ -159,6 +168,49 @@ pub fn revert_checkpoint(
 pub fn list_checkpoints_json(store: &BridgeCheckpointStore) -> Result<String, String> {
     let v: Vec<&BridgeToolBatchCheckpoint> = store.list();
     serde_json::to_string(&v).map_err(|e| e.to_string())
+}
+
+// ── P3.4 — background notifications fabric ───────────────────────────────
+//
+// The IDE shell creates a single [`BridgeBroadcastBus`] per session and
+// stores it next to the harness. Background workers (automations, cron,
+// MCP reload) call [`publish_notification`] / [`publish_automation_completion`]
+// when they finish; the bridge subscribes via [`subscribe_notifications`]
+// and forwards each `BridgeNotification` to the React panel as a toast.
+//
+// All publishers are `&self` and lock-free on the hot path. A publish
+// to a channel with zero subscribers is a silent drop, not an error.
+
+/// Subscribe to the notifications channel. Always succeeds.
+pub fn subscribe_notifications(
+    bus: &BridgeBroadcastBus,
+) -> tokio::sync::broadcast::Receiver<BridgeBusMessage> {
+    bridge_notifications::subscribe(bus)
+}
+
+/// Publish a typed notification. Returns the number of receivers, or
+/// `BridgeBusError::NoSubscribers` if nobody is listening.
+pub fn publish_notification(
+    bus: &BridgeBroadcastBus,
+    n: BridgeNotification,
+) -> Result<usize, BridgeBusError> {
+    bridge_notifications::publish(bus, n)
+}
+
+/// Sugar: convert an [`BridgeAutomationResult`] to a notification and
+/// publish it. Failed runs become `Severity::Error`.
+pub fn publish_automation_completion(
+    bus: &BridgeBroadcastBus,
+    result: &BridgeAutomationResult,
+) -> Result<usize, BridgeBusError> {
+    bridge_notifications::publish_automation_completion(bus, result)
+}
+
+/// Render a [`BridgeBusMessage`] payload as a typed
+/// [`BridgeNotification`]. Returns `Err` only if the message did not
+/// originate from the notifications publisher (malformed JSON).
+pub fn parse_notification(msg: &BridgeBusMessage) -> Result<BridgeNotification, String> {
+    serde_json::from_str(&msg.content).map_err(|e| e.to_string())
 }
 
 /// Exact token count using tiktoken (cl100k_base, used by GPT-4/Claude).
@@ -1645,5 +1697,95 @@ mod tests {
         let mut store = new_checkpoint_store();
         let err = commit_checkpoint(&mut store, BridgeCheckpointId(42)).unwrap_err();
         assert!(matches!(err, BridgeCheckpointError::Unknown(_)));
+    }
+
+    // ── P3.4 — notifications bridge ──────────────────────────────────────
+
+    fn dummy_automation_result(success: bool) -> BridgeAutomationResult {
+        use chrono::Utc;
+        BridgeAutomationResult {
+            automation_id: "nightly".into(),
+            trigger_event: "cron".into(),
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            success,
+            output: "done".into(),
+            tokens_used: Default::default(),
+            cost_usd: 0.0,
+            commit_sha: None,
+            pr_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn p3_4_publish_notification_round_trips_through_bridge() {
+        let bus = BridgeBroadcastBus::new();
+        let mut rx = subscribe_notifications(&bus);
+        let n = BridgeNotification::info("test", "title", "body");
+        let delivered = publish_notification(&bus, n.clone()).unwrap();
+        assert_eq!(delivered, 1);
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(msg.channel, BRIDGE_NOTIFICATIONS_CHANNEL);
+        let parsed = parse_notification(&msg).unwrap();
+        assert_eq!(parsed, n);
+    }
+
+    #[tokio::test]
+    async fn p3_4_automation_completion_published_via_bridge() {
+        let bus = BridgeBroadcastBus::new();
+        let mut rx = subscribe_notifications(&bus);
+        publish_automation_completion(&bus, &dummy_automation_result(true)).unwrap();
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let n = parse_notification(&msg).unwrap();
+        assert_eq!(n.severity, BridgeNotificationSeverity::Info);
+        assert_eq!(n.source, "automation:nightly");
+    }
+
+    #[tokio::test]
+    async fn p3_4_automation_failure_published_with_error_severity() {
+        let bus = BridgeBroadcastBus::new();
+        let mut rx = subscribe_notifications(&bus);
+        publish_automation_completion(&bus, &dummy_automation_result(false)).unwrap();
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let n = parse_notification(&msg).unwrap();
+        assert_eq!(n.severity, BridgeNotificationSeverity::Error);
+        assert!(n.title.contains("failed"));
+    }
+
+    #[test]
+    fn p3_4_publish_without_subscribers_surfaces_no_subscribers() {
+        let bus = BridgeBroadcastBus::new();
+        let n = BridgeNotification::info("s", "t", "b");
+        let err = publish_notification(&bus, n).unwrap_err();
+        assert!(matches!(err, BridgeBusError::NoSubscribers(_)));
+    }
+
+    #[test]
+    fn p3_4_parse_notification_rejects_malformed_payload() {
+        let msg = BridgeBusMessage {
+            from: "x".into(),
+            content: "not json".into(),
+            timestamp: 0,
+            channel: BRIDGE_NOTIFICATIONS_CHANNEL.into(),
+        };
+        assert!(parse_notification(&msg).is_err());
     }
 }
