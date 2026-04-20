@@ -2406,6 +2406,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "caduceus-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "caduceus-core",
+ "caduceus-orchestrator",
+ "caduceus-providers",
+ "caduceus-tools",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "caduceus-git"
 version = "0.1.0"
 dependencies = [
@@ -2629,6 +2647,7 @@ dependencies = [
  "async-trait",
  "caduceus-core",
  "caduceus-crdt",
+ "caduceus-eval",
  "caduceus-git",
  "caduceus-marketplace",
  "caduceus-mcp",

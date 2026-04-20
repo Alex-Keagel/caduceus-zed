@@ -19,6 +19,7 @@ caduceus-crdt = { workspace = true }
 caduceus-marketplace = { workspace = true }
 caduceus-runtime = { workspace = true }
 caduceus-mcp = { workspace = true }
+caduceus-eval = { workspace = true }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

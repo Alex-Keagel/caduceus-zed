@@ -269,6 +269,7 @@ caduceus-permissions = { path = "../caduceus/crates/caduceus-permissions" }
 caduceus-crdt = { path = "../caduceus/crates/caduceus-crdt" }
 caduceus-runtime = { path = "../caduceus/crates/caduceus-runtime" }
 caduceus-mcp = { path = "../caduceus/crates/caduceus-mcp" }
+caduceus-eval = { path = "../caduceus/crates/caduceus-eval" }
 caduceus-marketplace = { path = "../caduceus/crates/caduceus-marketplace" }
 caduceus_bridge = { path = "crates/caduceus_bridge" }
 

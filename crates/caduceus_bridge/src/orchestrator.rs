@@ -85,6 +85,33 @@ pub use caduceus_orchestrator::notifications::{
 pub use caduceus_orchestrator::automations::AutomationResult as BridgeAutomationResult;
 pub use caduceus_core::ModelId as BridgeModelId;
 
+// ── P7.1 — StepId on SessionState (G26) ─────────────────────────────────
+pub use caduceus_core::StepId as BridgeStepId;
+
+// ── P7.2 — OpenTelemetry GenAI mapper (G23) ─────────────────────────────
+pub use caduceus_telemetry::genai::{
+    GenAiContext as BridgeGenAiContext, GenAiMapper as BridgeGenAiMapper,
+    GenAiSpan as BridgeGenAiSpan, GenAiSpanExporter as BridgeGenAiSpanExporter,
+    GenAiValue as BridgeGenAiValue, JsonlGenAiExporter as BridgeJsonlGenAiExporter,
+};
+
+// ── P7.3 — Trajectory recorder / replayer (G22) ─────────────────────────
+pub use caduceus_eval::{
+    RecordingLlmAdapter as BridgeRecordingLlmAdapter,
+    ReplayingLlmAdapter as BridgeReplayingLlmAdapter, Trajectory as BridgeTrajectory,
+    TrajectoryEntry as BridgeTrajectoryEntry, TrajectoryRecorder as BridgeTrajectoryRecorder,
+};
+
+// ── P8.1 / P8.2 / P8.4 — Step verification & process-reward ─────────────
+pub use caduceus_core::{
+    EnsembleCombiner as BridgeEnsembleCombiner,
+    EnsembleStepVerifier as BridgeEnsembleStepVerifier,
+    ObservedToolCall as BridgeObservedToolCall, OffStepVerifier as BridgeOffStepVerifier,
+    StepScore as BridgeStepScore, StepVerifier as BridgeStepVerifier,
+    StepView as BridgeStepView,
+};
+pub use caduceus_orchestrator::rollout_prm::RolloutPrmVerifier as BridgeRolloutPrmVerifier;
+
 /// P3.1 — Apply a [`BridgePlanAmendment`] to a [`BridgeActionPlan`] from the
 /// IPC layer. Accepts the JSON shape produced by the React panel and returns
 /// either the new plan revision metadata or a typed error so the UI can
@@ -2597,5 +2624,47 @@ mod tests {
         // ReplayHandle is Clone-shared per its doc comment.
         assert_send_sync::<ReplayHandle>();
         assert_clone::<ReplayHandle>();
+    }
+
+    // ── P7 / P8 bridge re-export contracts ──────────────────────────────
+
+    #[test]
+    fn p7_1_step_id_is_value_type() {
+        // BridgeStepId is a Copy newtype around u64; the IDE uses it
+        // as a key in event timelines.
+        let s = BridgeStepId(42);
+        let s2 = s; // Copy
+        assert_eq!(s.0, s2.0);
+    }
+
+    #[test]
+    fn p7_2_genai_exporter_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<BridgeJsonlGenAiExporter>();
+        assert_send_sync::<BridgeGenAiSpan>();
+    }
+
+    #[test]
+    fn p7_3_trajectory_types_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<BridgeTrajectoryRecorder>();
+        assert_send_sync::<BridgeTrajectory>();
+    }
+
+    #[test]
+    fn p8_1_step_verifier_object_safe() {
+        // The trait must remain object-safe so callers can hold an
+        // `Arc<dyn BridgeStepVerifier>` in IPC handlers.
+        fn assert_object_safe(_: &dyn BridgeStepVerifier) {}
+        let off = BridgeOffStepVerifier;
+        assert_object_safe(&off);
+    }
+
+    #[test]
+    fn p8_4_ensemble_combiner_variants_exposed() {
+        // Sanity: every combiner variant is constructible from the bridge.
+        let _ = BridgeEnsembleCombiner::Mean;
+        let _ = BridgeEnsembleCombiner::Median;
+        let _ = BridgeEnsembleCombiner::Threshold(0.5);
     }
 }
