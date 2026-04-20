@@ -43,7 +43,41 @@ pub use caduceus_orchestrator::{
 
 // Re-export types needed by tools.
 pub use caduceus_orchestrator::modes::AgentMode as BridgeAgentMode;
+pub use caduceus_orchestrator::modes::{
+    ActionPlan as BridgeActionPlan, AmendError as BridgeAmendError,
+    AppliedAmendment as BridgeAppliedAmendment, PlanAmendment as BridgePlanAmendment,
+    PlannedAction as BridgePlannedAction,
+};
 pub use caduceus_core::ModelId as BridgeModelId;
+
+/// P3.1 — Apply a [`BridgePlanAmendment`] to a [`BridgeActionPlan`] from the
+/// IPC layer. Accepts the JSON shape produced by the React panel and returns
+/// either the new plan revision metadata or a typed error so the UI can
+/// re‑render. Stale revisions are surfaced explicitly, never silently merged.
+///
+/// The caller (Tauri command in the IDE shell) is expected to:
+/// 1. Hold the live `ActionPlan` (one per turn).
+/// 2. Pass the user's edit as a `PlanAmendment` JSON payload.
+/// 3. Forward the returned [`caduceus_core::AgentEvent::PlanAmended`] event
+///    to the UI emitter.
+pub fn apply_plan_amendment(
+    plan: &mut BridgeActionPlan,
+    amendment_json: &str,
+) -> Result<BridgeAppliedAmendment, BridgeAmendError> {
+    let amendment: BridgePlanAmendment = serde_json::from_str(amendment_json)
+        .map_err(|_| BridgeAmendError::StaleRevision {
+            expected: 0,
+            actual: plan.revision,
+        })?;
+    plan.apply_amendment(amendment)
+}
+
+/// P3.1 — Render a snapshot of the current [`BridgeActionPlan`] as JSON for
+/// the UI. The shape mirrors the per‑step revision so the React panel can
+/// detect divergence on the next amendment attempt.
+pub fn snapshot_plan_json(plan: &BridgeActionPlan) -> Result<String, String> {
+    serde_json::to_string(plan).map_err(|e| e.to_string())
+}
 
 /// Exact token count using tiktoken (cl100k_base, used by GPT-4/Claude).
 /// Falls back to the heuristic estimate if tokenizer initialization fails.
@@ -1352,5 +1386,96 @@ mod tests {
         assert!(h.speculative_cache().is_some());
         assert!(h.reflexion().is_some());
         assert!(h.tot_config().is_some());
+    }
+
+    // ── P3.1 — amend_plan IPC bridge ────────────────────────────────────
+
+    #[test]
+    fn p3_1_apply_replace_amendment_via_bridge() {
+        let mut plan = BridgeActionPlan::new();
+        plan.add("read_file", &serde_json::json!({"path": "/a"}));
+        plan.add("write_file", &serde_json::json!({"path": "/b", "content": "x"}));
+        let rev = plan.actions[0].revision;
+        let amend = serde_json::json!({
+            "kind": "replace",
+            "step": 1,
+            "args": {"path": "/c"},
+            "description": "read /c",
+            "expected_revision": rev,
+        });
+        let res = apply_plan_amendment(&mut plan, &amend.to_string()).unwrap();
+        assert_eq!(res.step, 1);
+        assert_eq!(plan.actions[0].args, serde_json::json!({"path": "/c"}));
+    }
+
+    #[test]
+    fn p3_1_stale_revision_rejected() {
+        let mut plan = BridgeActionPlan::new();
+        plan.add("read_file", &serde_json::json!({"path": "/a"}));
+        let amend = serde_json::json!({
+            "kind": "replace",
+            "step": 1,
+            "args": {"path": "/c"},
+            "description": "x",
+            "expected_revision": 9999,
+        });
+        let err = apply_plan_amendment(&mut plan, &amend.to_string()).unwrap_err();
+        match err {
+            BridgeAmendError::StaleRevision { .. } => {}
+            other => panic!("expected StaleRevision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p3_1_malformed_json_returns_stale_not_panic() {
+        let mut plan = BridgeActionPlan::new();
+        let err = apply_plan_amendment(&mut plan, "{not json").unwrap_err();
+        assert!(matches!(err, BridgeAmendError::StaleRevision { .. }));
+    }
+
+    #[test]
+    fn p3_1_insert_amendment_renumbers_subsequent_steps() {
+        let mut plan = BridgeActionPlan::new();
+        plan.add("a", &serde_json::json!({}));
+        plan.add("b", &serde_json::json!({}));
+        let amend = serde_json::json!({
+            "kind": "insert",
+            "after_step": 1,
+            "tool_name": "mid",
+            "args": {},
+            "description": "mid",
+            "expected_plan_revision": plan.revision,
+        });
+        let res = apply_plan_amendment(&mut plan, &amend.to_string()).unwrap();
+        assert_eq!(res.step, 2);
+        assert_eq!(plan.actions.len(), 3);
+        assert_eq!(plan.actions[1].tool_name, "mid");
+        assert_eq!(plan.actions[2].tool_name, "b");
+    }
+
+    #[test]
+    fn p3_1_remove_amendment_drops_step() {
+        let mut plan = BridgeActionPlan::new();
+        plan.add("a", &serde_json::json!({}));
+        plan.add("b", &serde_json::json!({}));
+        let rev = plan.actions[0].revision;
+        let amend = serde_json::json!({
+            "kind": "remove",
+            "step": 1,
+            "expected_revision": rev,
+        });
+        apply_plan_amendment(&mut plan, &amend.to_string()).unwrap();
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].tool_name, "b");
+    }
+
+    #[test]
+    fn p3_1_snapshot_plan_json_round_trips() {
+        let mut plan = BridgeActionPlan::new();
+        plan.add("read_file", &serde_json::json!({"path": "/x"}));
+        let json = snapshot_plan_json(&plan).unwrap();
+        let restored: BridgeActionPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.actions.len(), 1);
+        assert_eq!(restored.revision, plan.revision);
     }
 }
