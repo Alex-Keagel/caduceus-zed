@@ -48,6 +48,11 @@ pub use caduceus_orchestrator::modes::{
     AppliedAmendment as BridgeAppliedAmendment, PlanAmendment as BridgePlanAmendment,
     PlannedAction as BridgePlannedAction,
 };
+pub use caduceus_orchestrator::checkpoint::{
+    BatchState as BridgeBatchState, CheckpointError as BridgeCheckpointError,
+    CheckpointId as BridgeCheckpointId, CheckpointStore as BridgeCheckpointStore,
+    FileSnapshot as BridgeFileSnapshot, ToolBatchCheckpoint as BridgeToolBatchCheckpoint,
+};
 pub use caduceus_core::ModelId as BridgeModelId;
 
 /// P3.1 — Apply a [`BridgePlanAmendment`] to a [`BridgeActionPlan`] from the
@@ -77,6 +82,83 @@ pub fn apply_plan_amendment(
 /// detect divergence on the next amendment attempt.
 pub fn snapshot_plan_json(plan: &BridgeActionPlan) -> Result<String, String> {
     serde_json::to_string(plan).map_err(|e| e.to_string())
+}
+
+// ── P3.3 — per-tool-batch checkpoint + 1-click revert ─────────────────────
+//
+// The IDE shell owns a [`BridgeCheckpointStore`] for each agent session.
+// Tool wrappers must call [`begin_checkpoint`] before mutating files and
+// [`record_checkpoint_edit`] for each pre-image. After the batch finishes
+// (success or failure), the bridge calls [`commit_checkpoint`] to freeze the
+// snapshot. The React side renders the timeline via [`list_checkpoints_json`]
+// and triggers a one-click revert through [`revert_checkpoint`], which
+// returns the pre-images so the host can write them back to disk.
+//
+// The store is purely an in-memory ring (default cap 64); no I/O happens
+// inside this module — keeping the bridge filesystem-agnostic and trivial
+// to test under both Tauri and the headless CLI runner.
+
+/// Construct an empty checkpoint store with the orchestrator's default
+/// capacity (64). Wrap in `Arc<Mutex<_>>` to share with the harness via
+/// `AgentHarness::with_checkpoint_store`.
+pub fn new_checkpoint_store() -> BridgeCheckpointStore {
+    BridgeCheckpointStore::default()
+}
+
+/// Begin a new tool-batch checkpoint. `tool_summary` is rendered verbatim
+/// in the UI timeline (e.g. `"edit_file: src/lib.rs"`). `now_secs` is wall‑
+/// clock seconds since epoch; the bridge passes
+/// `SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()`.
+pub fn begin_checkpoint(
+    store: &mut BridgeCheckpointStore,
+    turn_index: u32,
+    tool_summary: impl Into<String>,
+    now_secs: u64,
+) -> BridgeCheckpointId {
+    store.begin_batch(turn_index, tool_summary.into(), now_secs)
+}
+
+/// Record a pre-image for `path`. Pass `before = None` if the file did
+/// not exist before this batch (revert then deletes it). Returns
+/// `Err(BridgeCheckpointError::Unknown)` if the id is stale (evicted or
+/// invalid) and `Err(BridgeCheckpointError::AlreadyClosed)` if the batch
+/// has already been committed or reverted.
+pub fn record_checkpoint_edit(
+    store: &mut BridgeCheckpointStore,
+    id: BridgeCheckpointId,
+    path: PathBuf,
+    before: Option<String>,
+) -> Result<(), BridgeCheckpointError> {
+    store.record_edit(id, path, before)
+}
+
+/// Freeze a checkpoint after the tool batch finishes. Idempotent in the
+/// sense that committing twice surfaces `AlreadyClosed` — the bridge
+/// should treat that as success when the UI has not yet updated.
+pub fn commit_checkpoint(
+    store: &mut BridgeCheckpointStore,
+    id: BridgeCheckpointId,
+) -> Result<(), BridgeCheckpointError> {
+    store.commit(id).map(|_| ())
+}
+
+/// One-click revert. Returns the recorded pre-images so the host can
+/// apply them. Marks the batch `Reverted` on success; subsequent reverts
+/// of the same id return `AlreadyClosed`. The harness, when wired,
+/// emits `CheckpointReverted` so the timeline updates.
+pub fn revert_checkpoint(
+    store: &mut BridgeCheckpointStore,
+    id: BridgeCheckpointId,
+) -> Result<Vec<BridgeFileSnapshot>, BridgeCheckpointError> {
+    store.revert(id)
+}
+
+/// Render the full checkpoint timeline as JSON for the React panel.
+/// Order is newest-first (matches `CheckpointStore::list`); the panel
+/// can render directly without reversing.
+pub fn list_checkpoints_json(store: &BridgeCheckpointStore) -> Result<String, String> {
+    let v: Vec<&BridgeToolBatchCheckpoint> = store.list();
+    serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
 /// Exact token count using tiktoken (cl100k_base, used by GPT-4/Claude).
@@ -1477,5 +1559,91 @@ mod tests {
         let restored: BridgeActionPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.actions.len(), 1);
         assert_eq!(restored.revision, plan.revision);
+    }
+
+    // ── P3.3 — checkpoint bridge ─────────────────────────────────────────
+
+    #[test]
+    fn p3_3_begin_record_commit_revert_round_trips() {
+        let mut store = new_checkpoint_store();
+        let id = begin_checkpoint(&mut store, 1, "edit_file", 100);
+        record_checkpoint_edit(
+            &mut store,
+            id,
+            PathBuf::from("/repo/src/lib.rs"),
+            Some("old".into()),
+        )
+        .unwrap();
+        record_checkpoint_edit(
+            &mut store,
+            id,
+            PathBuf::from("/repo/new_file.rs"),
+            None,
+        )
+        .unwrap();
+        commit_checkpoint(&mut store, id).unwrap();
+
+        let snaps = revert_checkpoint(&mut store, id).unwrap();
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps[0].before.as_deref(), Some("old"));
+        assert!(snaps[1].before.is_none());
+    }
+
+    #[test]
+    fn p3_3_record_after_commit_fails_closed() {
+        let mut store = new_checkpoint_store();
+        let id = begin_checkpoint(&mut store, 0, "noop", 0);
+        commit_checkpoint(&mut store, id).unwrap();
+        let err = record_checkpoint_edit(
+            &mut store,
+            id,
+            PathBuf::from("/x"),
+            Some("y".into()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, BridgeCheckpointError::AlreadyCommitted(_)));
+    }
+
+    #[test]
+    fn p3_3_revert_unknown_id_fails_closed() {
+        let mut store = new_checkpoint_store();
+        let err = revert_checkpoint(&mut store, BridgeCheckpointId(9999)).unwrap_err();
+        assert!(matches!(err, BridgeCheckpointError::Unknown(_)));
+    }
+
+    #[test]
+    fn p3_3_double_revert_fails_closed() {
+        let mut store = new_checkpoint_store();
+        let id = begin_checkpoint(&mut store, 0, "edit", 0);
+        record_checkpoint_edit(&mut store, id, PathBuf::from("/a"), Some("x".into()))
+            .unwrap();
+        commit_checkpoint(&mut store, id).unwrap();
+        revert_checkpoint(&mut store, id).unwrap();
+        let err = revert_checkpoint(&mut store, id).unwrap_err();
+        assert!(matches!(err, BridgeCheckpointError::AlreadyReverted(_)));
+    }
+
+    #[test]
+    fn p3_3_list_checkpoints_json_renders_timeline() {
+        let mut store = new_checkpoint_store();
+        let id1 = begin_checkpoint(&mut store, 1, "edit_file: a", 1);
+        commit_checkpoint(&mut store, id1).unwrap();
+        let id2 = begin_checkpoint(&mut store, 2, "edit_file: b", 2);
+        commit_checkpoint(&mut store, id2).unwrap();
+
+        let json = list_checkpoints_json(&store).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // CheckpointStore::list returns newest-first.
+        assert_eq!(arr[0]["tool_summary"], "edit_file: b");
+        assert_eq!(arr[1]["tool_summary"], "edit_file: a");
+    }
+
+    #[test]
+    fn p3_3_commit_unknown_id_fails_closed() {
+        let mut store = new_checkpoint_store();
+        let err = commit_checkpoint(&mut store, BridgeCheckpointId(42)).unwrap_err();
+        assert!(matches!(err, BridgeCheckpointError::Unknown(_)));
     }
 }
