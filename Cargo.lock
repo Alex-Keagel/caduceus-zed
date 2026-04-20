@@ -2389,6 +2389,7 @@ dependencies = [
  "dirs 5.0.1",
  "serde",
  "serde_json",
+ "static_assertions",
  "thiserror 2.0.17",
  "toml 0.8.23",
  "tracing",
