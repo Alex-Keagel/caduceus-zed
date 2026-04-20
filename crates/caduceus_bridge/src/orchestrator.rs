@@ -555,6 +555,103 @@ impl ReplayHandle {
     pub fn retention_cap(&self) -> usize {
         self.emitter.retention_cap()
     }
+
+    /// P6.2 / G27 — Number of events dropped from the live mpsc channel
+    /// since the last successful emit. Surfaced for diagnostics; the UI
+    /// timeline observes the same drop via the synthetic
+    /// `EventBufferOverflow { dropped_since_last }` event injected on the
+    /// next successful emit.
+    pub fn dropped_since_last(&self) -> u64 {
+        self.emitter.dropped_since_last()
+    }
+}
+
+// ── P6.7 — MCP error kind tagging ───────────────────────────────────────
+pub use caduceus_mcp::error::McpErrorKind as BridgeMcpErrorKind;
+
+/// P6.7 — Stable string label for an [`BridgeMcpErrorKind`]. The IDE uses
+/// this to drive icon/colour selection on MCP failures (transient vs
+/// permanent vs auth vs config vs not_found vs permission) without
+/// coupling to the Rust enum repr.
+pub fn mcp_error_kind_label(kind: BridgeMcpErrorKind) -> &'static str {
+    kind.label()
+}
+
+/// P6.7 — Convenience predicate mirroring [`BridgeMcpErrorKind::is_retryable`]
+/// so the IPC layer can short-circuit retry orchestration without
+/// importing the `caduceus-mcp` crate directly.
+pub fn mcp_error_kind_is_retryable(kind: BridgeMcpErrorKind) -> bool {
+    kind.is_retryable()
+}
+
+// ── P6.8 — SharedContext write-collision audit (G30) ────────────────────
+pub use caduceus_orchestrator::workers::ContextWriteRecord as BridgeContextWriteRecord;
+
+/// P6.8 / G30 — Build a `SharedContext` with the per-write audit trail
+/// enabled. The IDE uses the resulting `writes()`/`collisions()` snapshots
+/// to render a "branch contention" indicator in the multi-agent panel.
+pub fn new_shared_context_with_audit() -> SharedContext {
+    SharedContext::new().with_write_audit()
+}
+
+/// JSON snapshot of every recorded write (oldest-first). Each entry is
+/// `{ "branch": "<…>", "key": "<…>", "overwrote": <bool>, "seq": <u64> }`.
+/// Cheap; safe to call from any task — internally takes the read-half of
+/// the inner `RwLock`.
+pub async fn recorded_writes_json(ctx: &SharedContext) -> String {
+    serialise_writes(&ctx.writes().await)
+}
+
+/// JSON snapshot restricted to writes that overwrote a previous value
+/// (collisions). Empty array when no contention has occurred.
+pub async fn recorded_collisions_json(ctx: &SharedContext) -> String {
+    serialise_writes(&ctx.collisions().await)
+}
+
+fn serialise_writes(writes: &[BridgeContextWriteRecord]) -> String {
+    let entries: Vec<serde_json::Value> = writes
+        .iter()
+        .map(|w| {
+            serde_json::json!({
+                "branch": w.key.branch,
+                "key": w.key.key,
+                "overwrote": w.overwrote,
+                "seq": w.seq,
+            })
+        })
+        .collect();
+    serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Convenience predicate used by the UI to flip a "contention" badge
+/// without serialising the full audit list.
+pub async fn shared_context_had_collisions(ctx: &SharedContext) -> bool {
+    ctx.had_collisions().await
+}
+
+// ── P6.9 — Schema-versioned AgentEvent envelope (G33) ───────────────────
+pub use caduceus_core::{
+    AGENT_EVENT_SCHEMA_VERSION as BRIDGE_AGENT_EVENT_SCHEMA_VERSION,
+    VersionedAgentEvent as BridgeVersionedAgentEvent,
+};
+
+/// P6.9 / G33 — Wrap an `AgentEvent` in the current schema envelope and
+/// serialise to JSON. The IDE persists this form to the on-disk session
+/// log so a future build (newer or older schema) can decode without losing
+/// the original payload — unknown variants fall back to `AgentEvent::Unknown`.
+pub fn wrap_event_json(event: &AgentEvent) -> Result<String, String> {
+    let envelope = BridgeVersionedAgentEvent::current(event.clone());
+    serde_json::to_string(&envelope).map_err(|e| e.to_string())
+}
+
+/// Decode a versioned envelope. Returns the inner event together with a
+/// flag set when the producer's schema version is newer than this build —
+/// the UI can then surface a "client out of date" hint.
+pub fn parse_versioned_event_json(s: &str) -> Result<(AgentEvent, bool), String> {
+    let envelope: BridgeVersionedAgentEvent =
+        serde_json::from_str(s).map_err(|e| e.to_string())?;
+    let from_newer = envelope.is_from_newer_producer();
+    Ok((envelope.event, from_newer))
 }
 
 impl OrchestratorBridge {
@@ -2393,5 +2490,112 @@ mod tests {
         let sel = new_learned_selector(trained_model());
         let ranked = rank_candidates(&sel, &[]);
         assert!(ranked.is_empty());
+    }
+
+    // ── P6 production-hardening bridge tests ────────────────────────────
+
+    #[test]
+    fn p6_7_mcp_error_kind_label_is_stable() {
+        assert_eq!(mcp_error_kind_label(BridgeMcpErrorKind::Transient), "transient");
+        assert_eq!(mcp_error_kind_label(BridgeMcpErrorKind::Auth), "auth");
+        assert_eq!(mcp_error_kind_label(BridgeMcpErrorKind::NotFound), "not_found");
+        assert_eq!(mcp_error_kind_label(BridgeMcpErrorKind::Permission), "permission");
+        assert_eq!(mcp_error_kind_label(BridgeMcpErrorKind::Permanent), "permanent");
+        assert_eq!(mcp_error_kind_label(BridgeMcpErrorKind::Config), "config");
+    }
+
+    #[test]
+    fn p6_7_only_transient_is_retryable() {
+        assert!(mcp_error_kind_is_retryable(BridgeMcpErrorKind::Transient));
+        for k in [
+            BridgeMcpErrorKind::Permanent,
+            BridgeMcpErrorKind::Auth,
+            BridgeMcpErrorKind::Config,
+            BridgeMcpErrorKind::NotFound,
+            BridgeMcpErrorKind::Permission,
+        ] {
+            assert!(!mcp_error_kind_is_retryable(k), "{:?} must NOT be retryable", k);
+        }
+    }
+
+    #[tokio::test]
+    async fn p6_8_shared_context_audit_records_writes() {
+        let ctx = new_shared_context_with_audit();
+        ctx.write("a", "1").await;
+        ctx.write("b", "2").await;
+        let json = recorded_writes_json(&ctx).await;
+        assert!(json.contains("\"a\""), "audit json must include first key: {json}");
+        assert!(json.contains("\"b\""), "audit json must include second key: {json}");
+        assert!(!shared_context_had_collisions(&ctx).await);
+    }
+
+    #[tokio::test]
+    async fn p6_8_collisions_isolated_from_clean_writes() {
+        let ctx = new_shared_context_with_audit();
+        ctx.write("k", "v1").await;
+        ctx.write("k", "v2").await; // collision
+        let collisions = recorded_collisions_json(&ctx).await;
+        assert!(collisions.contains("\"overwrote\":true"), "collisions must record overwrite: {collisions}");
+        assert!(shared_context_had_collisions(&ctx).await);
+    }
+
+    #[tokio::test]
+    async fn p6_8_audit_disabled_yields_empty_writes() {
+        // Default `SharedContext::new()` does NOT enable audit.
+        let ctx = SharedContext::new();
+        ctx.write("a", "1").await;
+        let json = recorded_writes_json(&ctx).await;
+        assert_eq!(json, "[]", "audit must be off by default");
+    }
+
+    #[test]
+    fn p6_9_wrap_round_trips_through_versioned_envelope() {
+        let event = AgentEvent::TextDelta { text: "hi".to_string() };
+        let json = wrap_event_json(&event).expect("wrap");
+        assert!(json.contains(&format!("\"v\":{}", BRIDGE_AGENT_EVENT_SCHEMA_VERSION)));
+        let (decoded, from_newer) = parse_versioned_event_json(&json).expect("parse");
+        assert!(!from_newer);
+        match decoded {
+            AgentEvent::TextDelta { text } => assert_eq!(text, "hi"),
+            other => panic!("unexpected variant after round-trip: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p6_9_newer_producer_is_flagged() {
+        // Hand-craft an envelope claiming a newer schema version.
+        let future_v = BRIDGE_AGENT_EVENT_SCHEMA_VERSION + 5;
+        let event = AgentEvent::TextDelta { text: "future".to_string() };
+        let body = serde_json::to_string(&event).unwrap();
+        let json = format!("{{\"v\":{},\"event\":{}}}", future_v, body);
+        let (_decoded, from_newer) = parse_versioned_event_json(&json).expect("parse");
+        assert!(from_newer, "newer schema version must be flagged");
+    }
+
+    #[test]
+    fn p6_9_malformed_envelope_returns_err() {
+        let result = parse_versioned_event_json("not-json");
+        assert!(result.is_err());
+    }
+
+    // P6.10 — defensive contracts: the new bridge-exported types must
+    // remain `Send + Sync` (and `Clone` where the IDE relies on cheap
+    // sharing) so the IPC layer can hand them across runtime threads
+    // without lock-acquisition gymnastics.
+    #[test]
+    fn p6_10_defensive_contracts_send_sync_clone() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_clone<T: Clone>() {}
+        assert_send_sync::<BridgeMcpErrorKind>();
+        assert_clone::<BridgeMcpErrorKind>();
+        assert_send_sync::<BridgeVersionedAgentEvent>();
+        assert_clone::<BridgeVersionedAgentEvent>();
+        assert_send_sync::<BridgeContextWriteRecord>();
+        // ContextWriteRecord must be cloneable so audit snapshots can
+        // be returned by value across IPC.
+        assert_clone::<BridgeContextWriteRecord>();
+        // ReplayHandle is Clone-shared per its doc comment.
+        assert_send_sync::<ReplayHandle>();
+        assert_clone::<ReplayHandle>();
     }
 }
