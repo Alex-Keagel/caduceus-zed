@@ -275,6 +275,74 @@ impl OrchestratorBridge {
         count
     }
 
+    /// P13.7 (G‑R3.1) — hot‑reload variant of [`register_mcp_tools`].
+    ///
+    /// Re‑snapshots `manager.all_tools()` and computes the set
+    /// difference against the names currently registered in
+    /// `registry` that look like MCP tools (i.e. were last produced
+    /// by this very function or `register_mcp_tools`). Adds any tools
+    /// the manager now exposes that aren't in the registry; removes
+    /// any tool from the registry whose name no longer appears in the
+    /// manager surface; leaves stable tools untouched.
+    ///
+    /// The function is idempotent — calling it twice with no manager
+    /// changes returns `(0, 0)`. Returns `(added, removed)` so callers
+    /// can emit a single hot‑reload event.
+    ///
+    /// This is the engine‑side half of MCP hot‑reload; the manager
+    /// produces drift events via [`McpServerManager::drift_for`]; the
+    /// bridge consumes them by re‑running this diff. Tools that
+    /// MUTATED (same name, new schema) are NOT detected here — the
+    /// manager's `apply_tool_refresh` already replaces the cached
+    /// `McpToolDef`, so the next *invocation* will dispatch through
+    /// the new schema. Catching mutation here would require versioned
+    /// schemas in `Tool::spec()`, which we don't have yet.
+    pub async fn register_mcp_tools_diff(
+        manager: Arc<McpServerManager>,
+        registry: &mut ToolRegistry,
+        prior_mcp_names: &std::collections::HashSet<String>,
+    ) -> (usize, usize, std::collections::HashSet<String>) {
+        let defs = manager.all_tools().await;
+        let live: std::collections::HashSet<String> =
+            defs.iter().map(|d| d.name.clone()).collect();
+
+        // Removals first so a name reused by a different server is
+        // re‑bound cleanly.
+        let mut removed = 0usize;
+        for stale in prior_mcp_names.difference(&live) {
+            if registry.remove(stale) {
+                removed += 1;
+            }
+        }
+
+        // Additions: only register tools we don't already have.
+        let mut added = 0usize;
+        for def in defs {
+            if prior_mcp_names.contains(&def.name) && registry.get(&def.name).is_some() {
+                continue;
+            }
+            let manager_for_invoker = manager.clone();
+            let tool_name = def.name.clone();
+            let invoker: McpInvoker = Arc::new(move |input| {
+                let mgr = manager_for_invoker.clone();
+                let name = tool_name.clone();
+                Box::pin(async move {
+                    match mgr.call_tool(&name, input).await {
+                        Ok(value) => Ok(caduceus_core::ToolResult::success(value.to_string())),
+                        Err(e) => Ok(caduceus_core::ToolResult::error(format!(
+                            "mcp call '{name}' failed: {e}"
+                        ))),
+                    }
+                })
+            });
+            let bridge = McpToolBridge::new(&def, invoker);
+            registry.register(Arc::new(bridge));
+            added += 1;
+        }
+
+        (added, removed, live)
+    }
+
     /// Load workspace instructions from .caduceus/ hierarchy.
     pub fn load_instructions(&self) -> Result<InstructionSet, String> {
         let loader = InstructionLoader::new(&self.project_root);
@@ -747,6 +815,7 @@ mod tests {
                 content_blocks: None,
                 tool_calls: vec![],
                 tool_result: None,
+            cache_breakpoint: false,
             });
         }
         assert_eq!(history.len(), 10);
@@ -763,6 +832,7 @@ mod tests {
             content_blocks: None,
             tool_calls: vec![],
             tool_result: None,
+            cache_breakpoint: false,
         });
         assert!(!history.is_empty());
         OrchestratorBridge::conversation_clear(&mut history);
@@ -1194,6 +1264,73 @@ mod tests {
         let mut reg = ToolRegistry::new();
         let n = OrchestratorBridge::register_mcp_tools(mgr, &mut reg).await;
         assert_eq!(n, 0, "no servers => no tools registered");
+    }
+
+    // ── P13.7 — MCP hot‑reload diff ──────────────────────────────────
+
+    #[tokio::test]
+    async fn p13_7_diff_returns_zero_when_no_changes() {
+        use caduceus_mcp::McpServerManager;
+        use std::collections::HashSet;
+        let mgr = Arc::new(McpServerManager::new());
+        let mut reg = ToolRegistry::new();
+        let prior: HashSet<String> = HashSet::new();
+        let (added, removed, live) =
+            OrchestratorBridge::register_mcp_tools_diff(mgr.clone(), &mut reg, &prior)
+                .await;
+        assert_eq!((added, removed), (0, 0));
+        assert!(live.is_empty());
+        // Idempotent: calling again with the new live set yields zero.
+        let (a2, r2, _) =
+            OrchestratorBridge::register_mcp_tools_diff(mgr, &mut reg, &live).await;
+        assert_eq!((a2, r2), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn p13_7_diff_removes_stale_tools() {
+        // Simulate: a previous refresh registered "ghost_mcp_tool"
+        // and recorded its name in `prior_mcp_names`. The manager
+        // surface no longer contains it. Calling diff must remove it.
+        use caduceus_mcp::McpServerManager;
+        use caduceus_tools::Tool;
+        use std::collections::HashSet;
+
+        struct Stub(&'static str);
+        #[async_trait::async_trait]
+        impl Tool for Stub {
+            fn spec(&self) -> caduceus_core::ToolSpec {
+                caduceus_core::ToolSpec {
+                    name: self.0.into(),
+                    description: "stub".into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    required_capability: None,
+                }
+            }
+            async fn call(
+                &self,
+                _input: serde_json::Value,
+            ) -> caduceus_core::Result<caduceus_core::ToolResult> {
+                Ok(caduceus_core::ToolResult::success("stub"))
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(Stub("ghost_mcp_tool")));
+        assert!(reg.get("ghost_mcp_tool").is_some());
+
+        let mgr = Arc::new(McpServerManager::new());
+        let mut prior: HashSet<String> = HashSet::new();
+        prior.insert("ghost_mcp_tool".into());
+
+        let (added, removed, live) =
+            OrchestratorBridge::register_mcp_tools_diff(mgr, &mut reg, &prior).await;
+        assert_eq!(added, 0);
+        assert_eq!(removed, 1, "stale tool must be unregistered");
+        assert!(live.is_empty());
+        assert!(
+            reg.get("ghost_mcp_tool").is_none(),
+            "tool must actually be gone from the registry"
+        );
     }
 
     #[tokio::test]
