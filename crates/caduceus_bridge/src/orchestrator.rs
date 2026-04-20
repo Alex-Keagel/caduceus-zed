@@ -14,6 +14,7 @@ use caduceus_orchestrator::{
 };
 use caduceus_core::AgentEvent;
 use caduceus_core::{ModelId, ProviderId, SessionState};
+use caduceus_mcp::{McpServerManager, mcp_tool_bridge::{McpToolBridge, McpInvoker}};
 use caduceus_providers::LlmAdapter;
 use caduceus_tools::ToolRegistry;
 use std::path::{Path, PathBuf};
@@ -63,6 +64,19 @@ pub fn count_tokens_exact(text: &str) -> u32 {
 /// Wrapper around the AgentHarness for the bridge.
 pub struct OrchestratorBridge {
     project_root: PathBuf,
+    /// Optional speculative tool-result cache (P12.2). When set, every
+    /// harness produced by `build_harness*` is wired with a clone via
+    /// `AgentHarness::with_speculative_cache`, enabling tool-call hits
+    /// to short-circuit the spawn loop.
+    speculative_cache: Option<caduceus_tools::SpeculativeCache>,
+    /// Optional per-project Reflexion memory (P12.4). Wrapped in
+    /// `Arc<Mutex<…>>` so the bridge, harness, and IPC handlers all
+    /// share the same instance.
+    reflexion:
+        Option<Arc<std::sync::Mutex<caduceus_orchestrator::reflexion::ReflexionMemory>>>,
+    /// Optional Tree-of-Thoughts planner config (P12.3) attached to
+    /// every harness.
+    tot_config: Option<caduceus_orchestrator::branching_planner::PlannerConfig>,
 }
 
 /// Cheap, `Clone`-able handle to an `AgentEventEmitter`'s retention ring.
@@ -99,7 +113,166 @@ impl OrchestratorBridge {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         Self {
             project_root: project_root.into(),
+            speculative_cache: None,
+            reflexion: None,
+            tot_config: None,
         }
+    }
+
+    // ── P12 primitive wiring (production side) ───────────────────────────
+
+    /// Attach a [`SpeculativeCache`](caduceus_tools::SpeculativeCache) to
+    /// every subsequent harness produced by `build_harness*`. Cheaply
+    /// cloneable; the same `Arc`-backed map is shared by the bridge,
+    /// harness, and any external prefetcher (UI worker) that calls
+    /// [`OrchestratorBridge::speculative_cache`].
+    pub fn with_speculative_cache(
+        mut self,
+        cache: caduceus_tools::SpeculativeCache,
+    ) -> Self {
+        self.speculative_cache = Some(cache);
+        self
+    }
+
+    /// Convenience constructor — installs a default-TTL cache (60 s).
+    pub fn with_default_speculative_cache(self) -> Self {
+        self.with_speculative_cache(caduceus_tools::SpeculativeCache::new(
+            std::time::Duration::from_secs(60),
+        ))
+    }
+
+    /// Borrow the speculative cache so an external prefetcher (e.g. a
+    /// file-watcher worker that predicts the next `read_file` call) can
+    /// `reserve` / `complete` slots.
+    pub fn speculative_cache(&self) -> Option<&caduceus_tools::SpeculativeCache> {
+        self.speculative_cache.as_ref()
+    }
+
+    /// Attach a Reflexion memory store. Wrapped in `Arc<Mutex<…>>` so
+    /// the bridge can both feed the harness AND expose `record_outcome`
+    /// to the IPC layer.
+    pub fn with_reflexion(
+        mut self,
+        memory: Arc<
+            std::sync::Mutex<caduceus_orchestrator::reflexion::ReflexionMemory>,
+        >,
+    ) -> Self {
+        self.reflexion = Some(memory);
+        self
+    }
+
+    /// Convenience constructor — 16-slot, no TTL.
+    pub fn with_default_reflexion(self) -> Self {
+        let mem = caduceus_orchestrator::reflexion::ReflexionMemory::new(16);
+        self.with_reflexion(Arc::new(std::sync::Mutex::new(mem)))
+    }
+
+    /// Borrow the reflexion handle so the IPC layer can push attempt
+    /// outcomes from the agent panel after each turn completes.
+    pub fn reflexion(
+        &self,
+    ) -> Option<&Arc<std::sync::Mutex<caduceus_orchestrator::reflexion::ReflexionMemory>>>
+    {
+        self.reflexion.as_ref()
+    }
+
+    /// Record an attempt outcome into the bound reflexion memory using
+    /// the supplied `Reflector`. Returns the reflection that was
+    /// stored, or `None` if no memory is bound or the reflector
+    /// produced nothing.
+    pub fn record_attempt_outcome<R>(
+        &self,
+        reflector: &R,
+        task_tag: &str,
+        outcome: &caduceus_orchestrator::reflexion::AttemptOutcome,
+    ) -> Option<caduceus_orchestrator::reflexion::Reflection>
+    where
+        R: caduceus_orchestrator::reflexion::Reflector,
+    {
+        let mem = self.reflexion.as_ref()?;
+        let mut guard = mem.lock().ok()?;
+        guard.record_outcome(reflector, task_tag, outcome)
+    }
+
+    /// Set the default Tree-of-Thoughts planner config used for any
+    /// future `plan_with_tot` calls on harnesses produced by this
+    /// bridge.
+    pub fn with_tot_config(
+        mut self,
+        cfg: caduceus_orchestrator::branching_planner::PlannerConfig,
+    ) -> Self {
+        self.tot_config = Some(cfg);
+        self
+    }
+
+    /// Convenience: install the planner config defaults
+    /// (`PlannerConfig::default`).
+    pub fn with_default_tot_config(self) -> Self {
+        self.with_tot_config(
+            caduceus_orchestrator::branching_planner::PlannerConfig::default(),
+        )
+    }
+
+    /// Borrow the bound ToT planner config (if any).
+    pub fn tot_config(
+        &self,
+    ) -> Option<&caduceus_orchestrator::branching_planner::PlannerConfig> {
+        self.tot_config.as_ref()
+    }
+
+    /// Internal helper — chains every bound P12 primitive onto a freshly
+    /// built `AgentHarness`. Centralised so the four `build_harness*`
+    /// factories don't drift.
+    fn attach_p12(&self, mut h: AgentHarness) -> AgentHarness {
+        if let Some(cache) = self.speculative_cache.clone() {
+            h = h.with_speculative_cache(cache);
+        }
+        if let Some(mem) = self.reflexion.clone() {
+            h = h.with_reflexion(mem);
+        }
+        if let Some(cfg) = self.tot_config.clone() {
+            h = h.with_tot_config(cfg);
+        }
+        h
+    }
+
+    // ── MCP → Tool registration (P11.4 production wiring) ────────────────
+
+    /// Walk every tool advertised by `manager`, wrap each in an
+    /// [`McpToolBridge`] whose invoker forwards to
+    /// [`McpServerManager::call_tool`], and register the bridge in
+    /// `registry`. Returns the number of tools that were registered.
+    ///
+    /// The invoker captures `Arc<McpServerManager>` so the bridge stays
+    /// valid even after the registration call returns.
+    pub async fn register_mcp_tools(
+        manager: Arc<McpServerManager>,
+        registry: &mut ToolRegistry,
+    ) -> usize {
+        let defs = manager.all_tools().await;
+        let mut count = 0usize;
+        for def in defs {
+            let manager_for_invoker = manager.clone();
+            let tool_name = def.name.clone();
+            let invoker: McpInvoker = Arc::new(move |input| {
+                let mgr = manager_for_invoker.clone();
+                let name = tool_name.clone();
+                Box::pin(async move {
+                    match mgr.call_tool(&name, input).await {
+                        Ok(value) => Ok(caduceus_core::ToolResult::success(
+                            value.to_string(),
+                        )),
+                        Err(e) => Ok(caduceus_core::ToolResult::error(format!(
+                            "mcp call '{name}' failed: {e}"
+                        ))),
+                    }
+                })
+            });
+            let bridge = McpToolBridge::new(&def, invoker);
+            registry.register(Arc::new(bridge));
+            count += 1;
+        }
+        count
     }
 
     /// Load workspace instructions from .caduceus/ hierarchy.
@@ -215,6 +388,7 @@ impl OrchestratorBridge {
         let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
             .with_tool_timeout(std::time::Duration::from_secs(120))
             .with_instructions(&self.project_root);
+        let base = self.attach_p12(base);
         base.with_approval_flow(approval_tools.iter().map(|s| s.as_ref().to_string()))
     }
 
@@ -227,9 +401,10 @@ impl OrchestratorBridge {
         tools: ToolRegistry,
         system_prompt: &str,
     ) -> AgentHarness {
-        AgentHarness::new(provider, tools, 200_000, system_prompt)
+        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
             .with_tool_timeout(std::time::Duration::from_secs(120))
-            .with_instructions(&self.project_root)
+            .with_instructions(&self.project_root);
+        self.attach_p12(base)
     }
 
     // ── Emitter / replay seam (G17) ──────────────────────────────────────
@@ -271,6 +446,7 @@ impl OrchestratorBridge {
             .with_tool_timeout(std::time::Duration::from_secs(120))
             .with_instructions(&self.project_root)
             .with_emitter(emitter);
+        let base = self.attach_p12(base);
         let (harness, approval_tx) =
             base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()));
         (harness, approval_tx, replay_handle, event_rx)
@@ -905,6 +1081,7 @@ mod tests {
                 cache_creation_tokens: 0,
                 stop_reason: caduceus_providers::StopReason::EndTurn,
                 tool_calls: vec![],
+                logprobs: None,
             },
         ]));
         let tools = ToolRegistry::new();
@@ -931,5 +1108,112 @@ mod tests {
             !snap.is_empty(),
             "replay handle must observe events emitted by the harness (live={live}, snap=0)"
         );
+    }
+
+    // ── P12 production wiring tests ──────────────────────────────────────
+
+    #[test]
+    fn bridge_attaches_speculative_cache_to_harness() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = caduceus_tools::SpeculativeCache::new(
+            std::time::Duration::from_secs(30),
+        );
+        let bridge = OrchestratorBridge::new(dir.path())
+            .with_speculative_cache(cache.clone());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let h = bridge.build_harness_no_approval(provider, ToolRegistry::new(), "sys");
+        assert!(
+            h.speculative_cache().is_some(),
+            "harness must carry the speculative cache"
+        );
+        assert!(
+            bridge.speculative_cache().is_some(),
+            "bridge must expose the cache for prefetchers"
+        );
+    }
+
+    #[test]
+    fn bridge_attaches_reflexion_to_harness_and_records_outcome() {
+        use caduceus_orchestrator::reflexion::{
+            AttemptOutcome, HeuristicReflector, ReflexionMemory,
+        };
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let mem = Arc::new(std::sync::Mutex::new(ReflexionMemory::new(8)));
+        let bridge = OrchestratorBridge::new(dir.path()).with_reflexion(mem.clone());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let h = bridge.build_harness_no_approval(provider, ToolRegistry::new(), "sys");
+        assert!(h.reflexion().is_some(), "harness must carry reflexion");
+
+        let reflector = HeuristicReflector::default();
+        let outcome = AttemptOutcome::Failure {
+            error: "compile error: missing semicolon".into(),
+            attempted_action: None,
+        };
+        let stored = bridge
+            .record_attempt_outcome(&reflector, "task-1", &outcome)
+            .expect("must record");
+        assert_eq!(stored.task_tag, "task-1");
+        let guard = mem.lock().unwrap();
+        assert_eq!(guard.recent_for("task-1", 5).len(), 1);
+    }
+
+    #[test]
+    fn bridge_attaches_tot_config_to_harness() {
+        use caduceus_orchestrator::branching_planner::PlannerConfig;
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = PlannerConfig::default();
+        let bridge = OrchestratorBridge::new(dir.path()).with_tot_config(cfg.clone());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let h = bridge.build_harness_no_approval(provider, ToolRegistry::new(), "sys");
+        assert!(h.tot_config().is_some(), "harness must carry tot config");
+        assert!(bridge.tot_config().is_some(), "bridge must expose tot cfg");
+    }
+
+    #[test]
+    fn default_helpers_install_p12_primitives() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path())
+            .with_default_speculative_cache()
+            .with_default_reflexion()
+            .with_default_tot_config();
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let h = bridge.build_harness_no_approval(provider, ToolRegistry::new(), "sys");
+        assert!(h.speculative_cache().is_some());
+        assert!(h.reflexion().is_some());
+        assert!(h.tot_config().is_some());
+    }
+
+    #[tokio::test]
+    async fn register_mcp_tools_returns_zero_for_empty_manager() {
+        use caduceus_mcp::McpServerManager;
+        let mgr = Arc::new(McpServerManager::new());
+        let mut reg = ToolRegistry::new();
+        let n = OrchestratorBridge::register_mcp_tools(mgr, &mut reg).await;
+        assert_eq!(n, 0, "no servers => no tools registered");
+    }
+
+    #[tokio::test]
+    async fn p12_primitives_are_attached_via_emitter_path() {
+        use caduceus_orchestrator::reflexion::ReflexionMemory;
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = caduceus_tools::SpeculativeCache::new(
+            std::time::Duration::from_secs(60),
+        );
+        let mem = Arc::new(std::sync::Mutex::new(ReflexionMemory::new(4)));
+        let bridge = OrchestratorBridge::new(dir.path())
+            .with_speculative_cache(cache)
+            .with_reflexion(mem)
+            .with_default_tot_config();
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let (h, _tx, _replay, _rx) =
+            bridge.build_harness_with_emitter(provider, ToolRegistry::new(), "sys");
+        assert!(h.speculative_cache().is_some());
+        assert!(h.reflexion().is_some());
+        assert!(h.tot_config().is_some());
     }
 }
