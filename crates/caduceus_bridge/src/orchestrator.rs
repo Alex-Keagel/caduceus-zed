@@ -57,6 +57,17 @@ pub use caduceus_orchestrator::context_fold::{
     ExpandError as BridgeExpandError, FoldedTranscript as BridgeFoldedTranscript,
     TranscriptId as BridgeTranscriptId, TranscriptStore as BridgeTranscriptStore,
 };
+pub use caduceus_orchestrator::compaction_telemetry::{
+    CompactionEvent as BridgeCompactionEvent,
+    CompactionTelemetry as BridgeCompactionTelemetry, StrategyName as BridgeStrategyName,
+};
+pub use caduceus_orchestrator::compaction_scorer::{
+    self as bridge_compaction_scorer, BradleyTerryModel as BridgeBradleyTerryModel,
+    Pair as BridgeBradleyTerryPair,
+};
+pub use caduceus_orchestrator::learned_selector::{
+    LearnedSelector as BridgeLearnedSelector, SelectionMode as BridgeSelectionMode,
+};
 pub use caduceus_core::TokenBudget as BridgeTokenBudget;
 pub use caduceus_orchestrator::checkpoint::{
     BatchState as BridgeBatchState, CheckpointError as BridgeCheckpointError,
@@ -338,6 +349,148 @@ pub fn model_budget_spec_json(model_id: &str) -> String {
         ctx,
         reserved
     )
+}
+
+// ── P5.1 — CompactionTelemetry bridge ────────────────────────────────────
+//
+// The harness records a CompactionEvent every time a strategy fires.
+// The IDE shell snapshots / drains the ring for offline training and
+// for the at-a-glance dashboard. The bridge exposes a thin facade so
+// the React panel can:
+//   * push events from JS-driven dry runs (rare),
+//   * mark the most recent event at a given turn as having caused a
+//     downstream re-ask (rich label for the trainer),
+//   * drain the ring as JSONL for export, and
+//   * snapshot per-strategy stats for the dashboard.
+
+/// Construct an empty telemetry ring with the orchestrator default
+/// capacity (1024 events ≈ weeks of typical activity).
+pub fn new_compaction_telemetry() -> BridgeCompactionTelemetry {
+    BridgeCompactionTelemetry::default()
+}
+
+/// Append an event to the ring. Oldest event is evicted FIFO when
+/// the ring is full.
+pub fn record_compaction_event(
+    tel: &mut BridgeCompactionTelemetry,
+    ev: BridgeCompactionEvent,
+) {
+    tel.record(ev);
+}
+
+/// Mark the most-recent compaction at `turn_index` as having caused
+/// (or not) a downstream re-ask. Returns `true` if a matching event
+/// was found and updated. Used by the next-turn re-ask detector.
+pub fn mark_compaction_re_ask(
+    tel: &mut BridgeCompactionTelemetry,
+    turn_index: u32,
+    re_asked: bool,
+) -> bool {
+    tel.mark_re_ask(turn_index, re_asked)
+}
+
+/// Snapshot the ring (newest-last) as JSONL for export. Does not
+/// clear the ring.
+pub fn compaction_telemetry_jsonl(tel: &BridgeCompactionTelemetry) -> String {
+    tel.to_jsonl()
+}
+
+/// Drain all events as JSONL AND clear the ring. Use when the IDE
+/// pushes a batch to disk after a session ends.
+pub fn drain_compaction_telemetry_jsonl(tel: &mut BridgeCompactionTelemetry) -> String {
+    tel.drain_jsonl()
+}
+
+/// Per-strategy aggregates as JSON for the dashboard. Each row:
+/// `{"strategy":"…","count":N,"mean_tokens_dropped":F,"re_ask_rate":F|null}`.
+pub fn compaction_telemetry_stats_json(tel: &BridgeCompactionTelemetry) -> String {
+    let rows = tel.per_strategy_stats();
+    let json: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(s, count, mean, rate)| {
+            serde_json::json!({
+                "strategy": s,
+                "count": count,
+                "mean_tokens_dropped": mean,
+                "re_ask_rate": rate,
+            })
+        })
+        .collect();
+    serde_json::to_string(&json).unwrap_or_else(|_| "[]".into())
+}
+
+// ── P5.2 — Bradley–Terry scorer bridge ───────────────────────────────────
+//
+// Once telemetry has accumulated enough labelled events, the IDE
+// triggers a fit pass either in-process (small datasets) or out-of-
+// process via the JSONL export. Both paths are exposed.
+
+/// Fit a Bradley–Terry model directly from a slice of telemetry
+/// events. Convenience for in-process training when the dataset is
+/// small (a few hundred events).
+pub fn fit_bradley_terry(events: &[BridgeCompactionEvent]) -> BridgeBradleyTerryModel {
+    let pairs = bridge_compaction_scorer::pairs_from_events(events);
+    bridge_compaction_scorer::fit(&pairs)
+}
+
+/// Train a Bradley–Terry model from JSONL exported by
+/// [`drain_compaction_telemetry_jsonl`]. Returns a fully-fit model
+/// (default-empty if the JSONL is malformed or empty).
+pub fn train_bradley_terry_from_jsonl(jsonl: &str) -> BridgeBradleyTerryModel {
+    bridge_compaction_scorer::train_from_jsonl(jsonl)
+}
+
+/// Snapshot a trained model as JSON for persistence under
+/// `.caduceus/models/compaction.json`.
+pub fn snapshot_bradley_terry_json(model: &BridgeBradleyTerryModel) -> Result<String, String> {
+    serde_json::to_string(model).map_err(|e| e.to_string())
+}
+
+/// Restore a model from a JSON blob. Errors surface as `Err(String)`
+/// so the IDE can fall back to the heuristic selector.
+pub fn load_bradley_terry_json(json: &str) -> Result<BridgeBradleyTerryModel, String> {
+    serde_json::from_str(json).map_err(|e| e.to_string())
+}
+
+// ── P5.3 — Learned compaction-strategy selector bridge ──────────────────
+//
+// The selector wraps a trained BradleyTerryModel and re-orders
+// candidate strategies. The IDE owns one selector per session,
+// reloaded from disk on startup.
+
+/// Construct a learned selector from a trained model. Defaults to
+/// `Auto` mode (use the model only when at least 2 strategies have
+/// been observed, otherwise fall back to the heuristic order).
+pub fn new_learned_selector(model: BridgeBradleyTerryModel) -> BridgeLearnedSelector {
+    BridgeLearnedSelector::new(model)
+}
+
+/// Override the selection mode (Heuristic / Learned / Auto). Used
+/// by the IDE settings panel.
+pub fn set_selector_mode(
+    selector: BridgeLearnedSelector,
+    mode: BridgeSelectionMode,
+) -> BridgeLearnedSelector {
+    selector.with_mode(mode)
+}
+
+/// Re-order `candidates` from best to worst per the selector. Equal
+/// scores preserve input order (deterministic).
+pub fn rank_candidates<'a>(
+    selector: &BridgeLearnedSelector,
+    candidates: &[&'a str],
+) -> Vec<&'a str> {
+    selector.rank(candidates)
+}
+
+/// Pick the top candidate plus the score margin over the runner-up.
+/// `margin` is 0.0 when only one candidate is given. The IDE can show
+/// an "uncertain" badge when the margin is small (< 0.1).
+pub fn select_with_confidence<'a>(
+    selector: &BridgeLearnedSelector,
+    candidates: &[&'a str],
+) -> Option<(&'a str, f64)> {
+    selector.select_with_confidence(candidates)
 }
 
 /// Exact token count using tiktoken (cl100k_base, used by GPT-4/Claude).
@@ -2044,5 +2197,201 @@ mod tests {
         let json = model_budget_spec_json("model\"with\"quotes");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["model"], "model\"with\"quotes");
+    }
+
+    // ── P5.1 — CompactionTelemetry bridge ────────────────────────────────
+
+    fn dummy_event(strategy: &str, t_before: u32, t_after: u32, turn: u32) -> BridgeCompactionEvent {
+        BridgeCompactionEvent {
+            strategy: strategy.into(),
+            tokens_before: t_before,
+            tokens_after: t_after,
+            messages_before: 10,
+            messages_after: 5,
+            turn_index: turn,
+            at_secs: 0,
+            downstream_re_ask: None,
+        }
+    }
+
+    #[test]
+    fn p5_1_record_and_jsonl_round_trip() {
+        let mut tel = new_compaction_telemetry();
+        record_compaction_event(&mut tel, dummy_event("summarize", 8000, 2000, 1));
+        record_compaction_event(&mut tel, dummy_event("tool_collapse", 9000, 3000, 2));
+        let jsonl = compaction_telemetry_jsonl(&tel);
+        assert_eq!(jsonl.lines().count(), 2);
+        assert!(jsonl.contains("summarize"));
+        assert!(jsonl.contains("tool_collapse"));
+    }
+
+    #[test]
+    fn p5_1_mark_re_ask_returns_true_for_existing_turn() {
+        let mut tel = new_compaction_telemetry();
+        record_compaction_event(&mut tel, dummy_event("summarize", 8000, 2000, 7));
+        assert!(mark_compaction_re_ask(&mut tel, 7, true));
+        assert!(!mark_compaction_re_ask(&mut tel, 999, false));
+        let jsonl = compaction_telemetry_jsonl(&tel);
+        assert!(jsonl.contains("\"downstream_re_ask\":true"));
+    }
+
+    #[test]
+    fn p5_1_drain_clears_ring() {
+        let mut tel = new_compaction_telemetry();
+        record_compaction_event(&mut tel, dummy_event("summarize", 8000, 2000, 1));
+        let jsonl = drain_compaction_telemetry_jsonl(&mut tel);
+        assert!(jsonl.contains("summarize"));
+        assert!(tel.is_empty());
+    }
+
+    #[test]
+    fn p5_1_stats_json_aggregates_per_strategy() {
+        let mut tel = new_compaction_telemetry();
+        record_compaction_event(&mut tel, dummy_event("summarize", 8000, 2000, 1));
+        record_compaction_event(&mut tel, dummy_event("summarize", 9000, 4000, 2));
+        record_compaction_event(&mut tel, dummy_event("tool_collapse", 7000, 3000, 3));
+        let json = compaction_telemetry_stats_json(&tel);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // re_ask_rate is null when no events labelled.
+        for row in arr {
+            assert!(row["count"].as_u64().unwrap() >= 1);
+            assert!(row["re_ask_rate"].is_null());
+        }
+    }
+
+    // ── P5.2 — Bradley–Terry scorer bridge ───────────────────────────────
+
+    fn labelled_event(strategy: &str, turn: u32, re_asked: bool) -> BridgeCompactionEvent {
+        let mut ev = dummy_event(strategy, 8000, 2000, turn);
+        ev.downstream_re_ask = Some(re_asked);
+        ev
+    }
+
+    #[test]
+    fn p5_2_fit_bradley_terry_assigns_higher_score_to_safer_strategy() {
+        // summarize: 3 safe, 0 bad; tool_collapse: 0 safe, 3 bad.
+        // Bucketed pairs make summarize the consistent winner.
+        let events = vec![
+            labelled_event("summarize", 1, false),
+            labelled_event("tool_collapse", 2, true),
+            labelled_event("summarize", 3, false),
+            labelled_event("tool_collapse", 4, true),
+            labelled_event("summarize", 5, false),
+            labelled_event("tool_collapse", 6, true),
+        ];
+        let model = fit_bradley_terry(&events);
+        let s_summ = model.scores.get("summarize").copied().unwrap_or(f64::NAN);
+        let s_tool = model.scores.get("tool_collapse").copied().unwrap_or(f64::NAN);
+        assert!(
+            s_summ > s_tool,
+            "summarize ({s_summ}) should beat tool_collapse ({s_tool})"
+        );
+    }
+
+    #[test]
+    fn p5_2_train_from_jsonl_round_trips_through_drain() {
+        let mut tel = new_compaction_telemetry();
+        for ev in [
+            labelled_event("summarize", 1, false),
+            labelled_event("tool_collapse", 2, true),
+            labelled_event("summarize", 3, false),
+            labelled_event("tool_collapse", 4, true),
+        ] {
+            record_compaction_event(&mut tel, ev);
+        }
+        let jsonl = drain_compaction_telemetry_jsonl(&mut tel);
+        let model = train_bradley_terry_from_jsonl(&jsonl);
+        assert!(model.scores.contains_key("summarize"));
+        assert!(model.scores.contains_key("tool_collapse"));
+    }
+
+    #[test]
+    fn p5_2_snapshot_and_load_round_trip() {
+        let mut model = BridgeBradleyTerryModel::default();
+        model.scores.insert("summarize".into(), 0.7);
+        model.scores.insert("tool_collapse".into(), -0.4);
+        model.iterations = 42;
+        let json = snapshot_bradley_terry_json(&model).unwrap();
+        let restored = load_bradley_terry_json(&json).unwrap();
+        assert_eq!(restored.iterations, 42);
+        assert_eq!(restored.scores.get("summarize"), Some(&0.7));
+    }
+
+    #[test]
+    fn p5_2_load_malformed_json_fails_closed() {
+        let err = load_bradley_terry_json("not json").unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    // ── P5.3 — Learned selector bridge ───────────────────────────────────
+
+    fn trained_model() -> BridgeBradleyTerryModel {
+        let mut m = BridgeBradleyTerryModel::default();
+        m.scores.insert("summarize".into(), 0.9);
+        m.scores.insert("tool_collapse".into(), -0.2);
+        m.scores.insert("sliding_window".into(), 0.1);
+        m.iterations = 10;
+        m
+    }
+
+    #[test]
+    fn p5_3_rank_orders_by_learned_score_in_learned_mode() {
+        let sel = set_selector_mode(
+            new_learned_selector(trained_model()),
+            BridgeSelectionMode::Learned,
+        );
+        let candidates = ["tool_collapse", "summarize", "sliding_window"];
+        let ranked = rank_candidates(&sel, &candidates);
+        assert_eq!(ranked, vec!["summarize", "sliding_window", "tool_collapse"]);
+    }
+
+    #[test]
+    fn p5_3_rank_preserves_input_order_in_heuristic_mode() {
+        let sel = set_selector_mode(
+            new_learned_selector(trained_model()),
+            BridgeSelectionMode::Heuristic,
+        );
+        let candidates = ["tool_collapse", "summarize", "sliding_window"];
+        let ranked = rank_candidates(&sel, &candidates);
+        assert_eq!(ranked, vec!["tool_collapse", "summarize", "sliding_window"]);
+    }
+
+    #[test]
+    fn p5_3_select_with_confidence_returns_margin() {
+        let sel = set_selector_mode(
+            new_learned_selector(trained_model()),
+            BridgeSelectionMode::Learned,
+        );
+        let (top, margin) =
+            select_with_confidence(&sel, &["tool_collapse", "summarize"]).unwrap();
+        assert_eq!(top, "summarize");
+        // 0.9 - (-0.2) = 1.1
+        assert!((margin - 1.1).abs() < 1e-9, "margin = {margin}");
+    }
+
+    #[test]
+    fn p5_3_select_with_confidence_single_candidate_yields_zero_margin() {
+        let sel = new_learned_selector(trained_model());
+        let (top, margin) = select_with_confidence(&sel, &["summarize"]).unwrap();
+        assert_eq!(top, "summarize");
+        assert_eq!(margin, 0.0);
+    }
+
+    #[test]
+    fn p5_3_auto_mode_falls_back_to_heuristic_when_model_empty() {
+        // Empty model ⇒ Auto must preserve input order.
+        let sel = new_learned_selector(BridgeBradleyTerryModel::default());
+        let candidates = ["c1", "c2", "c3"];
+        let ranked = rank_candidates(&sel, &candidates);
+        assert_eq!(ranked, vec!["c1", "c2", "c3"]);
+    }
+
+    #[test]
+    fn p5_3_rank_empty_candidates_returns_empty() {
+        let sel = new_learned_selector(trained_model());
+        let ranked = rank_candidates(&sel, &[]);
+        assert!(ranked.is_empty());
     }
 }
