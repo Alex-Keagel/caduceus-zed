@@ -48,6 +48,16 @@ pub use caduceus_orchestrator::modes::{
     AppliedAmendment as BridgeAppliedAmendment, PlanAmendment as BridgePlanAmendment,
     PlannedAction as BridgePlannedAction,
 };
+pub use caduceus_orchestrator::memory_blocks::{
+    ArchivalSummary as BridgeArchivalSummary, BlockLimits as BridgeBlockLimits,
+    CompactionReport as BridgeMemoryCompactionReport, MemoryBlocks as BridgeMemoryBlocks,
+    WorkingMessage as BridgeWorkingMessage,
+};
+pub use caduceus_orchestrator::context_fold::{
+    ExpandError as BridgeExpandError, FoldedTranscript as BridgeFoldedTranscript,
+    TranscriptId as BridgeTranscriptId, TranscriptStore as BridgeTranscriptStore,
+};
+pub use caduceus_core::TokenBudget as BridgeTokenBudget;
 pub use caduceus_orchestrator::checkpoint::{
     BatchState as BridgeBatchState, CheckpointError as BridgeCheckpointError,
     CheckpointId as BridgeCheckpointId, CheckpointStore as BridgeCheckpointStore,
@@ -211,6 +221,123 @@ pub fn publish_automation_completion(
 /// originate from the notifications publisher (malformed JSON).
 pub fn parse_notification(msg: &BridgeBusMessage) -> Result<BridgeNotification, String> {
     serde_json::from_str(&msg.content).map_err(|e| e.to_string())
+}
+
+// ── P4.1 — MemoryBlocks bridge ───────────────────────────────────────────
+//
+// The IDE shell creates one `BridgeMemoryBlocks` per session and
+// shares it with the harness via `AgentHarness::with_memory_blocks`.
+// The React panel renders the persona / project / working / archival
+// blocks via `snapshot_memory_blocks_json`; tool wrappers append turns
+// via `append_working_message`. Compaction is triggered explicitly by
+// the orchestrator harness; `compact_memory_blocks` is exposed so the
+// IDE can also trigger it on demand (e.g. "/compact" slash).
+
+/// Construct an empty memory-blocks store with the supplied limits.
+pub fn new_memory_blocks(limits: BridgeBlockLimits) -> BridgeMemoryBlocks {
+    BridgeMemoryBlocks::new(limits)
+}
+
+/// Set the persona block. Returns the number of chars dropped due to
+/// the cap (0 if under limit).
+pub fn set_memory_persona(
+    blocks: &mut BridgeMemoryBlocks,
+    text: impl Into<String>,
+) -> usize {
+    blocks.set_persona(text)
+}
+
+/// Set the project-context block. Returns chars dropped.
+pub fn set_memory_project_context(
+    blocks: &mut BridgeMemoryBlocks,
+    text: impl Into<String>,
+) -> usize {
+    blocks.set_project_context(text)
+}
+
+/// Append a single message to working history.
+pub fn append_working_message(
+    blocks: &mut BridgeMemoryBlocks,
+    msg: BridgeWorkingMessage,
+) {
+    blocks.append_working(msg);
+}
+
+/// Trigger a compaction pass. Returns telemetry the React panel can
+/// surface as a toast ("compacted N tool turns into 1 summary").
+pub fn compact_memory_blocks(blocks: &mut BridgeMemoryBlocks) -> BridgeMemoryCompactionReport {
+    blocks.compact()
+}
+
+/// Render the entire memory-blocks snapshot as JSON for the panel.
+pub fn snapshot_memory_blocks_json(blocks: &BridgeMemoryBlocks) -> Result<String, String> {
+    serde_json::to_string(blocks).map_err(|e| e.to_string())
+}
+
+// ── P4.2 — context_fold bridge ───────────────────────────────────────────
+//
+// Long tool transcripts (e.g. a 4k-token bash output) are folded into
+// a one-line placeholder once they exceed
+// `context_fold::DEFAULT_FOLD_THRESHOLD_CHARS`. The original is kept
+// in a side-store and can be expanded back on demand via the React
+// panel's "show full output" affordance.
+
+/// Construct an empty transcript store (default capacity).
+pub fn new_transcript_store() -> BridgeTranscriptStore {
+    BridgeTranscriptStore::default()
+}
+
+/// Fold a transcript: returns the placeholder + a stable id the panel
+/// uses to expand later. `subagent` and `outcome` are short labels
+/// rendered in the placeholder bubble (e.g. `"bash"`, `"ok"`).
+pub fn fold_transcript(
+    store: &mut BridgeTranscriptStore,
+    subagent: impl Into<String>,
+    outcome: impl Into<String>,
+    full: impl Into<String>,
+) -> BridgeFoldedTranscript {
+    store.fold(subagent, outcome, full.into())
+}
+
+/// Expand a previously-folded transcript by id. Returns
+/// `BridgeExpandError::Unknown` when the id has been evicted (FIFO)
+/// and `Expired` when the entry is past TTL.
+pub fn expand_transcript(
+    store: &BridgeTranscriptStore,
+    id: BridgeTranscriptId,
+) -> Result<String, BridgeExpandError> {
+    store.expand(id).map(str::to_owned)
+}
+
+/// Number of folded transcripts currently retained.
+pub fn folded_transcript_count(store: &BridgeTranscriptStore) -> usize {
+    store.len()
+}
+
+// ── P4.4 — per-model token budget snapshot ───────────────────────────────
+//
+// The IDE renders a budget bar above the prompt input. Without this
+// helper, the panel would have to wait for the first turn (which
+// invokes `apply_model_budget_for_turn`) before it could display
+// context limits. This wrapper exposes the static
+// `TokenBudget::model_spec` table so the panel pre-renders correctly.
+
+/// Returns `(context_limit_tokens, reserved_output_tokens)` for a
+/// given model id. Falls back to the conservative defaults for
+/// unknown models.
+pub fn model_budget_spec(model_id: &str) -> (u32, u32) {
+    BridgeTokenBudget::model_spec(model_id)
+}
+
+/// JSON shape: `{"model":"…","context_limit":…,"reserved_output":…}`.
+pub fn model_budget_spec_json(model_id: &str) -> String {
+    let (ctx, reserved) = model_budget_spec(model_id);
+    format!(
+        "{{\"model\":\"{}\",\"context_limit\":{},\"reserved_output\":{}}}",
+        model_id.replace('"', "\\\""),
+        ctx,
+        reserved
+    )
 }
 
 /// Exact token count using tiktoken (cl100k_base, used by GPT-4/Claude).
@@ -1787,5 +1914,135 @@ mod tests {
             channel: BRIDGE_NOTIFICATIONS_CHANNEL.into(),
         };
         assert!(parse_notification(&msg).is_err());
+    }
+
+    // ── P4.1 — MemoryBlocks bridge ───────────────────────────────────────
+
+    #[test]
+    fn p4_1_new_memory_blocks_uses_supplied_limits() {
+        let limits = BridgeBlockLimits {
+            persona_chars: 10,
+            project_context_tokens: 100,
+            working_history_tokens: 200,
+            archival_summary_tokens: 50,
+        };
+        let m = new_memory_blocks(limits);
+        assert_eq!(m.limits.persona_chars, 10);
+        assert!(m.working_history.is_empty());
+    }
+
+    #[test]
+    fn p4_1_set_persona_truncates_over_cap_and_reports_dropped() {
+        let mut m = new_memory_blocks(BridgeBlockLimits {
+            persona_chars: 5,
+            ..BridgeBlockLimits::default()
+        });
+        let dropped = set_memory_persona(&mut m, "abcdefghij");
+        assert_eq!(dropped, 5);
+        assert_eq!(m.persona, "abcde");
+    }
+
+    #[test]
+    fn p4_1_append_working_message_grows_history() {
+        let mut m = new_memory_blocks(BridgeBlockLimits::default());
+        append_working_message(
+            &mut m,
+            BridgeWorkingMessage {
+                role: "user".into(),
+                text: "hi".into(),
+                tokens: 1,
+                pair_id: None,
+            },
+        );
+        assert_eq!(m.working_history.len(), 1);
+    }
+
+    #[test]
+    fn p4_1_compact_returns_telemetry_report() {
+        let mut m = new_memory_blocks(BridgeBlockLimits {
+            working_history_tokens: 10,
+            ..BridgeBlockLimits::default()
+        });
+        for i in 0..5 {
+            append_working_message(
+                &mut m,
+                BridgeWorkingMessage {
+                    role: "tool".into(),
+                    text: format!("m{i}"),
+                    tokens: 5,
+                    pair_id: None,
+                },
+            );
+        }
+        let report = compact_memory_blocks(&mut m);
+        // We don't assert exact eviction count (depends on internal
+        // policy) but the report must serialise.
+        let _json = serde_json::to_string(&report).unwrap();
+    }
+
+    #[test]
+    fn p4_1_snapshot_memory_blocks_json_round_trips() {
+        let mut m = new_memory_blocks(BridgeBlockLimits::default());
+        set_memory_persona(&mut m, "agent persona");
+        set_memory_project_context(&mut m, "open files: lib.rs");
+        let json = snapshot_memory_blocks_json(&m).unwrap();
+        let restored: BridgeMemoryBlocks = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.persona, "agent persona");
+        assert_eq!(restored.project_context, "open files: lib.rs");
+    }
+
+    // ── P4.2 — context_fold bridge ───────────────────────────────────────
+
+    #[test]
+    fn p4_2_fold_then_expand_round_trips() {
+        let mut store = new_transcript_store();
+        let big = "x".repeat(8_000);
+        let folded = fold_transcript(&mut store, "bash", "ok", big.clone());
+        assert_eq!(folded.original_chars, 8_000);
+        let recovered = expand_transcript(&store, folded.id).unwrap();
+        assert_eq!(recovered.len(), 8_000);
+        assert_eq!(folded_transcript_count(&store), 1);
+    }
+
+    #[test]
+    fn p4_2_expand_unknown_id_fails_closed() {
+        let store = new_transcript_store();
+        let err = expand_transcript(&store, BridgeTranscriptId(999)).unwrap_err();
+        assert!(matches!(err, BridgeExpandError::Unknown(_)));
+    }
+
+    // ── P4.4 — per-model budget snapshot ────────────────────────────────
+
+    #[test]
+    fn p4_4_model_budget_spec_returns_known_caps() {
+        let (ctx, reserved) = model_budget_spec("gpt-4o");
+        assert!(ctx > 0);
+        assert!(reserved > 0);
+        assert!(ctx > reserved, "context_limit must exceed reserved_output");
+    }
+
+    #[test]
+    fn p4_4_model_budget_spec_unknown_model_returns_defaults() {
+        let (ctx, reserved) = model_budget_spec("totally-made-up-model-9999");
+        // Unknown models still get safe defaults — never zero (would
+        // break budget arithmetic).
+        assert!(ctx > 0);
+        assert!(reserved > 0);
+    }
+
+    #[test]
+    fn p4_4_model_budget_spec_json_well_formed() {
+        let json = model_budget_spec_json("gpt-4o");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["model"], "gpt-4o");
+        assert!(v["context_limit"].as_u64().unwrap() > 0);
+        assert!(v["reserved_output"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn p4_4_model_budget_spec_json_escapes_quotes_in_model_id() {
+        let json = model_budget_spec_json("model\"with\"quotes");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["model"], "model\"with\"quotes");
     }
 }
