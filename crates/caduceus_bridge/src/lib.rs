@@ -29,5 +29,14 @@ pub mod safety;
 pub mod tree_sitter;
 pub mod context_events;
 pub mod index_dag;
+pub mod dag_state;
 
 pub use engine::CaduceusEngine;
+
+// P13d — live two-DAG state reducer (features + agents + snapshot). IDE
+// clients feed AgentEvents in and call `active_*` projections to render.
+pub use dag_state::{
+    ActiveFanoutV1, AgentEdgeV1, AgentNodeV1, AgentsDagV1, AwaitingApprovalV1, FeatureStepStatus,
+    FeatureStepV1, FeaturesDagV1, PendingScopeExpansionV1, ProvenanceEdgeV1, SessionSnapshotV1,
+    SessionStateReducer,
+};
