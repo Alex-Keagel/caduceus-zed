@@ -541,7 +541,7 @@ impl ReducerHandle {
     /// View the handle as an [`IntrospectionSink`] trait object. Hands
     /// out a `&dyn IntrospectionSink` backed by this same handle so
     /// callers can feed it straight into the critique fan-out driver.
-    pub fn as_sink(&self) -> &(dyn caduceus_orchestrator::critique_fanout::IntrospectionSink + '_) {
+    pub fn as_sink(&self) -> &(dyn caduceus_orchestrator::IntrospectionSink + '_) {
         self
     }
 
@@ -554,7 +554,7 @@ impl ReducerHandle {
 }
 
 #[async_trait::async_trait]
-impl caduceus_orchestrator::critique_fanout::IntrospectionSink for ReducerHandle {
+impl caduceus_orchestrator::IntrospectionSink for ReducerHandle {
     async fn emit(&self, event: IntrospectionEventV1) {
         // Wrap in the outer AgentEvent envelope so the reducer's unified
         // `ingest` path handles it — introspection is just one flavor of
@@ -960,7 +960,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reducer_handle_is_introspection_sink_and_reduces_introspection_events() {
-        use caduceus_orchestrator::critique_fanout::IntrospectionSink;
+        use caduceus_orchestrator::IntrospectionSink;
         let h = ReducerHandle::new();
         // Feed an introspection event directly through the sink API.
         let ev = IntrospectionEventV1::EnvelopeApplied {
@@ -989,7 +989,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn reducer_handle_concurrent_emitters_do_not_lose_events() {
-        use caduceus_orchestrator::critique_fanout::IntrospectionSink;
+        use caduceus_orchestrator::IntrospectionSink;
         let h = ReducerHandle::new();
         let mut set = Vec::new();
         for i in 0..32u64 {

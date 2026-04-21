@@ -12,8 +12,9 @@ use caduceus_core::{
     AgentEdgeKind, AgentEvent, Critique, CritiqueSeverity, EnvelopeSummaryV1, ExecutionId,
     IntrospectionEventV1, StepId,
 };
+use caduceus_orchestrator::IntrospectionSink;
 use caduceus_orchestrator::critique_fanout::{
-    CritiqueRunner, FanoutIntrospectionCtx, IntrospectionSink,
+    CritiqueRunner, FanoutIntrospectionCtx,
     spawn_critique_fanout_with_introspection,
 };
 use caduceus_orchestrator::modes::PersonaRegistry;

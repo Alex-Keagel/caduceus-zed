@@ -19,7 +19,6 @@ mod caduceus_marketplace_tool;
 mod caduceus_mcp_security_tool;
 mod caduceus_memory_read_tool;
 mod caduceus_memory_write_tool;
-mod caduceus_mode_request_tool;
 mod caduceus_policy_tool;
 mod caduceus_prd_tool;
 mod caduceus_product_tool;
@@ -189,7 +188,6 @@ pub use caduceus_marketplace_tool::*;
 pub use caduceus_mcp_security_tool::*;
 pub use caduceus_memory_read_tool::*;
 pub use caduceus_memory_write_tool::*;
-pub use caduceus_mode_request_tool::*;
 pub use caduceus_policy_tool::*;
 pub use caduceus_prd_tool::*;
 pub use caduceus_product_tool::*;
@@ -317,7 +315,6 @@ tools! {
     CaduceusMarketplaceTool,
     CaduceusMcpSecurityTool,
     CaduceusMemoryReadTool,
-    CaduceusModeRequestTool,
     CaduceusMemoryWriteTool,
     CaduceusPolicyTool,
     CaduceusPrdTool,

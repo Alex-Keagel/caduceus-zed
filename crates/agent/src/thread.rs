@@ -5,7 +5,7 @@ use crate::{
     CaduceusDependencyScanTool, CaduceusErrorAnalysisTool, CaduceusGitReadTool,
     CaduceusGitWriteTool, CaduceusIndexTool, CaduceusKanbanTool, CaduceusKillSwitchTool,
     CaduceusMarketplaceTool, CaduceusMcpSecurityTool, CaduceusMemoryReadTool,
-    CaduceusMemoryWriteTool, CaduceusModeRequestTool, CaduceusPolicyTool, CaduceusPrdTool,
+    CaduceusMemoryWriteTool, CaduceusPolicyTool, CaduceusPrdTool,
     CaduceusProductTool, CaduceusProgressTool, CaduceusProjectTool, CaduceusProjectWikiTool,
     CaduceusScaffoldTool, CaduceusSecurityScanTool, CaduceusSemanticSearchTool,
     CaduceusStorageTool, CaduceusTaskDecomposeTool, CaduceusTaskTreeTool, CaduceusTelemetryTool,
@@ -1675,81 +1675,22 @@ impl Thread {
     /// Plan mode CANNOT write:
     /// - Code files (.rs, .py, .js, .ts, etc.)
     /// - Terminal commands
+    /// Tool dispatch gate — delegates to the bridge's authoritative
+    /// `mode_allows_tool` (ST-A6 / contract `mode-policy-shim-v1`). The old
+    /// hardcoded allowlist that lived here is retired; the bridge is the
+    /// single source of truth for mode × tool decisions.
     fn is_tool_allowed_in_current_mode(&self, tool_name: &str) -> bool {
         let mode = self.caduceus_mode_from_profile();
-
-        // Always allowed in any mode
-        let always_allowed = ["caduceus_mode_request", "spawn_agent"];
-        if always_allowed.contains(&tool_name) {
-            return true;
+        let allowed = caduceus_bridge::orchestrator::mode_allows_tool(mode, tool_name);
+        if !allowed {
+            log::warn!(
+                "[caduceus] BLOCKED '{}' in {} mode. \
+                Ask the user to switch to a mode that allows this tool.",
+                tool_name,
+                mode
+            );
         }
-
-        // Use engine's AgentMode for read-only classification
-        let is_read_only = caduceus_bridge::orchestrator::BridgeAgentMode::from_str_loose(mode)
-            .map(|m| {
-                matches!(
-                    m,
-                    caduceus_bridge::orchestrator::BridgeAgentMode::Plan
-                        | caduceus_bridge::orchestrator::BridgeAgentMode::Research
-                )
-            })
-            .unwrap_or(false);
-
-        if is_read_only {
-            let allowed_tools = [
-                // Zed built-in read tools (local only — no network)
-                "read_file",
-                "find_path",
-                "grep",
-                "list_directory",
-                "diagnostics",
-                "now",
-                "open",
-                // Caduceus read-only tools (strictly no state mutation)
-                "caduceus_semantic_search",
-                "caduceus_index",
-                "caduceus_code_graph",
-                "caduceus_tree_sitter",
-                "caduceus_git_read",
-                "caduceus_memory_read",
-                "caduceus_dependency_scan",
-                "caduceus_security_scan",
-                "caduceus_error_analysis",
-                "caduceus_mcp_security",
-                "caduceus_prd",
-                "caduceus_progress",
-                "caduceus_telemetry",
-                "caduceus_conversation",
-                "caduceus_marketplace",
-                "caduceus_project",
-                "caduceus_task_tree",
-                "caduceus_time_tracking",
-                "caduceus_policy",
-                "caduceus_cross_search",
-                "caduceus_api_registry",
-                "caduceus_architect",
-                "caduceus_product",
-                // REMOVED from read-only: caduceus_wiki (write/delete),
-                // caduceus_project_wiki (write_page/auto_populate),
-                // caduceus_kanban (git worktree mutations),
-                // caduceus_checkpoint (create/restore),
-                // caduceus_storage (save/delete),
-                // caduceus_automations (add/remove/enable/disable),
-                // caduceus_scaffold (creates files)
-            ];
-            let allowed = allowed_tools.contains(&tool_name);
-            if !allowed {
-                log::warn!(
-                    "[caduceus] BLOCKED '{}' in {} mode. \
-                    Use caduceus_mode_request to escalate.",
-                    tool_name,
-                    mode
-                );
-            }
-            allowed
-        } else {
-            true // Ring 1+ allows everything
-        }
+        allowed
     }
 
     /// Caduceus: unified max-token fallback for context budgeting.
@@ -2296,7 +2237,6 @@ impl Thread {
         self.add_tool(CaduceusProgressTool::new());
         self.add_tool(CaduceusTelemetryTool::new());
         self.add_tool(CaduceusTimeTrackingTool::new());
-        self.add_tool(CaduceusModeRequestTool::new());
         self.add_tool(CaduceusTreeSitterTool::new(self.project.clone()));
         self.add_tool(CaduceusTaskTreeTool::new());
         self.add_tool(CaduceusTaskDecomposeTool::new(self.task_dag.clone()));
@@ -3148,7 +3088,7 @@ impl Thread {
                 DO NOT retry — this is a permission issue, not a transient error. \
                 Ask the user: \"I need {} to complete this task. \
                 Shall I switch to Act mode?\" \
-                Then use caduceus_mode_request to request the change.",
+                The user will switch the mode manually if they agree.",
                 tool_use.name, mode, tool_use.name
             );
             log::warn!(
@@ -4267,7 +4207,7 @@ impl Thread {
                 **Security**: caduceus_security_scan (SAST), caduceus_mcp_security (MCP tool vetting), caduceus_policy (compliance)\n\
                 **Project**: caduceus_project (multi-repo config), caduceus_api_registry (API catalog), \
                 caduceus_architect (health score), caduceus_product (feature tracking)\n\
-                **Meta**: caduceus_mode_request (switch modes), caduceus_progress (velocity), \
+                **Meta**: caduceus_progress (velocity), \
                 caduceus_telemetry (token usage), caduceus_time_tracking (session time)\n\
                 \n\
                 Rules: PERMISSION DENIED = don't retry, ask user to switch mode. \

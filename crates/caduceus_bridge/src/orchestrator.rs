@@ -533,7 +533,7 @@ pub struct OrchestratorBridge {
     reflexion: Option<Arc<std::sync::Mutex<caduceus_orchestrator::reflexion::ReflexionMemory>>>,
     /// Optional Tree-of-Thoughts planner config (P12.3) attached to
     /// every harness.
-    tot_config: Option<caduceus_orchestrator::branching_planner::PlannerConfig>,
+    tot_config: Option<caduceus_orchestrator::PlannerConfig>,
 }
 
 /// Cheap, `Clone`-able handle to an `AgentEventEmitter`'s retention ring.
@@ -758,7 +758,7 @@ impl OrchestratorBridge {
     /// bridge.
     pub fn with_tot_config(
         mut self,
-        cfg: caduceus_orchestrator::branching_planner::PlannerConfig,
+        cfg: caduceus_orchestrator::PlannerConfig,
     ) -> Self {
         self.tot_config = Some(cfg);
         self
@@ -767,11 +767,11 @@ impl OrchestratorBridge {
     /// Convenience: install the planner config defaults
     /// (`PlannerConfig::default`).
     pub fn with_default_tot_config(self) -> Self {
-        self.with_tot_config(caduceus_orchestrator::branching_planner::PlannerConfig::default())
+        self.with_tot_config(caduceus_orchestrator::PlannerConfig::default())
     }
 
     /// Borrow the bound ToT planner config (if any).
-    pub fn tot_config(&self) -> Option<&caduceus_orchestrator::branching_planner::PlannerConfig> {
+    pub fn tot_config(&self) -> Option<&caduceus_orchestrator::PlannerConfig> {
         self.tot_config.as_ref()
     }
 
@@ -1800,7 +1800,7 @@ mod tests {
 
     #[test]
     fn bridge_attaches_tot_config_to_harness() {
-        use caduceus_orchestrator::branching_planner::PlannerConfig;
+        use caduceus_orchestrator::PlannerConfig;
         use caduceus_providers::mock::MockLlmAdapter;
         let dir = tempfile::tempdir().unwrap();
         let cfg = PlannerConfig::default();
@@ -2812,6 +2812,83 @@ pub fn mode_allows_writes(mode: &str) -> bool {
         AgentMode::Act => true,
         AgentMode::Autopilot => true,
     }
+}
+
+/// Read-only tool allowlist (Plan + Research) — the **single source of truth**.
+///
+/// Contract `mode-policy-shim-v1` (decomposition §5): the Zed IDE MUST NOT
+/// carry a local copy of this list. `thread.rs::is_tool_allowed_in_current_mode`
+/// delegates to this function. When a new read-only tool ships, it is added
+/// here and both the engine and the IDE pick it up without a second edit.
+///
+/// Entries split into two classes:
+///   1. Zed built-in read tools (local only, no network side effects)
+///   2. Caduceus read-only tools (strictly no state mutation)
+///
+/// Any tool not in this set is treated as write-ish and gated by mode.
+fn is_read_only_tool(tool_name: &str) -> bool {
+    const READ_ONLY_TOOLS: &[&str] = &[
+        // ── Zed built-in read tools ────────────────────────────────────
+        "read_file",
+        "find_path",
+        "grep",
+        "list_directory",
+        "diagnostics",
+        "now",
+        "open",
+        // ── Caduceus read-only tools ───────────────────────────────────
+        "caduceus_semantic_search",
+        "caduceus_index",
+        "caduceus_code_graph",
+        "caduceus_tree_sitter",
+        "caduceus_git_read",
+        "caduceus_memory_read",
+        "caduceus_dependency_scan",
+        "caduceus_security_scan",
+        "caduceus_error_analysis",
+        "caduceus_mcp_security",
+        "caduceus_prd",
+        "caduceus_progress",
+        "caduceus_telemetry",
+        "caduceus_conversation",
+        "caduceus_marketplace",
+        "caduceus_project",
+        "caduceus_task_tree",
+        "caduceus_time_tracking",
+        "caduceus_policy",
+        "caduceus_cross_search",
+        "caduceus_api_registry",
+        "caduceus_architect",
+        "caduceus_product",
+    ];
+    READ_ONLY_TOOLS.contains(&tool_name)
+}
+
+/// Authoritative mode × tool gate — returns `true` when the mode allows the
+/// tool to dispatch. This is the **single source of truth** the IDE calls
+/// before dispatching every tool; the old hardcoded `thread.rs` allowlist is
+/// retired.
+///
+/// Decision table:
+///   - `plan`, `research` → only read-only tools dispatch; writes bounce
+///     (Plan→intercept, Research→markdown-only via envelope preflight).
+///   - `act`, `autopilot` → every tool dispatches; per-folder write gates
+///     are enforced by the engine's `PermissionEnvelope::preflight`.
+///
+/// Tools not classified as read-only are permitted only in write-capable
+/// modes. Callers MUST additionally route through `envelope.preflight(...)`
+/// for path-level authority — this function only covers the mode-level gate.
+pub fn mode_allows_tool(mode: &str, tool_name: &str) -> bool {
+    // `spawn_agent` is the one tool exempt from mode gating — it transfers
+    // work to a sub-agent whose own envelope decides what it can do.
+    if tool_name == "spawn_agent" {
+        return true;
+    }
+    if is_read_only_tool(tool_name) {
+        return true;
+    }
+    // Any remaining tool is a write-capable tool. Gate on mode.
+    mode_allows_writes(mode)
 }
 
 // ── P13c — catalog endpoints (personas, skills, models) ────────────────────

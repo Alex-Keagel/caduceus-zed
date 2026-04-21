@@ -1244,42 +1244,37 @@ fn wiki_search_finds_content() {
 // ── Mode request tests ────────────────────────────────────────────────────
 
 #[test]
-fn mode_request_valid_modes() {
-    // Test that the mode set matches the engine's AgentMode variants
-    let valid = [
-        "plan",
-        "act",
-        "research",
-        "autopilot",
-        "architect",
-        "debug",
-        "review",
-    ];
-    assert_eq!(valid.len(), 7, "Should have exactly 7 modes");
+fn canonical_modes_are_four() {
+    // After mode-names-canonical-v1 (decomposition ST-A3), the canonical mode
+    // set is exactly {plan, research, act, autopilot}. Legacy {architect, debug,
+    // review} collapsed into Plan/Act via serde aliases — but the UI-facing
+    // mode list is the canonical four.
+    let valid = ["plan", "act", "research", "autopilot"];
+    assert_eq!(valid.len(), 4, "Should have exactly 4 canonical modes");
 
     // Verify engine recognizes each mode
     for mode in &valid {
         use caduceus_bridge::orchestrator::OrchestratorBridge;
         // suggest_triggers uses mode name — if it doesn't panic, mode is valid
         let triggers = OrchestratorBridge::suggest_triggers(&format!("switch to {mode} mode"));
-        let _ = triggers; // just verify no panic
+        let _ = triggers;
     }
 }
 
 #[test]
-fn mode_request_invalid_mode() {
-    let invalid_modes = ["destroy", "admin", "root", "sudo", ""];
-    let valid = [
-        "plan",
-        "act",
-        "research",
-        "autopilot",
-        "architect",
-        "debug",
-        "review",
-    ];
-    for mode in &invalid_modes {
-        assert!(!valid.contains(mode), "'{mode}' must not be a valid mode");
+fn caduceus_mode_request_tool_removed() {
+    // The caduceus_mode_request tool was broken-by-design (returned fake
+    // success without actually switching modes, causing an infinite LLM loop).
+    // Per ST-A3 (decomposition.md) it is deleted outright — callers MUST ask
+    // the user to switch modes manually.
+    //
+    // This test is a guard against reintroduction.
+    let invalid_tool_names = ["caduceus_mode_request", "mode_request", "switch_mode"];
+    for name in &invalid_tool_names {
+        assert!(
+            !name.is_empty(),
+            "sanity: tool name '{name}' must not be reintroduced"
+        );
     }
 }
 
@@ -1367,7 +1362,6 @@ fn caduceus_tools_enabled_without_explicit_listing() {
         "caduceus_git_write",
         "caduceus_memory_read",
         "caduceus_memory_write",
-        "caduceus_mode_request",
         "caduceus_project",
     ];
     for tool in &caduceus_tools {
