@@ -139,7 +139,7 @@ impl PermissionsBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caduceus_permissions::{PolicyCondition, PermissionDecision};
+    use caduceus_permissions::{PermissionDecision, PolicyCondition};
 
     #[test]
     fn permissions_grant_revoke_capability() {

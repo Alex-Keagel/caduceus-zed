@@ -1,13 +1,12 @@
 //! Telemetry bridge — token counting, cost calculation, usage tracking,
 //! SLO monitoring, budget enforcement, drift detection, and degradation breaker.
 
-use caduceus_telemetry::{
-    BudgetEnforcer, CognitiveDegradationBreaker, BehavioralDriftDetector,
-    CostCalculator, CostLogger, CostRecord, DegradationIndicators, DegradationStage,
-    ModelPricing, OtelExporter, OtelExporterConfig, Slo, SloMetric, SloMonitor,
-    SloStatus, TelemetryEvent, TokenCounter,
-};
 use caduceus_core::{ModelId, ProviderId};
+use caduceus_telemetry::{
+    BehavioralDriftDetector, BudgetEnforcer, CognitiveDegradationBreaker, CostCalculator,
+    CostLogger, CostRecord, DegradationIndicators, DegradationStage, ModelPricing, OtelExporter,
+    OtelExporterConfig, Slo, SloMetric, SloMonitor, SloStatus, TelemetryEvent, TokenCounter,
+};
 
 /// Re-export the telemetry TokenUsage (different from core::TokenUsage)
 pub use caduceus_telemetry::TokenUsage as TelemetryTokenUsage;
@@ -65,20 +64,14 @@ impl TelemetryBridge {
 
     /// Calculate cost for a specific request.
     pub fn calculate_cost(&self, provider: &str, model: &str, usage: &TelemetryTokenUsage) -> f64 {
-        self.calculator.calculate(
-            &ProviderId::new(provider),
-            &ModelId::new(model),
-            usage,
-        )
+        self.calculator
+            .calculate(&ProviderId::new(provider), &ModelId::new(model), usage)
     }
 
     /// Log a cost event.
     pub fn log_cost(&mut self, provider: &str, model: &str, usage: TelemetryTokenUsage) {
-        self.logger.log(
-            &ProviderId::new(provider),
-            &ModelId::new(model),
-            usage,
-        );
+        self.logger
+            .log(&ProviderId::new(provider), &ModelId::new(model), usage);
     }
 
     /// Get total cost across all logged events.
@@ -156,7 +149,10 @@ impl TelemetryBridge {
     /// Check cost against budget and record if within limit.
     pub fn check_and_record(&mut self, cost: f64) -> Result<(), String> {
         self.budget.check_and_record(cost).map_err(|e| {
-            format!("Budget exceeded: spent ${:.4}, limit ${:.4}", e.spent_usd, e.limit_usd)
+            format!(
+                "Budget exceeded: spent ${:.4}, limit ${:.4}",
+                e.spent_usd, e.limit_usd
+            )
         })
     }
 
@@ -176,9 +172,18 @@ impl TelemetryBridge {
     pub fn generate_report(&self) -> String {
         let mut report = String::from("# Telemetry Report\n\n");
         report.push_str(&format!("## Token Usage\n"));
-        report.push_str(&format!("- Input tokens:  {}\n", self.counter.total_usage().input_tokens));
-        report.push_str(&format!("- Output tokens: {}\n", self.counter.total_usage().output_tokens));
-        report.push_str(&format!("- Total cost:    ${:.6}\n\n", self.logger.total_cost()));
+        report.push_str(&format!(
+            "- Input tokens:  {}\n",
+            self.counter.total_usage().input_tokens
+        ));
+        report.push_str(&format!(
+            "- Output tokens: {}\n",
+            self.counter.total_usage().output_tokens
+        ));
+        report.push_str(&format!(
+            "- Total cost:    ${:.6}\n\n",
+            self.logger.total_cost()
+        ));
         report.push_str(&format!("## Budget\n"));
         report.push_str(&format!("- Limit:     ${:.4}\n", self.budget.limit()));
         report.push_str(&format!("- Spent:     ${:.4}\n", self.budget.spent()));
@@ -190,8 +195,14 @@ impl TelemetryBridge {
                 status.name, status.target, status.current, status.is_met
             ));
         }
-        report.push_str(&format!("\n## Drift Score: {:.4}\n", self.drift_detector.drift_score()));
-        report.push_str(&format!("## Degradation Stage: {:?}\n", self.degradation_breaker.current_stage()));
+        report.push_str(&format!(
+            "\n## Drift Score: {:.4}\n",
+            self.drift_detector.drift_score()
+        ));
+        report.push_str(&format!(
+            "## Degradation Stage: {:?}\n",
+            self.degradation_breaker.current_stage()
+        ));
         report
     }
 
@@ -295,7 +306,6 @@ mod tests {
             input_tokens: 1000,
             output_tokens: 500,
             cached_tokens: 0,
-            
         };
         t.record_usage("claude-sonnet", &usage);
         let model = t.model_usage("claude-sonnet");
@@ -310,7 +320,6 @@ mod tests {
             input_tokens: 1000,
             output_tokens: 500,
             cached_tokens: 0,
-            
         };
         t.log_cost("anthropic", "claude-sonnet", usage);
         assert_eq!(t.cost_record_count(), 1);
@@ -323,7 +332,6 @@ mod tests {
             input_tokens: 1000,
             output_tokens: 500,
             cached_tokens: 0,
-            
         };
         t.record_usage("test", &usage);
         t.reset_session();
@@ -333,8 +341,16 @@ mod tests {
     #[test]
     fn telemetry_all_model_usage() {
         let mut t = TelemetryBridge::new();
-        let u1 = TelemetryTokenUsage { input_tokens: 100, output_tokens: 50, cached_tokens: 0 };
-        let u2 = TelemetryTokenUsage { input_tokens: 200, output_tokens: 100, cached_tokens: 0 };
+        let u1 = TelemetryTokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_tokens: 0,
+        };
+        let u2 = TelemetryTokenUsage {
+            input_tokens: 200,
+            output_tokens: 100,
+            cached_tokens: 0,
+        };
         t.record_usage("model-a", &u1);
         t.record_usage("model-b", &u2);
         let all = t.all_model_usage();
@@ -362,7 +378,11 @@ mod tests {
     #[test]
     fn telemetry_cost_for_model() {
         let mut t = TelemetryBridge::new();
-        let usage = TelemetryTokenUsage { input_tokens: 1000, output_tokens: 500, cached_tokens: 0 };
+        let usage = TelemetryTokenUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_tokens: 0,
+        };
         t.log_cost("anthropic", "claude-sonnet", usage.clone());
         t.log_cost("anthropic", "claude-sonnet", usage);
         let cost = t.cost_for_model("claude-sonnet");
@@ -374,7 +394,11 @@ mod tests {
     #[test]
     fn telemetry_export_json() {
         let mut t = TelemetryBridge::new();
-        let usage = TelemetryTokenUsage { input_tokens: 100, output_tokens: 50, cached_tokens: 0 };
+        let usage = TelemetryTokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_tokens: 0,
+        };
         t.log_cost("anthropic", "claude-sonnet", usage);
         let json = t.export_json().unwrap();
         assert!(json.contains("claude-sonnet"));

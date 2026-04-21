@@ -7,9 +7,7 @@
 
 use async_trait::async_trait;
 use caduceus_bridge::dag_state::SessionStateReducer;
-use caduceus_bridge::orchestrator::{
-    list_bundled_skills, list_models, list_modes, list_personas,
-};
+use caduceus_bridge::orchestrator::{list_bundled_skills, list_models, list_modes, list_personas};
 use caduceus_core::{
     AgentEdgeKind, AgentEvent, Critique, CritiqueSeverity, EnvelopeSummaryV1, ExecutionId,
     IntrospectionEventV1, StepId,
@@ -35,7 +33,9 @@ impl ReducerSink {
             reducer: Mutex::new(SessionStateReducer::new()),
         }
     }
-    fn snapshot(&self) -> (
+    fn snapshot(
+        &self,
+    ) -> (
         caduceus_bridge::dag_state::FeaturesDagV1,
         caduceus_bridge::dag_state::AgentsDagV1,
         caduceus_bridge::dag_state::SessionSnapshotV1,
@@ -250,9 +250,11 @@ fn p13e_catalogs_are_populated_and_aligned() {
     // Models catalog exposes vendor tiers without exact ids.
     let models = list_models();
     assert!(!models.is_empty());
-    assert!(models
-        .iter()
-        .any(|m| m.vendor == "anthropic" && m.tier == "opus"));
+    assert!(
+        models
+            .iter()
+            .any(|m| m.vendor == "anthropic" && m.tier == "opus")
+    );
 
     // list_bundled_skills is callable on any path (empty workspace → empty).
     let tmp = tempfile::tempdir().unwrap();

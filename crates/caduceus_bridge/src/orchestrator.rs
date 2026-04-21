@@ -674,6 +674,18 @@ impl OrchestratorBridge {
 
     // ── P12 primitive wiring (production side) ───────────────────────────
 
+    /// Mint a fresh [`ReducerHandle`] for a new session. Cheap; the handle
+    /// owns a private [`SessionStateReducer`] behind an `Arc<Mutex<…>>` so
+    /// every collaborator (critique fan-out driver, IPC replay loop, UI
+    /// remount path) sees the same reducer state. Pass the handle into
+    /// `spawn_critique_fanout_with_introspection` via `handle.as_sink()`
+    /// and into the session event replay path via `handle.ingest_event`
+    /// / `handle.ingest_many` — one reducer per session, three filtered
+    /// projections out.
+    pub fn new_reducer_handle(&self) -> crate::dag_state::ReducerHandle {
+        crate::dag_state::ReducerHandle::new()
+    }
+
     /// Attach a [`SpeculativeCache`](caduceus_tools::SpeculativeCache) to
     /// every subsequent harness produced by `build_harness*`. Cheaply
     /// cloneable; the same `Arc`-backed map is shared by the bridge,
@@ -3096,7 +3108,10 @@ mod p13c_catalog_tests {
         assert!(!m.is_empty());
         // At minimum, Anthropic opus + OpenAI opus tier must be present —
         // these are the primary orchestrator + cross-check vendors.
-        assert!(m.iter().any(|x| x.vendor == "anthropic" && x.tier == "opus"));
+        assert!(
+            m.iter()
+                .any(|x| x.vendor == "anthropic" && x.tier == "opus")
+        );
         assert!(m.iter().any(|x| x.vendor == "openai" && x.tier == "opus"));
         // Cost / latency classes are present on every entry.
         for entry in &m {

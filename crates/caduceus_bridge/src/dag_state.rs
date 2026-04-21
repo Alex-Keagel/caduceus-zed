@@ -440,6 +440,132 @@ impl SessionStateReducer {
     }
 }
 
+// ── ReducerHandle — auto-wire-ready, concurrent-safe wrapper ───────────────
+//
+// P13 follow-up: the bare [`SessionStateReducer`] is `Send` but not `Sync`
+// (it mutates internal maps through `&mut self`). In production every
+// session has one reducer fed by BOTH:
+//   * the introspection pipeline (many parallel critic tasks calling
+//     `IntrospectionSink::emit` on the same handle), AND
+//   * the generic agent event stream (`AgentEvent::PlanStepPending`,
+//     `ModeChanged`, `AwaitingApproval`, …).
+//
+// `ReducerHandle` is the shared, cloneable, sync-safe handle the bridge
+// hands out to both sides. It wraps the reducer in `Arc<Mutex<…>>` and
+// implements [`IntrospectionSink`], so passing `handle.as_sink()` into
+// [`caduceus_orchestrator::critique_fanout::spawn_critique_fanout_with_introspection`]
+// just works — no ad-hoc `Mutex<Reducer>` wrappers in caller code.
+//
+// The handle deliberately owns a single reducer per session (not per
+// projection). Three reducers would skew; one reducer, three filtered
+// views is the invariant from the P13 design.
+
+/// Cheaply-cloneable, thread-safe handle to a per-session
+/// [`SessionStateReducer`]. Use `OrchestratorBridge::new_reducer_handle`
+/// to mint one per session; every collaborator that produces events —
+/// the introspection fan-out driver, the IPC layer, the UI replay loop —
+/// should share the same handle so the reducer sees every event exactly
+/// once.
+#[derive(Clone, Default)]
+pub struct ReducerHandle {
+    inner: std::sync::Arc<std::sync::Mutex<SessionStateReducer>>,
+}
+
+impl std::fmt::Debug for ReducerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Avoid taking the lock in Debug to prevent Debug-triggered deadlocks.
+        f.debug_struct("ReducerHandle").finish_non_exhaustive()
+    }
+}
+
+impl ReducerHandle {
+    /// Mint a fresh handle with an empty reducer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold a single [`AgentEvent`] into state. The lock is held only for
+    /// the duration of the `ingest` call — cheap map/vec pushes.
+    pub fn ingest_event(&self, event: &AgentEvent) -> u64 {
+        let mut g = self.inner.lock().expect("reducer mutex poisoned");
+        g.ingest(event)
+    }
+
+    /// Bulk ingest — typical path for session replay on UI remount.
+    /// Events are ingested in slice order under a single lock acquisition
+    /// so no concurrent producer can interleave and split the replay.
+    pub fn ingest_many(&self, events: &[AgentEvent]) -> u64 {
+        let mut g = self.inner.lock().expect("reducer mutex poisoned");
+        let mut last = g.last_event_id();
+        for ev in events {
+            last = g.ingest(ev);
+        }
+        last
+    }
+
+    /// Current reducer-local event id.
+    pub fn last_event_id(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("reducer mutex poisoned")
+            .last_event_id()
+    }
+
+    /// Features-DAG view. `include_sensitive` is reserved for future
+    /// redaction of per-step metadata; today the features projection has
+    /// no sensitive fields but the signature is kept uniform with the
+    /// other two projections.
+    pub fn active_features_dag(&self, include_sensitive: bool) -> FeaturesDagV1 {
+        self.inner
+            .lock()
+            .expect("reducer mutex poisoned")
+            .active_features_dag(include_sensitive)
+    }
+
+    /// Agents-DAG view with redaction controlled by `include_sensitive`.
+    pub fn active_agents_dag(&self, include_sensitive: bool) -> AgentsDagV1 {
+        self.inner
+            .lock()
+            .expect("reducer mutex poisoned")
+            .active_agents_dag(include_sensitive)
+    }
+
+    /// Session snapshot with redaction controlled by `include_sensitive`.
+    pub fn active_session_snapshot(&self, include_sensitive: bool) -> SessionSnapshotV1 {
+        self.inner
+            .lock()
+            .expect("reducer mutex poisoned")
+            .active_session_snapshot(include_sensitive)
+    }
+
+    /// View the handle as an [`IntrospectionSink`] trait object. Hands
+    /// out a `&dyn IntrospectionSink` backed by this same handle so
+    /// callers can feed it straight into the critique fan-out driver.
+    pub fn as_sink(
+        &self,
+    ) -> &(dyn caduceus_orchestrator::critique_fanout::IntrospectionSink + '_) {
+        self
+    }
+
+    /// Strong ref-count of the underlying reducer — diagnostic helper for
+    /// tests that want to assert "only the bridge holds the reducer".
+    #[doc(hidden)]
+    pub fn _strong_count(&self) -> usize {
+        std::sync::Arc::strong_count(&self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl caduceus_orchestrator::critique_fanout::IntrospectionSink for ReducerHandle {
+    async fn emit(&self, event: IntrospectionEventV1) {
+        // Wrap in the outer AgentEvent envelope so the reducer's unified
+        // `ingest` path handles it — introspection is just one flavor of
+        // agent event from the reducer's perspective.
+        let wrapped = AgentEvent::Introspection(event);
+        self.ingest_event(&wrapped);
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -584,7 +710,11 @@ mod tests {
         let a = r.active_agents_dag(true);
         assert_eq!(a.nodes.len(), 2);
         assert_eq!(a.edges.len(), 2);
-        assert_eq!(a.active_fanouts.len(), 1, "fanout still active until Completed");
+        assert_eq!(
+            a.active_fanouts.len(),
+            1,
+            "fanout still active until Completed"
+        );
 
         r.ingest(&AgentEvent::Introspection(
             IntrospectionEventV1::FanoutCompleted {
@@ -783,5 +913,99 @@ mod tests {
         assert_eq!(s.provenance.len(), 2);
         assert_eq!(s.provenance[0].kind, ProvenanceEdgeKind::ExecutesStep);
         assert_eq!(s.provenance[1].kind, ProvenanceEdgeKind::AmendsPlan);
+    }
+
+    // ── ReducerHandle tests ────────────────────────────────────────────────
+
+    #[test]
+    fn reducer_handle_ingest_matches_direct_reducer() {
+        let direct = {
+            let mut r = SessionStateReducer::new();
+            r.ingest(&plan_step(1, 10, "bash", vec![]));
+            r.ingest(&plan_step(2, 20, "edit", vec![10]));
+            r.active_features_dag(false)
+        };
+        let h = ReducerHandle::new();
+        h.ingest_event(&plan_step(1, 10, "bash", vec![]));
+        h.ingest_event(&plan_step(2, 20, "edit", vec![10]));
+        let via_handle = h.active_features_dag(false);
+        assert_eq!(direct, via_handle);
+    }
+
+    #[test]
+    fn reducer_handle_ingest_many_under_single_lock() {
+        let h = ReducerHandle::new();
+        let events = vec![
+            plan_step(1, 10, "bash", vec![]),
+            plan_step(2, 20, "edit", vec![10]),
+            plan_step(3, 30, "test", vec![20]),
+        ];
+        let last = h.ingest_many(&events);
+        assert_eq!(last, 3);
+        assert_eq!(h.last_event_id(), 3);
+        let dag = h.active_features_dag(false);
+        assert_eq!(dag.steps.len(), 3);
+        assert_eq!(dag.steps[2].depends_on, vec![StepId(20)]);
+    }
+
+    #[test]
+    fn reducer_handle_clones_share_same_reducer() {
+        let h1 = ReducerHandle::new();
+        let h2 = h1.clone();
+        h1.ingest_event(&plan_step(1, 7, "bash", vec![]));
+        // h2 sees h1's ingestion — proof they share the same Arc<Mutex<…>>.
+        assert_eq!(h2.last_event_id(), 1);
+        assert_eq!(h2.active_features_dag(false).steps.len(), 1);
+        // And the strong count reflects both handles.
+        assert_eq!(h1._strong_count(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reducer_handle_is_introspection_sink_and_reduces_introspection_events() {
+        use caduceus_orchestrator::critique_fanout::IntrospectionSink;
+        let h = ReducerHandle::new();
+        // Feed an introspection event directly through the sink API.
+        let ev = IntrospectionEventV1::EnvelopeApplied {
+            summary: EnvelopeSummaryV1 {
+                read_scope_count: 1,
+                write_scope_count: 1,
+                write_deny_count: 0,
+                network_enabled: false,
+                exec_enabled: false,
+                approval_cadence: "never".into(),
+                scope_source: "builtin".into(),
+                display_text: Some("demo".into()),
+            },
+        };
+        IntrospectionSink::emit(&h, ev).await;
+        let snap = h.active_session_snapshot(true);
+        assert!(snap.envelope.is_some());
+        assert_eq!(snap.envelope.as_ref().unwrap().display_text.as_deref(), Some("demo"));
+        // Redacted view strips display_text.
+        let redacted = h.active_session_snapshot(false);
+        assert!(redacted.envelope.as_ref().unwrap().display_text.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn reducer_handle_concurrent_emitters_do_not_lose_events() {
+        use caduceus_orchestrator::critique_fanout::IntrospectionSink;
+        let h = ReducerHandle::new();
+        let mut set = Vec::new();
+        for i in 0..32u64 {
+            let h = h.clone();
+            set.push(tokio::spawn(async move {
+                let ev = IntrospectionEventV1::ProvenanceRecorded {
+                    edge: ProvenanceEdgeKind::ExecutesStep,
+                    execution_id: ExecutionId(i),
+                    target_step_id: Some(StepId(i)),
+                };
+                IntrospectionSink::emit(&h, ev).await;
+            }));
+        }
+        for j in set {
+            j.await.unwrap();
+        }
+        assert_eq!(h.last_event_id(), 32);
+        assert_eq!(h.active_session_snapshot(false).provenance.len(), 32);
     }
 }

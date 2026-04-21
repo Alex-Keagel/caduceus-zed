@@ -160,8 +160,7 @@ fn extract_symbols_recursive(
         let end_line = node.end_position().row + 1;
 
         let node_content = if end_line <= lines.len() {
-            lines[start_line.saturating_sub(1)..end_line.min(lines.len())]
-                .join("\n")
+            lines[start_line.saturating_sub(1)..end_line.min(lines.len())].join("\n")
         } else {
             node.utf8_text(content.as_bytes()).unwrap_or("").to_string()
         };
@@ -208,14 +207,22 @@ fn classify_node(
     }
 }
 
-fn get_child_text<'a>(node: tree_sitter::Node<'a>, field: &str, content: &'a str) -> Option<&'a str> {
+fn get_child_text<'a>(
+    node: tree_sitter::Node<'a>,
+    field: &str,
+    content: &'a str,
+) -> Option<&'a str> {
     node.child_by_field_name(field)
         .and_then(|n| n.utf8_text(content.as_bytes()).ok())
 }
 
 // ── Rust ────────────────────────────────────────────────────────────────────
 
-fn classify_rust_node(kind: &str, node: tree_sitter::Node, content: &str) -> Option<(SymbolType, String)> {
+fn classify_rust_node(
+    kind: &str,
+    node: tree_sitter::Node,
+    content: &str,
+) -> Option<(SymbolType, String)> {
     match kind {
         "function_item" => {
             let name = get_child_text(node, "name", content)?;
@@ -253,7 +260,11 @@ fn classify_rust_node(kind: &str, node: tree_sitter::Node, content: &str) -> Opt
 
 // ── Python ──────────────────────────────────────────────────────────────────
 
-fn classify_python_node(kind: &str, node: tree_sitter::Node, content: &str) -> Option<(SymbolType, String)> {
+fn classify_python_node(
+    kind: &str,
+    node: tree_sitter::Node,
+    content: &str,
+) -> Option<(SymbolType, String)> {
     match kind {
         "function_definition" => {
             let name = get_child_text(node, "name", content)?;
@@ -274,7 +285,11 @@ fn classify_python_node(kind: &str, node: tree_sitter::Node, content: &str) -> O
 
 // ── TypeScript/JavaScript ───────────────────────────────────────────────────
 
-fn classify_ts_node(kind: &str, node: tree_sitter::Node, content: &str) -> Option<(SymbolType, String)> {
+fn classify_ts_node(
+    kind: &str,
+    node: tree_sitter::Node,
+    content: &str,
+) -> Option<(SymbolType, String)> {
     match kind {
         "function_declaration" => {
             let name = get_child_text(node, "name", content)?;
@@ -317,7 +332,11 @@ fn classify_ts_node(kind: &str, node: tree_sitter::Node, content: &str) -> Optio
 
 // ── Go ──────────────────────────────────────────────────────────────────────
 
-fn classify_go_node(kind: &str, node: tree_sitter::Node, content: &str) -> Option<(SymbolType, String)> {
+fn classify_go_node(
+    kind: &str,
+    node: tree_sitter::Node,
+    content: &str,
+) -> Option<(SymbolType, String)> {
     match kind {
         "function_declaration" => {
             let name = get_child_text(node, "name", content)?;
@@ -355,7 +374,11 @@ fn classify_go_node(kind: &str, node: tree_sitter::Node, content: &str) -> Optio
 
 // ── C ───────────────────────────────────────────────────────────────────────
 
-fn classify_c_node(kind: &str, node: tree_sitter::Node, content: &str) -> Option<(SymbolType, String)> {
+fn classify_c_node(
+    kind: &str,
+    node: tree_sitter::Node,
+    content: &str,
+) -> Option<(SymbolType, String)> {
     match kind {
         "function_definition" => {
             let declarator = node.child_by_field_name("declarator")?;
@@ -423,11 +446,31 @@ pub enum Status {
         let chunks = chunker.chunk_file("src/main.rs", code);
 
         let names: Vec<&str> = chunks.iter().map(|c| c.symbol_name.as_str()).collect();
-        assert!(names.contains(&"Config"), "Should find struct Config, got: {:?}", names);
-        assert!(names.contains(&"main"), "Should find fn main, got: {:?}", names);
-        assert!(names.contains(&"Processor"), "Should find trait Processor, got: {:?}", names);
-        assert!(names.contains(&"Status"), "Should find enum Status, got: {:?}", names);
-        assert!(chunks.len() >= 5, "Should find at least 5 symbols, found {}", chunks.len());
+        assert!(
+            names.contains(&"Config"),
+            "Should find struct Config, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"main"),
+            "Should find fn main, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Processor"),
+            "Should find trait Processor, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "Should find enum Status, got: {:?}",
+            names
+        );
+        assert!(
+            chunks.len() >= 5,
+            "Should find at least 5 symbols, found {}",
+            chunks.len()
+        );
     }
 
     #[test]
@@ -449,15 +492,29 @@ def main():
         let chunker = TreeSitterChunker::new();
         let chunks = chunker.chunk_file("main.py", code);
         let names: Vec<&str> = chunks.iter().map(|c| c.symbol_name.as_str()).collect();
-        assert!(names.contains(&"DataProcessor"), "Should find class, got: {:?}", names);
-        assert!(names.contains(&"main"), "Should find function, got: {:?}", names);
+        assert!(
+            names.contains(&"DataProcessor"),
+            "Should find class, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"main"),
+            "Should find function, got: {:?}",
+            names
+        );
     }
 
     #[test]
     fn test_repo_map() {
         let files = vec![
-            ("src/main.rs".to_string(), "pub fn main() {}\npub struct App {}".to_string()),
-            ("src/lib.rs".to_string(), "pub fn init() {}\npub trait Service {}".to_string()),
+            (
+                "src/main.rs".to_string(),
+                "pub fn main() {}\npub struct App {}".to_string(),
+            ),
+            (
+                "src/lib.rs".to_string(),
+                "pub fn init() {}\npub trait Service {}".to_string(),
+            ),
         ];
         let map = generate_repo_map(&files);
         assert!(map.contains("src/main.rs:"), "Should have file header");

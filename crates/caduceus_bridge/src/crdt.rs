@@ -18,7 +18,10 @@ impl CrdtBridge {
     pub fn open_buffer(&mut self, file_path: &str, initial_text: Option<&str>) -> BufferInfo {
         // Validate path — reject traversal attempts entirely
         if file_path.contains("..") || std::path::Path::new(file_path).is_absolute() {
-            log::warn!("[caduceus] CRDT open_buffer: rejected unsafe path '{}'", file_path);
+            log::warn!(
+                "[caduceus] CRDT open_buffer: rejected unsafe path '{}'",
+                file_path
+            );
             return BufferInfo {
                 file_path: file_path.to_string(),
                 length: 0,
@@ -79,11 +82,7 @@ impl CrdtBridge {
     }
 
     /// Apply a remote operation.
-    pub fn apply_remote(
-        &mut self,
-        file_path: &str,
-        op: Operation,
-    ) -> Result<(), String> {
+    pub fn apply_remote(&mut self, file_path: &str, op: Operation) -> Result<(), String> {
         let buf = self
             .buffers
             .get_mut(file_path)

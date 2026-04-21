@@ -92,7 +92,10 @@ fn read_store(project_root: &Path) -> BTreeMap<String, String> {
             // Write migrated JSON and remove legacy file
             let _ = write_store(project_root, &map);
             let _ = std::fs::remove_file(&md_path);
-            log::info!("[caduceus] Migrated {} memory entries from memory.md → memory.json", map.len());
+            log::info!(
+                "[caduceus] Migrated {} memory entries from memory.md → memory.json",
+                map.len()
+            );
             return map;
         }
     }
@@ -115,15 +118,23 @@ fn write_store(project_root: &Path, store: &BTreeMap<String, String>) -> Result<
 pub fn store(project_root: &Path, key: &str, value: &str) -> Result<(), String> {
     validate_key(key)?;
     if RESERVED_PREFIXES.iter().any(|p| key.starts_with(p)) {
-        return Err(format!("Key '{}' uses a reserved prefix ({}). Use store_system() for engine-managed keys.",
-            key, RESERVED_PREFIXES.join(", ")));
+        return Err(format!(
+            "Key '{}' uses a reserved prefix ({}). Use store_system() for engine-managed keys.",
+            key,
+            RESERVED_PREFIXES.join(", ")
+        ));
     }
     let sanitized = sanitize_value(value);
     let lock = project_lock(project_root);
-    let _guard = lock.lock().map_err(|e| format!("memory lock poisoned: {e}"))?;
+    let _guard = lock
+        .lock()
+        .map_err(|e| format!("memory lock poisoned: {e}"))?;
     let mut map = read_store(project_root);
     if map.len() >= MAX_ENTRIES && !map.contains_key(key) {
-        return Err(format!("Memory limit reached ({} entries). Delete old entries first.", MAX_ENTRIES));
+        return Err(format!(
+            "Memory limit reached ({} entries). Delete old entries first.",
+            MAX_ENTRIES
+        ));
     }
     map.insert(key.to_string(), sanitized);
     write_store(project_root, &map)
@@ -134,7 +145,9 @@ pub fn store_system(project_root: &Path, key: &str, value: &str) -> Result<(), S
     validate_key(key)?;
     let sanitized = sanitize_value(value);
     let lock = project_lock(project_root);
-    let _guard = lock.lock().map_err(|e| format!("memory lock poisoned: {e}"))?;
+    let _guard = lock
+        .lock()
+        .map_err(|e| format!("memory lock poisoned: {e}"))?;
     let mut map = read_store(project_root);
     if map.len() >= MAX_ENTRIES && !map.contains_key(key) {
         return Err(format!("Memory limit reached ({} entries).", MAX_ENTRIES));
@@ -153,10 +166,15 @@ pub fn list(project_root: &Path) -> Vec<(String, String)> {
 
 pub fn delete(project_root: &Path, key: &str) -> Result<(), String> {
     if RESERVED_PREFIXES.iter().any(|p| key.starts_with(p)) {
-        return Err(format!("Cannot delete reserved key '{}' — managed by engine", key));
+        return Err(format!(
+            "Cannot delete reserved key '{}' — managed by engine",
+            key
+        ));
     }
     let lock = project_lock(project_root);
-    let _guard = lock.lock().map_err(|e| format!("memory lock poisoned: {e}"))?;
+    let _guard = lock
+        .lock()
+        .map_err(|e| format!("memory lock poisoned: {e}"))?;
     let mut map = read_store(project_root);
     if map.remove(key).is_none() {
         return Err(format!("Key '{}' not found", key));
@@ -215,7 +233,11 @@ mod tests {
         // Without newlines, the value is a single string — no key injection possible
         // Verify only one entry exists (not 3 forged keys)
         let entries = list(dir.path());
-        assert_eq!(entries.len(), 1, "Only 1 entry should exist, not 3 forged ones");
+        assert_eq!(
+            entries.len(),
+            1,
+            "Only 1 entry should exist, not 3 forged ones"
+        );
         assert_eq!(entries[0].0, "key");
     }
 
@@ -237,7 +259,11 @@ mod tests {
         let long_value = "x".repeat(10000);
         store(dir.path(), "big", &long_value).unwrap();
         let stored = get(dir.path(), "big").unwrap();
-        assert!(stored.len() <= MAX_VALUE_LEN, "Value should be capped at {}", MAX_VALUE_LEN);
+        assert!(
+            stored.len() <= MAX_VALUE_LEN,
+            "Value should be capped at {}",
+            MAX_VALUE_LEN
+        );
     }
 
     #[test]
@@ -271,7 +297,8 @@ mod tests {
         std::fs::write(
             caduceus_dir.join("memory.md"),
             "# Caduceus Memory\ngreeting: hello\nproject: test",
-        ).unwrap();
+        )
+        .unwrap();
         // Read should auto-migrate
         let entries = list(dir.path());
         assert_eq!(entries.len(), 2);

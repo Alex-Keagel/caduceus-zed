@@ -11,15 +11,6 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput};
 
 use super::caduceus_project_tool::ProjectConfig;
 
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
-}
-
 /// Manage a file-based project wiki under `.caduceus/wiki/`. Supports reading,
 /// writing, listing, searching, and auto-populating wiki pages from project config.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]

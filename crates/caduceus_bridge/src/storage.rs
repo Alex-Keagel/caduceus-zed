@@ -3,9 +3,8 @@
 
 use caduceus_core::{AuditEntry, SessionId};
 use caduceus_storage::{
-    GitTrackableStore, MemoryRecord, SqliteStorage, StoredCost, StoredToolCall,
-    TraceEvent, TraceEventType, TrajectoryRecorder, WikiEngine, WikiLinter, WikiIndex,
-    WikiPage, WikiWatcher,
+    GitTrackableStore, MemoryRecord, SqliteStorage, StoredCost, StoredToolCall, TraceEvent,
+    TraceEventType, TrajectoryRecorder, WikiEngine, WikiIndex, WikiLinter, WikiPage, WikiWatcher,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -57,7 +56,10 @@ impl StorageBridge {
             .map_err(|e| e.to_string())
     }
 
-    pub async fn list_messages(&self, session_id: &SessionId) -> Result<Vec<StoredMessage>, String> {
+    pub async fn list_messages(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<StoredMessage>, String> {
         self.storage
             .list_messages(session_id)
             .await
@@ -105,10 +107,17 @@ impl StorageBridge {
     }
 
     pub async fn total_cost(&self, session_id: &SessionId) -> Result<f64, String> {
-        self.storage.total_cost(session_id).await.map_err(|e| e.to_string())
+        self.storage
+            .total_cost(session_id)
+            .await
+            .map_err(|e| e.to_string())
     }
 
-    pub async fn export_transcript(&self, session_id: &SessionId, output_path: &Path) -> Result<(), String> {
+    pub async fn export_transcript(
+        &self,
+        session_id: &SessionId,
+        output_path: &Path,
+    ) -> Result<(), String> {
         self.storage
             .export_transcript(session_id, output_path)
             .await
@@ -202,12 +211,7 @@ impl StorageBridge {
     // ── Memory CRUD ──────────────────────────────────────────────────────
 
     /// Set (upsert) a memory key-value in a scope.
-    pub async fn set_memory(
-        &self,
-        scope: &str,
-        key: &str,
-        value: &str,
-    ) -> Result<(), String> {
+    pub async fn set_memory(&self, scope: &str, key: &str, value: &str) -> Result<(), String> {
         self.storage
             .set_memory(scope, key, value, "bridge")
             .await
@@ -215,11 +219,7 @@ impl StorageBridge {
     }
 
     /// Get a single memory record.
-    pub async fn get_memory(
-        &self,
-        scope: &str,
-        key: &str,
-    ) -> Result<Option<MemoryRecord>, String> {
+    pub async fn get_memory(&self, scope: &str, key: &str) -> Result<Option<MemoryRecord>, String> {
         self.storage
             .get_memory(scope, key)
             .await
@@ -227,10 +227,7 @@ impl StorageBridge {
     }
 
     /// List all memories in a scope (None = all scopes).
-    pub async fn list_memories(
-        &self,
-        scope: &str,
-    ) -> Result<Vec<MemoryRecord>, String> {
+    pub async fn list_memories(&self, scope: &str) -> Result<Vec<MemoryRecord>, String> {
         self.storage
             .list_memories(Some(scope))
             .await
@@ -248,10 +245,7 @@ impl StorageBridge {
     // ── Structured data store ────────────────────────────────────────────
 
     /// Get a structured (JSON) value by key.
-    pub async fn get_structured(
-        &self,
-        key: &str,
-    ) -> Result<Option<serde_json::Value>, String> {
+    pub async fn get_structured(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
         self.storage
             .get_structured(key)
             .await
@@ -323,11 +317,7 @@ impl StorageBridge {
     }
 
     /// Save (upsert) a task.
-    pub fn save_task(
-        &self,
-        project_root: &Path,
-        task: &serde_json::Value,
-    ) -> Result<(), String> {
+    pub fn save_task(&self, project_root: &Path, task: &serde_json::Value) -> Result<(), String> {
         let store = GitTrackableStore::new(project_root);
         store.save_task(task)
     }
@@ -362,12 +352,7 @@ impl StorageBridge {
     }
 
     /// Write (upsert) a wiki page.
-    pub fn write_page(
-        &self,
-        project_root: &Path,
-        slug: &str,
-        content: &str,
-    ) -> Result<(), String> {
+    pub fn write_page(&self, project_root: &Path, slug: &str, content: &str) -> Result<(), String> {
         let wiki = WikiEngine::new(project_root);
         wiki.init().map_err(|e| e.to_string())?;
         wiki.write_page(slug, content).map_err(|e| e.to_string())
@@ -380,11 +365,7 @@ impl StorageBridge {
     }
 
     /// Search wiki pages by query.
-    pub fn search_pages(
-        &self,
-        project_root: &Path,
-        query: &str,
-    ) -> Result<Vec<WikiPage>, String> {
+    pub fn search_pages(&self, project_root: &Path, query: &str) -> Result<Vec<WikiPage>, String> {
         let wiki = WikiEngine::new(project_root);
         wiki.init().map_err(|e| e.to_string())?;
         wiki.search_pages(query).map_err(|e| e.to_string())
@@ -432,8 +413,7 @@ impl StorageBridge {
 
     /// Import a trajectory from JSON.
     pub fn import_trajectory(&self, data: &str) -> Result<String, String> {
-        let recorder = TrajectoryRecorder::import_trajectory(data)
-            .map_err(|e| e.to_string())?;
+        let recorder = TrajectoryRecorder::import_trajectory(data).map_err(|e| e.to_string())?;
         Ok(recorder.export_trajectory())
     }
 
@@ -569,7 +549,9 @@ mod tests {
         let storage = StorageBridge::open_in_memory().unwrap();
         let sid = SessionId::new();
         // record_cost on non-existent session returns FK error
-        let result = storage.record_cost(&sid, "anthropic", "claude", 100, 50, 0.005).await;
+        let result = storage
+            .record_cost(&sid, "anthropic", "claude", 100, 50, 0.005)
+            .await;
         assert!(result.is_err(), "Should fail FK: no session row");
     }
 
@@ -651,7 +633,9 @@ mod tests {
         let root = dir.path();
 
         // Write
-        storage.write_page(root, "test-page", "# Test\nHello wiki").unwrap();
+        storage
+            .write_page(root, "test-page", "# Test\nHello wiki")
+            .unwrap();
         assert!(storage.page_exists(root, "test-page"));
 
         // Read

@@ -130,10 +130,14 @@ mod tests {
         let snap = snapshot();
         // The most recent matching event we just inserted should be ahead of
         // the older one in the snapshot.
-        let idx_first = snap.iter().position(|e| matches!(&e.kind,
-            ContextEventKind::MessageEvicted { reason, .. } if reason == "first"));
-        let idx_second = snap.iter().position(|e| matches!(&e.kind,
-            ContextEventKind::MessageEvicted { reason, .. } if reason == "second"));
+        let idx_first = snap.iter().position(|e| {
+            matches!(&e.kind,
+            ContextEventKind::MessageEvicted { reason, .. } if reason == "first")
+        });
+        let idx_second = snap.iter().position(|e| {
+            matches!(&e.kind,
+            ContextEventKind::MessageEvicted { reason, .. } if reason == "second")
+        });
         if let (Some(a), Some(b)) = (idx_first, idx_second) {
             assert!(b < a, "newest should appear before older in snapshot");
         }

@@ -134,10 +134,7 @@ impl RuntimeBridge {
     }
 
     /// Instantiate an E2b template, returning the instance.
-    pub fn instantiate(
-        &self,
-        template_id: &str,
-    ) -> Result<caduceus_runtime::E2bInstance, String> {
+    pub fn instantiate(&self, template_id: &str) -> Result<caduceus_runtime::E2bInstance, String> {
         self.templates
             .instantiate(template_id)
             .map_err(|e| e.to_string())
@@ -229,13 +226,15 @@ mod tests {
     fn runtime_instantiate_registered_template() {
         let dir = tempfile::tempdir().unwrap();
         let mut bridge = RuntimeBridge::new(dir.path());
-        bridge.templates.register_template(caduceus_runtime::E2bTemplate {
-            id: "tpl-1".into(),
-            name: "python-sandbox".into(),
-            dockerfile: None,
-            start_command: None,
-            env_vars: HashMap::new(),
-        });
+        bridge
+            .templates
+            .register_template(caduceus_runtime::E2bTemplate {
+                id: "tpl-1".into(),
+                name: "python-sandbox".into(),
+                dockerfile: None,
+                start_command: None,
+                env_vars: HashMap::new(),
+            });
         let instance = bridge.instantiate("tpl-1").unwrap();
         assert_eq!(instance.template_id, "tpl-1");
         assert_eq!(instance.status, "running");

@@ -26,8 +26,8 @@
 //! every API.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MAX_EVENTS: usize = 256;
@@ -441,10 +441,7 @@ impl Dag {
             ra.cmp(rb)
                 .then_with(|| (a.access as u8).cmp(&(b.access as u8)))
                 .then_with(|| match (&a.from, &b.from) {
-                    (
-                        DagNode::Agent { id: ai, .. },
-                        DagNode::Agent { id: bi, .. },
-                    ) => ai.cmp(bi),
+                    (DagNode::Agent { id: ai, .. }, DagNode::Agent { id: bi, .. }) => ai.cmp(bi),
                     _ => std::cmp::Ordering::Equal,
                 })
         });
@@ -516,7 +513,12 @@ mod tests {
     fn single_access_appears_in_dag() {
         let _g = test_lock();
         clear();
-        record("u1", AgentKind::User, IndexResource::SemanticIndex, AccessKind::Read);
+        record(
+            "u1",
+            AgentKind::User,
+            IndexResource::SemanticIndex,
+            AccessKind::Read,
+        );
         let dag = Dag::from_snapshot(&snapshot());
         assert_eq!(dag.edges.len(), 1);
         assert_eq!(dag.edges[0].count, 1);
@@ -528,7 +530,12 @@ mod tests {
         let _g = test_lock();
         clear();
         for _ in 0..3 {
-            record("u1", AgentKind::User, IndexResource::SemanticIndex, AccessKind::Read);
+            record(
+                "u1",
+                AgentKind::User,
+                IndexResource::SemanticIndex,
+                AccessKind::Read,
+            );
         }
         let dag = Dag::from_snapshot(&snapshot());
         assert_eq!(dag.edges.len(), 1);
@@ -539,8 +546,18 @@ mod tests {
     fn read_and_write_are_distinct_edges() {
         let _g = test_lock();
         clear();
-        record("u1", AgentKind::User, IndexResource::CodeGraph, AccessKind::Read);
-        record("u1", AgentKind::User, IndexResource::CodeGraph, AccessKind::Write);
+        record(
+            "u1",
+            AgentKind::User,
+            IndexResource::CodeGraph,
+            AccessKind::Read,
+        );
+        record(
+            "u1",
+            AgentKind::User,
+            IndexResource::CodeGraph,
+            AccessKind::Write,
+        );
         let dag = Dag::from_snapshot(&snapshot());
         assert_eq!(dag.edges.len(), 2);
     }
@@ -551,8 +568,18 @@ mod tests {
         // the same resource is a real race risk.
         let _g = test_lock();
         clear();
-        record("u1", AgentKind::User, IndexResource::SemanticIndex, AccessKind::Write);
-        record("bg-1", AgentKind::Subagent, IndexResource::SemanticIndex, AccessKind::Read);
+        record(
+            "u1",
+            AgentKind::User,
+            IndexResource::SemanticIndex,
+            AccessKind::Write,
+        );
+        record(
+            "bg-1",
+            AgentKind::Subagent,
+            IndexResource::SemanticIndex,
+            AccessKind::Read,
+        );
         let dag = Dag::from_snapshot(&snapshot());
         let contention = dag.contention_points();
         assert_eq!(contention.len(), 1);
@@ -566,8 +593,18 @@ mod tests {
         // the warning chip.
         let _g = test_lock();
         clear();
-        record("u1", AgentKind::User, IndexResource::SemanticIndex, AccessKind::Read);
-        record("bg-1", AgentKind::Subagent, IndexResource::SemanticIndex, AccessKind::Read);
+        record(
+            "u1",
+            AgentKind::User,
+            IndexResource::SemanticIndex,
+            AccessKind::Read,
+        );
+        record(
+            "bg-1",
+            AgentKind::Subagent,
+            IndexResource::SemanticIndex,
+            AccessKind::Read,
+        );
         let dag = Dag::from_snapshot(&snapshot());
         assert!(
             dag.contention_points().is_empty(),
@@ -581,8 +618,18 @@ mod tests {
         // canonical race condition.
         let _g = test_lock();
         clear();
-        record("u1", AgentKind::User, IndexResource::SemanticIndex, AccessKind::Write);
-        record("bg-1", AgentKind::Subagent, IndexResource::SemanticIndex, AccessKind::Write);
+        record(
+            "u1",
+            AgentKind::User,
+            IndexResource::SemanticIndex,
+            AccessKind::Write,
+        );
+        record(
+            "bg-1",
+            AgentKind::Subagent,
+            IndexResource::SemanticIndex,
+            AccessKind::Write,
+        );
         let dag = Dag::from_snapshot(&snapshot());
         assert_eq!(dag.contention_points().len(), 1);
     }
@@ -591,8 +638,18 @@ mod tests {
     fn single_agent_no_contention_warning() {
         let _g = test_lock();
         clear();
-        record("u1", AgentKind::User, IndexResource::SemanticIndex, AccessKind::Read);
-        record("u1", AgentKind::User, IndexResource::CodeGraph, AccessKind::Write);
+        record(
+            "u1",
+            AgentKind::User,
+            IndexResource::SemanticIndex,
+            AccessKind::Read,
+        );
+        record(
+            "u1",
+            AgentKind::User,
+            IndexResource::CodeGraph,
+            AccessKind::Write,
+        );
         let dag = Dag::from_snapshot(&snapshot());
         assert!(dag.contention_points().is_empty());
         let ascii = dag.to_ascii();
@@ -618,9 +675,24 @@ mod tests {
     fn ascii_renders_three_agents_one_resource_with_contention() {
         let _g = test_lock();
         clear();
-        record("u1", AgentKind::User, IndexResource::SemanticIndex, AccessKind::Read);
-        record("bg-1", AgentKind::Subagent, IndexResource::SemanticIndex, AccessKind::Read);
-        record("bg-2", AgentKind::Subagent, IndexResource::SemanticIndex, AccessKind::Write);
+        record(
+            "u1",
+            AgentKind::User,
+            IndexResource::SemanticIndex,
+            AccessKind::Read,
+        );
+        record(
+            "bg-1",
+            AgentKind::Subagent,
+            IndexResource::SemanticIndex,
+            AccessKind::Read,
+        );
+        record(
+            "bg-2",
+            AgentKind::Subagent,
+            IndexResource::SemanticIndex,
+            AccessKind::Write,
+        );
         let ascii = render_current_ascii();
         assert!(ascii.contains("user:u1"));
         assert!(ascii.contains("subagent:bg-1"));
@@ -648,10 +720,23 @@ mod tests {
         let _g = test_lock();
         clear();
         let v0 = version();
-        record("u1", AgentKind::User, IndexResource::SemanticIndex, AccessKind::Read);
+        record(
+            "u1",
+            AgentKind::User,
+            IndexResource::SemanticIndex,
+            AccessKind::Read,
+        );
         let v1 = version();
-        assert!(v1 > v0, "version should advance after record() (was {v0}, now {v1})");
-        record("u2", AgentKind::Tool, IndexResource::CodeGraph, AccessKind::Write);
+        assert!(
+            v1 > v0,
+            "version should advance after record() (was {v0}, now {v1})"
+        );
+        record(
+            "u2",
+            AgentKind::Tool,
+            IndexResource::CodeGraph,
+            AccessKind::Write,
+        );
         let v2 = version();
         assert!(v2 > v1, "second record should also advance version");
     }

@@ -276,8 +276,7 @@ mod tests {
 
     #[test]
     fn marketplace_suggest_name() {
-        let name =
-            MarketplaceBridge::suggest_skill_name(&["Code Review Helper".into()]);
+        let name = MarketplaceBridge::suggest_skill_name(&["Code Review Helper".into()]);
         assert_eq!(name, "code-review-helper");
     }
 
@@ -396,7 +395,9 @@ mod tests {
         });
         let resolved = bridge.resolve_conflicts("local");
         assert!(
-            resolved.iter().any(|a| matches!(a, SyncAction::Push(n) if n == "shared")),
+            resolved
+                .iter()
+                .any(|a| matches!(a, SyncAction::Push(n) if n == "shared")),
             "Local preference should produce Push"
         );
     }

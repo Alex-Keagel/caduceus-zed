@@ -12,24 +12,24 @@
 //! - Memory persistence via filesystem
 //! - Session management via `SqliteStorage`
 
-pub mod engine;
-pub mod tools;
-pub mod search;
-pub mod git;
-pub mod security;
-pub mod memory;
-pub mod storage;
-pub mod telemetry;
+pub mod context_events;
 pub mod crdt;
-pub mod orchestrator;
+pub mod dag_state;
+pub mod engine;
+pub mod git;
+pub mod index_dag;
 pub mod marketplace;
+pub mod memory;
+pub mod orchestrator;
 pub mod providers;
 pub mod runtime;
 pub mod safety;
+pub mod search;
+pub mod security;
+pub mod storage;
+pub mod telemetry;
+pub mod tools;
 pub mod tree_sitter;
-pub mod context_events;
-pub mod index_dag;
-pub mod dag_state;
 
 pub use engine::CaduceusEngine;
 
@@ -37,6 +37,6 @@ pub use engine::CaduceusEngine;
 // clients feed AgentEvents in and call `active_*` projections to render.
 pub use dag_state::{
     ActiveFanoutV1, AgentEdgeV1, AgentNodeV1, AgentsDagV1, AwaitingApprovalV1, FeatureStepStatus,
-    FeatureStepV1, FeaturesDagV1, PendingScopeExpansionV1, ProvenanceEdgeV1, SessionSnapshotV1,
-    SessionStateReducer,
+    FeatureStepV1, FeaturesDagV1, PendingScopeExpansionV1, ProvenanceEdgeV1, ReducerHandle,
+    SessionSnapshotV1, SessionStateReducer,
 };

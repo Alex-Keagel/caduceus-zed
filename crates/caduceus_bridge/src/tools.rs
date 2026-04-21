@@ -2,17 +2,15 @@
 //! plus bridge wrappers for dependency scanning, LSP detection, snippet
 //! finding, scaffold templates, notebook parsing, and test running.
 
+pub use caduceus_core::{ToolResult, ToolSpec};
 pub use caduceus_tools::Tool;
 pub use caduceus_tools::ToolRegistry;
-pub use caduceus_core::{ToolResult, ToolSpec};
 
 // Re-export tool subsystem types for consumers.
 pub use caduceus_tools::{
-    DepScanner, LockFileType, DepVulnerability,
-    LspBridgeTool, LineNumberFinder, SnippetLocation,
-    ScaffoldRegistry, ScaffoldType,
-    NotebookCellTool, NotebookCell, CellType,
-    SelfVerifier, VerificationResult,
+    CellType, DepScanner, DepVulnerability, LineNumberFinder, LockFileType, LspBridgeTool,
+    NotebookCell, NotebookCellTool, ScaffoldRegistry, ScaffoldType, SelfVerifier, SnippetLocation,
+    VerificationResult,
 };
 
 use std::path::PathBuf;
@@ -133,7 +131,10 @@ mod tests {
 
     #[test]
     fn tools_detect_lsp_server_rust() {
-        assert_eq!(ToolsBridge::detect_lsp_server("rust"), Some("rust-analyzer"));
+        assert_eq!(
+            ToolsBridge::detect_lsp_server("rust"),
+            Some("rust-analyzer")
+        );
     }
 
     #[test]

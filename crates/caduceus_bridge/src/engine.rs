@@ -5,7 +5,7 @@
 
 use caduceus_core::{ToolResult, ToolSpec};
 use caduceus_omniscience::{
-    AstOverlay, CodePropertyGraph, CodeHashEmbedder, EmbeddingBackend, EmbeddingModelConfig,
+    AstOverlay, CodeHashEmbedder, CodePropertyGraph, EmbeddingBackend, EmbeddingModelConfig,
     EmbeddingSelector, FederatedIndex, OpenAiEmbedder, ParseErrorDownRanker, ProjectIndex,
     ScoredChunk, SemanticIndex, VectorSpaceMap,
 };
@@ -56,8 +56,7 @@ impl CaduceusEngine {
         let root = project_root.into();
         let tools = Self::build_tool_registry(&root);
         let embedder: Box<dyn EmbeddingBackend> = if let Ok(api_key) =
-            std::env::var("CADUCEUS_EMBEDDING_API_KEY")
-                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            std::env::var("CADUCEUS_EMBEDDING_API_KEY").or_else(|_| std::env::var("OPENAI_API_KEY"))
         {
             log::info!("[caduceus] Using OpenAI embeddings");
             Box::new(OpenAiEmbedder::new(api_key))
@@ -71,25 +70,32 @@ impl CaduceusEngine {
                         Box::new(backend) as Box<dyn EmbeddingBackend>
                     }
                     Err(e) => {
-                        log::warn!("[caduceus] FastEmbed failed: {e} — falling back to code-hash embedder");
+                        log::warn!(
+                            "[caduceus] FastEmbed failed: {e} — falling back to code-hash embedder"
+                        );
                         Box::new(CodeHashEmbedder::new(384))
                     }
                 }
             }
             #[cfg(not(feature = "local-embeddings"))]
             {
-                log::info!("[caduceus] Using code-hash local embeddings (set CADUCEUS_EMBEDDING_API_KEY for OpenAI)");
+                log::info!(
+                    "[caduceus] Using code-hash local embeddings (set CADUCEUS_EMBEDDING_API_KEY for OpenAI)"
+                );
                 Box::new(CodeHashEmbedder::new(384))
             }
         };
-        let index = SemanticIndex::new(embedder)
-            .with_chunker(crate::tree_sitter::TreeSitterChunker::new());
+        let index =
+            SemanticIndex::new(embedder).with_chunker(crate::tree_sitter::TreeSitterChunker::new());
 
         // Try loading persisted index
         let index_path = root.join(".caduceus").join("index.json");
         if let Ok(count) = index.load_from_file(&index_path) {
             if count > 0 {
-                log::info!("[caduceus] Loaded {} cached embeddings from index.json", count);
+                log::info!(
+                    "[caduceus] Loaded {} cached embeddings from index.json",
+                    count
+                );
             }
         }
 
@@ -197,7 +203,10 @@ impl CaduceusEngine {
         name: &str,
         input: serde_json::Value,
     ) -> Result<ToolResult, String> {
-        self.tools.execute(name, input).await.map_err(|e| e.to_string())
+        self.tools
+            .execute(name, input)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Get all tool specifications.
@@ -217,8 +226,12 @@ impl CaduceusEngine {
         // Default to a generic id when the caller hasn't identified itself.
         // Prefer `index_directory_as(...)` from per-agent code paths so the
         // DAG can attribute concurrent activity to the actual subagent.
-        self.index_directory_as("engine:index_directory", crate::index_dag::AgentKind::Tool, path)
-            .await
+        self.index_directory_as(
+            "engine:index_directory",
+            crate::index_dag::AgentKind::Tool,
+            path,
+        )
+        .await
     }
 
     /// Caller-attributed variant of `index_directory`. Use this when the
@@ -332,21 +345,13 @@ impl CaduceusEngine {
 
     /// Acquire a poison-tolerant read guard on `code_graph`.
     /// See field doc on `code_graph` (audit #17): a panicked writer is recoverable.
-    fn code_graph_read(
-        &self,
-    ) -> std::sync::RwLockReadGuard<'_, CodePropertyGraph> {
-        self.code_graph
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
+    fn code_graph_read(&self) -> std::sync::RwLockReadGuard<'_, CodePropertyGraph> {
+        self.code_graph.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Acquire a poison-tolerant write guard on `code_graph`. See `code_graph_read`.
-    fn code_graph_write(
-        &self,
-    ) -> std::sync::RwLockWriteGuard<'_, CodePropertyGraph> {
-        self.code_graph
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
+    fn code_graph_write(&self) -> std::sync::RwLockWriteGuard<'_, CodePropertyGraph> {
+        self.code_graph.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Find code that depends on a symbol.
@@ -485,7 +490,12 @@ impl CaduceusEngine {
         self.secret_scanner
             .scan(text)
             .iter()
-            .map(|f| format!("[{}] at position {}-{}: {}", f.kind, f.start, f.end, f.redacted_preview))
+            .map(|f| {
+                format!(
+                    "[{}] at position {}-{}: {}",
+                    f.kind, f.start, f.end, f.redacted_preview
+                )
+            })
             .collect()
     }
 
@@ -536,7 +546,12 @@ impl CaduceusEngine {
         checker
             .check_all()
             .iter()
-            .map(|c| format!("[{}] {} ({:?}): {}", c.id, c.name, c.severity, c.description))
+            .map(|c| {
+                format!(
+                    "[{}] {} ({:?}): {}",
+                    c.id, c.name, c.severity, c.description
+                )
+            })
             .collect()
     }
 
@@ -690,12 +705,8 @@ impl CaduceusEngine {
 
     /// Create a new worktree.
     pub fn git_create_worktree(&self, branch: &str, path: &str) -> Result<(), String> {
-        caduceus_git::WorktreeManager::create_worktree(
-            &self.project_root,
-            branch,
-            Path::new(path),
-        )
-        .map_err(|e| e.to_string())
+        caduceus_git::WorktreeManager::create_worktree(&self.project_root, branch, Path::new(path))
+            .map_err(|e| e.to_string())
     }
 
     /// Remove a worktree.
@@ -863,10 +874,7 @@ impl CaduceusEngine {
     // ── Error Recovery ────────────────────────────────────────────────────
 
     /// Suggest alternative approaches based on an error analysis.
-    pub fn suggest_alternatives(
-        &self,
-        error_log: &str,
-    ) -> Vec<crate::search::AlternativeInfo> {
+    pub fn suggest_alternatives(&self, error_log: &str) -> Vec<crate::search::AlternativeInfo> {
         let analysis = caduceus_omniscience::BranchReflector::analyze_error(error_log);
         caduceus_omniscience::BranchReflector::suggest_alternatives(&analysis)
             .iter()
@@ -948,11 +956,7 @@ impl CaduceusEngine {
     // ── MCP Security ──────────────────────────────────────────────────────
 
     /// Check an MCP tool name for typosquatting.
-    pub fn mcp_check_typosquatting(
-        &self,
-        name: &str,
-        known: &[&str],
-    ) -> Option<String> {
+    pub fn mcp_check_typosquatting(&self, name: &str, known: &[&str]) -> Option<String> {
         let checker = caduceus_mcp::McpSecurityScanner::new();
         checker.check_typosquatting(name, known)
     }
@@ -966,10 +970,7 @@ impl CaduceusEngine {
     // ── MCP Tool Scanning ────────────────────────────────────────────────
 
     /// Security-scan a single MCP tool definition.
-    pub fn mcp_scan_tool_definition(
-        &self,
-        tool: &serde_json::Value,
-    ) -> Vec<McpSecurityFinding> {
+    pub fn mcp_scan_tool_definition(&self, tool: &serde_json::Value) -> Vec<McpSecurityFinding> {
         let scanner = caduceus_mcp::McpSecurityScanner::new();
         scanner
             .scan_tool_definition(tool)
@@ -984,10 +985,7 @@ impl CaduceusEngine {
     }
 
     /// Security-scan all MCP tool definitions.
-    pub fn mcp_scan_all_tools(
-        &self,
-        tools: &[serde_json::Value],
-    ) -> McpSecurityReport {
+    pub fn mcp_scan_all_tools(&self, tools: &[serde_json::Value]) -> McpSecurityReport {
         let scanner = caduceus_mcp::McpSecurityScanner::new();
         let report = scanner.scan_all_tools(tools);
         McpSecurityReport {
@@ -1008,10 +1006,7 @@ impl CaduceusEngine {
     }
 
     /// Build Azure MCP tool definitions for the requested services.
-    pub fn mcp_build_tool_definitions(
-        &self,
-        services: &[String],
-    ) -> Vec<serde_json::Value> {
+    pub fn mcp_build_tool_definitions(&self, services: &[String]) -> Vec<serde_json::Value> {
         caduceus_mcp::AzureMcpTools::build_tool_definitions(services)
     }
 
@@ -1057,7 +1052,11 @@ mod tests {
     #[test]
     fn engine_creates_with_tools() {
         let engine = CaduceusEngine::new(".");
-        assert!(engine.tool_count() >= 38, "Expected 38+ tools, got {}", engine.tool_count());
+        assert!(
+            engine.tool_count() >= 38,
+            "Expected 38+ tools, got {}",
+            engine.tool_count()
+        );
     }
 
     #[test]
@@ -1065,7 +1064,11 @@ mod tests {
         let engine = CaduceusEngine::new(".");
         for spec in engine.tool_specs() {
             assert!(!spec.name.is_empty(), "Tool has empty name");
-            assert!(!spec.description.is_empty(), "Tool {} has empty description", spec.name);
+            assert!(
+                !spec.description.is_empty(),
+                "Tool {} has empty description",
+                spec.name
+            );
         }
     }
 
@@ -1574,11 +1577,7 @@ mod tests {
     #[tokio::test]
     async fn engine_index_directory_three_phase_no_deadlock() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("a.rs"),
-            "fn alpha() {}\nfn beta() {}\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
         let engine = CaduceusEngine::new(tmp.path().to_str().unwrap());
         let count = engine.index_directory(tmp.path()).await.expect("index");
         // Even if the dummy embedder is in use, indexing must report a
@@ -1596,13 +1595,14 @@ mod tests {
         std::fs::write(tmp.path().join("a.rs"), "fn alpha() {}\n").unwrap();
         let engine = std::sync::Arc::new(CaduceusEngine::new(tmp.path().to_str().unwrap()));
         // Prime the index so search has something to query.
-        engine.index_directory(tmp.path()).await.expect("prime index");
+        engine
+            .index_directory(tmp.path())
+            .await
+            .expect("prime index");
 
         let e1 = engine.clone();
         let p1 = tmp.path().to_path_buf();
-        let indexer = tokio::spawn(async move {
-            e1.index_directory(&p1).await
-        });
+        let indexer = tokio::spawn(async move { e1.index_directory(&p1).await });
 
         let e2 = engine.clone();
         let searcher = tokio::spawn(async move {
@@ -1613,10 +1613,9 @@ mod tests {
 
         // Bound the wait so a starvation regression fails as a timeout
         // rather than hanging the test runner.
-        let (idx, srch) = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            async { tokio::join!(indexer, searcher) },
-        )
+        let (idx, srch) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::join!(indexer, searcher)
+        })
         .await
         .expect("indexer + searcher must both finish — starvation regression?");
         idx.unwrap().expect("indexer task");
@@ -1712,7 +1711,10 @@ mod tests {
             .map(|h| h.unwrap())
             .filter(|r| r.is_ok())
             .count();
-        assert!(ok >= 1, "at least one reindex must succeed under contention");
+        assert!(
+            ok >= 1,
+            "at least one reindex must succeed under contention"
+        );
     }
 
     /// Bug #5/#6/#7 hard regression: with the old
@@ -1736,10 +1738,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl EmbeddingBackend for SlowEmbedder {
-            async fn embed(
-                &self,
-                texts: Vec<String>,
-            ) -> caduceus_core::Result<Vec<Vec<f32>>> {
+            async fn embed(&self, texts: Vec<String>) -> caduceus_core::Result<Vec<Vec<f32>>> {
                 // Sleep proportional to batch size so the indexer is the
                 // dominant time-consumer; search should still race past it.
                 tokio::time::sleep(self.per_text_delay * texts.len() as u32).await;
@@ -1750,8 +1749,7 @@ mod tests {
                         for (i, b) in t.bytes().enumerate() {
                             v[i % self.dims] += b as f32;
                         }
-                        let n: f32 =
-                            v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+                        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
                         v.iter_mut().for_each(|x| *x /= n);
                         v
                     })
@@ -1790,9 +1788,7 @@ mod tests {
         let started = Instant::now();
         let i1 = index.clone();
         let p1 = tmp.path().to_path_buf();
-        let indexer = tokio::spawn(async move {
-            i1.index_directory_incremental(&p1).await
-        });
+        let indexer = tokio::spawn(async move { i1.index_directory_incremental(&p1).await });
 
         // Give the indexer a head start so it's definitely mid-await when
         // the searcher launches.
@@ -1867,10 +1863,9 @@ mod tests {
             }
         });
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            async { tokio::join!(churner, searcher) },
-        )
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(churner, searcher)
+        })
         .await
         .expect("churn + zero-top-k searches must finish");
     }
