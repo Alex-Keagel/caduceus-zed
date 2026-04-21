@@ -89,31 +89,22 @@ impl AgentTool for CaduceusModeRequestTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input
-                .recv()
-                .await
-                .map_err(|e| CaduceusModeRequestToolOutput::Error {
+            let input = input.recv().await.map_err(|e| {
+                CaduceusModeRequestToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                })?;
+                }
+            })?;
 
-            // P9: mode catalog is dynamic — source from the bridge so new
-            // engine-side modes appear without a tool recompile. Legacy
-            // names (architect/debug/review) still normalize via
-            // `AgentMode::from_str_loose` on the engine side.
-            let canonical_modes: Vec<String> = caduceus_bridge::orchestrator::list_modes()
-                .into_iter()
-                .map(|m| m.name)
-                .collect();
-            let legacy_aliases = ["architect", "debug", "review", "auto"];
-            let is_known = canonical_modes.iter().any(|m| m == &input.mode)
-                || legacy_aliases.contains(&input.mode.as_str());
+            let valid_modes = [
+                "plan", "act", "research", "autopilot", "architect", "debug", "review",
+            ];
 
-            if !is_known {
+            if !valid_modes.contains(&input.mode.as_str()) {
                 return Err(CaduceusModeRequestToolOutput::Error {
                     error: format!(
                         "Invalid mode '{}'. Valid modes: {}",
                         input.mode,
-                        canonical_modes.join(", ")
+                        valid_modes.join(", ")
                     ),
                 });
             }
@@ -127,16 +118,12 @@ impl AgentTool for CaduceusModeRequestTool {
                 input.reason
             );
 
-            // P9: honest wording — the tool records the user's intent to
-            // switch. The change is NOT automatic; the user applies it from
-            // the profile dropdown. Do NOT imply the mode is now active.
             Ok(CaduceusModeRequestToolOutput::Success {
                 message: format!(
-                    "Mode change to '{}' requested. The change is NOT active yet — \
-                    the user must apply it via the profile dropdown. Until then, \
-                    continue to respect the CURRENT permission envelope. Do NOT retry \
-                    the blocked tool call on the assumption that the mode has switched.",
-                    input.mode
+                    "📋 Mode change to **{}** has been noted. \
+                    To apply it, select '{}' from the profile dropdown in the input bar. \
+                    The mode change is not automatic — the user controls the active profile.",
+                    input.mode, input.mode
                 ),
             })
         })

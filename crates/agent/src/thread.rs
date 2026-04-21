@@ -1,20 +1,20 @@
 use crate::{
-    CaduceusApiRegistryTool, CaduceusArchitectTool, CaduceusAutomationsTool,
-    CaduceusBackgroundAgentTool, CaduceusCheckpointTool, CaduceusCodeGraphTool,
-    CaduceusConversationTool, CaduceusCrossGitTool, CaduceusCrossSearchTool,
-    CaduceusDependencyScanTool, CaduceusErrorAnalysisTool, CaduceusGitReadTool,
-    CaduceusGitWriteTool, CaduceusIndexTool, CaduceusKanbanTool, CaduceusKillSwitchTool,
-    CaduceusMarketplaceTool, CaduceusMcpSecurityTool, CaduceusMemoryReadTool,
-    CaduceusMemoryWriteTool, CaduceusModeRequestTool, CaduceusPolicyTool, CaduceusPrdTool,
-    CaduceusProductTool, CaduceusProgressTool, CaduceusProjectTool, CaduceusProjectWikiTool,
-    CaduceusScaffoldTool, CaduceusSecurityScanTool, CaduceusSemanticSearchTool,
-    CaduceusStorageTool, CaduceusTaskDecomposeTool, CaduceusTaskTreeTool, CaduceusTelemetryTool,
-    CaduceusTimeTrackingTool, CaduceusTreeSitterTool, CaduceusWikiTool, ContextServerRegistry,
-    CopyPathTool, CreateDirectoryTool, DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool,
-    EditFileTool, FetchTool, FindPathTool, GrepTool, ListDirectoryTool, MovePathTool, NowTool,
-    OpenTool, ProjectSnapshot, ReadFileTool, RestoreFileFromDiskTool, SaveFileTool, SpawnAgentTool,
-    StreamingEditFileTool, SystemPromptTemplate, Template, Templates, TerminalTool,
-    ToolPermissionDecision, UpdatePlanTool, WebSearchTool, decide_permission_from_settings,
+    CaduceusApiRegistryTool, CaduceusArchitectTool,
+    CaduceusAutomationsTool, CaduceusBackgroundAgentTool, CaduceusCheckpointTool, CaduceusCodeGraphTool, CaduceusConversationTool, CaduceusCrossGitTool, CaduceusCrossSearchTool, CaduceusDependencyScanTool,
+    CaduceusErrorAnalysisTool, CaduceusGitReadTool, CaduceusGitWriteTool,
+    CaduceusIndexTool, CaduceusKanbanTool, CaduceusKillSwitchTool, CaduceusMarketplaceTool, CaduceusMcpSecurityTool,
+    CaduceusMemoryReadTool, CaduceusMemoryWriteTool, CaduceusModeRequestTool,
+    CaduceusPolicyTool, CaduceusPrdTool, CaduceusProductTool, CaduceusProjectTool, CaduceusProjectWikiTool,
+    CaduceusProgressTool, CaduceusScaffoldTool, CaduceusSecurityScanTool,
+    CaduceusSemanticSearchTool, CaduceusStorageTool, CaduceusTaskTreeTool, CaduceusTaskDecomposeTool,
+    CaduceusTelemetryTool, CaduceusTimeTrackingTool, CaduceusTreeSitterTool, CaduceusWikiTool,
+    ContextServerRegistry, CopyPathTool,
+    CreateDirectoryTool, DbLanguageModel, DbThread, DeletePathTool,
+    DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, GrepTool,
+    ListDirectoryTool, MovePathTool, NowTool, OpenTool, ProjectSnapshot, ReadFileTool,
+    RestoreFileFromDiskTool, SaveFileTool, SpawnAgentTool, StreamingEditFileTool,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision,
+    UpdatePlanTool, WebSearchTool, decide_permission_from_settings,
 };
 use acp_thread::{MentionUri, UserMessageId};
 use action_log::ActionLog;
@@ -762,7 +762,8 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Res
     Ok(())
 }
 
-static ATOMIC_WRITE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ATOMIC_WRITE_NONCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct NewTerminal {
@@ -1240,9 +1241,7 @@ impl Thread {
             guardrail_alert: None,
             context_compacted_this_turn: false,
             context_pins: caduceus_bridge::orchestrator::ContextManager::new(128000),
-            task_dag: std::sync::Arc::new(std::sync::Mutex::new(
-                caduceus_bridge::orchestrator::TaskDAG::new(),
-            )),
+            task_dag: std::sync::Arc::new(std::sync::Mutex::new(caduceus_bridge::orchestrator::TaskDAG::new())),
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
@@ -1491,9 +1490,7 @@ impl Thread {
             guardrail_alert: None,
             context_compacted_this_turn: false,
             context_pins: caduceus_bridge::orchestrator::ContextManager::new(128000),
-            task_dag: std::sync::Arc::new(std::sync::Mutex::new(
-                caduceus_bridge::orchestrator::TaskDAG::new(),
-            )),
+            task_dag: std::sync::Arc::new(std::sync::Mutex::new(caduceus_bridge::orchestrator::TaskDAG::new())),
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
@@ -1612,15 +1609,8 @@ impl Thread {
     pub fn context_zone_and_pct(&self) -> (caduceus_bridge::orchestrator::ContextZone, f64) {
         let total = self.estimate_total_tokens();
         let max = self.model_max_tokens();
-        let pct = if max == 0 {
-            0.0
-        } else {
-            ((total as f64 / max as f64) * 100.0).min(100.0)
-        };
-        (
-            caduceus_bridge::orchestrator::ContextZone::from_percentage(pct),
-            pct,
-        )
+        let pct = if max == 0 { 0.0 } else { ((total as f64 / max as f64) * 100.0).min(100.0) };
+        (caduceus_bridge::orchestrator::ContextZone::from_percentage(pct), pct)
     }
 
     /// Current context zone (Green/Yellow/Orange/Red/Critical)
@@ -1678,86 +1668,69 @@ impl Thread {
     fn is_tool_allowed_in_current_mode(&self, tool_name: &str) -> bool {
         let mode = self.caduceus_mode_from_profile();
 
-        // Always allowed in any mode — the escalation tool itself and
-        // sub-agent spawning. `caduceus_mode_request` remains an "always
-        // allowed" tool because if the LLM can't REQUEST a change, it can't
-        // escalate at all; but P9 rewrote its body so it no longer pretends
-        // the mode is automatically applied.
-        let always_allowed = ["caduceus_mode_request", "spawn_agent"];
+        // Always allowed in any mode
+        let always_allowed = [
+            "caduceus_mode_request",
+            "spawn_agent",
+        ];
         if always_allowed.contains(&tool_name) {
             return true;
         }
 
-        // P9: delegate the "does this mode permit writes?" question to the
-        // engine via the bridge instead of maintaining a parallel hardcoded
-        // catalog here. This fixes RC12 (the ring and the engine's envelope
-        // disagreeing on e.g. `web_fetch`). For the fine-grained
-        // per-folder / per-extension decision, the engine's envelope
-        // preflight is authoritative — see `PermissionEnvelope::preflight`.
-        //
-        // The small reverse-allowlist below only exists so the IDE has
-        // something sensible to do for tools whose write-ness we can't
-        // infer from name alone. When the envelope is wired end-to-end
-        // (the stretch goal of P9), this whole function collapses to a
-        // single `envelope.preflight(tool, path)` call.
-        if caduceus_bridge::orchestrator::mode_allows_writes(mode) {
-            return true;
-        }
+        // Use engine's AgentMode for read-only classification
+        let is_read_only = caduceus_bridge::orchestrator::BridgeAgentMode::from_str_loose(mode)
+            .map(|m| matches!(m,
+                caduceus_bridge::orchestrator::BridgeAgentMode::Plan
+                | caduceus_bridge::orchestrator::BridgeAgentMode::Research
+                | caduceus_bridge::orchestrator::BridgeAgentMode::Architect
+                | caduceus_bridge::orchestrator::BridgeAgentMode::Review
+            ))
+            .unwrap_or(false);
 
-        // Read-only mode: allow tools whose name structurally implies read
-        // or analysis. Anything else is conservatively denied; the user
-        // can grant scope expansion through the normal request flow.
-        const READ_ONLY_PREFIX_OR_NAME: &[&str] = &[
-            "read_file",
-            "find_path",
-            "grep",
-            "list_directory",
-            "diagnostics",
-            "now",
-            "open",
-            "web_fetch",
-            "web_search",
-            // Caduceus read-only tools
-            "caduceus_semantic_search",
-            "caduceus_index",
-            "caduceus_code_graph",
-            "caduceus_tree_sitter",
-            "caduceus_git_read",
-            "caduceus_memory_read",
-            "caduceus_dependency_scan",
-            "caduceus_security_scan",
-            "caduceus_error_analysis",
-            "caduceus_mcp_security",
-            "caduceus_prd",
-            "caduceus_progress",
-            "caduceus_telemetry",
-            "caduceus_conversation",
-            "caduceus_marketplace",
-            "caduceus_project",
-            "caduceus_task_tree",
-            "caduceus_time_tracking",
-            "caduceus_policy",
-            "caduceus_cross_search",
-            "caduceus_api_registry",
-            "caduceus_architect",
-            "caduceus_product",
-        ];
-        let allowed = READ_ONLY_PREFIX_OR_NAME.contains(&tool_name);
-        if !allowed {
-            log::warn!(
-                "[caduceus] '{}' not in read-only allowlist for {} mode. \
-                Engine envelope will give the authoritative decision.",
-                tool_name,
-                mode
-            );
+        if is_read_only {
+            let allowed_tools = [
+                // Zed built-in read tools (local only — no network)
+                "read_file", "find_path", "grep", "list_directory",
+                "diagnostics", "now", "open",
+                // Caduceus read-only tools (strictly no state mutation)
+                "caduceus_semantic_search", "caduceus_index",
+                "caduceus_code_graph", "caduceus_tree_sitter",
+                "caduceus_git_read", "caduceus_memory_read",
+                "caduceus_dependency_scan", "caduceus_security_scan",
+                "caduceus_error_analysis", "caduceus_mcp_security",
+                "caduceus_prd", "caduceus_progress",
+                "caduceus_telemetry", "caduceus_conversation",
+                "caduceus_marketplace",
+                "caduceus_project",
+                "caduceus_task_tree", "caduceus_time_tracking",
+                "caduceus_policy",
+                "caduceus_cross_search", "caduceus_api_registry",
+                "caduceus_architect", "caduceus_product",
+                // REMOVED from read-only: caduceus_wiki (write/delete),
+                // caduceus_project_wiki (write_page/auto_populate),
+                // caduceus_kanban (git worktree mutations),
+                // caduceus_checkpoint (create/restore),
+                // caduceus_storage (save/delete),
+                // caduceus_automations (add/remove/enable/disable),
+                // caduceus_scaffold (creates files)
+            ];
+            let allowed = allowed_tools.contains(&tool_name);
+            if !allowed {
+                log::warn!(
+                    "[caduceus] BLOCKED '{}' in {} mode. \
+                    Use caduceus_mode_request to escalate.",
+                    tool_name, mode
+                );
+            }
+            allowed
+        } else {
+            true // Ring 1+ allows everything
         }
-        allowed
     }
 
     /// Caduceus: unified max-token fallback for context budgeting.
     fn model_max_tokens(&self) -> u32 {
-        self.model
-            .as_ref()
+        self.model.as_ref()
             .map(|m| m.max_token_count() as u32)
             .unwrap_or(64_000)
     }
@@ -1770,26 +1743,14 @@ impl Thread {
         if let Some(cached) = self.cached_token_estimate.get() {
             return cached;
         }
-        let total: u32 = self
-            .messages
-            .iter()
-            .map(|m| match m {
-                Message::User(u) => u
-                    .content
-                    .iter()
-                    .map(|c| match c {
-                        UserMessageContent::Text(t) => {
-                            caduceus_bridge::orchestrator::count_tokens_exact(t)
-                        }
-                        _ => 10,
-                    })
-                    .sum::<u32>(),
-                Message::Agent(a) => {
-                    caduceus_bridge::orchestrator::count_tokens_exact(&a.to_markdown())
-                }
-                Message::Resume => 0,
-            })
-            .sum();
+        let total: u32 = self.messages.iter().map(|m| match m {
+            Message::User(u) => u.content.iter().map(|c| match c {
+                UserMessageContent::Text(t) => caduceus_bridge::orchestrator::count_tokens_exact(t),
+                _ => 10,
+            }).sum::<u32>(),
+            Message::Agent(a) => caduceus_bridge::orchestrator::count_tokens_exact(&a.to_markdown()),
+            Message::Resume => 0,
+        }).sum();
         self.cached_token_estimate.set(Some(total));
         total
     }
@@ -1823,9 +1784,7 @@ impl Thread {
         use caduceus_bridge::orchestrator::ContextZone;
         let total = self.estimate_total_tokens();
         let max = self.model_max_tokens();
-        if max == 0 {
-            return ContextZone::Green;
-        }
+        if max == 0 { return ContextZone::Green; }
         ContextZone::from_percentage((total as f64 / max as f64) * 100.0)
     }
 
@@ -1861,10 +1820,8 @@ impl Thread {
         zone: caduceus_bridge::orchestrator::ContextZone,
         cx: &mut Context<Self>,
     ) -> bool {
-        use caduceus_bridge::orchestrator::compaction::{MessageGroupKind, build_message_groups};
-        use caduceus_bridge::orchestrator::{
-            CompactMessage, CompactionPipeline, ContextZone, estimate_tokens,
-        };
+        use caduceus_bridge::orchestrator::{estimate_tokens, ContextZone, CompactMessage, CompactionPipeline};
+        use caduceus_bridge::orchestrator::compaction::{build_message_groups, MessageGroupKind};
 
         // Use compaction cooldown guard
         if !self.compaction_cooldown.can_compact() {
@@ -1873,64 +1830,28 @@ impl Thread {
 
         let total_tokens = self.estimate_total_tokens();
         let max_context = self.model_max_tokens();
-        let fill_pct = if max_context == 0 {
-            0.0
-        } else {
-            (total_tokens as f64 / max_context as f64) * 100.0
-        };
+        let fill_pct = if max_context == 0 { 0.0 } else { (total_tokens as f64 / max_context as f64) * 100.0 };
 
         let msg_count = self.messages.len();
         // Decide whether to compact based on zone + message count
         let (should_compact, keep_recent) = match zone {
             ContextZone::Green => {
-                if msg_count > 60 {
-                    (true, 20)
-                } else {
-                    (false, 0)
-                }
+                if msg_count > 60 { (true, 20) } else { (false, 0) }
             }
             ContextZone::Yellow => {
-                log::info!(
-                    "[caduceus] Context zone YELLOW ({:.0}% full, {} msgs)",
-                    fill_pct,
-                    msg_count
-                );
-                if msg_count > 30 {
-                    (true, 15)
-                } else {
-                    (false, 0)
-                }
+                log::info!("[caduceus] Context zone YELLOW ({:.0}% full, {} msgs)", fill_pct, msg_count);
+                if msg_count > 30 { (true, 15) } else { (false, 0) }
             }
             ContextZone::Orange => {
-                log::info!(
-                    "[caduceus] Context zone ORANGE ({:.0}% full, {} msgs)",
-                    fill_pct,
-                    msg_count
-                );
-                if msg_count > 15 {
-                    (true, 10)
-                } else {
-                    (false, 0)
-                }
+                log::info!("[caduceus] Context zone ORANGE ({:.0}% full, {} msgs)", fill_pct, msg_count);
+                if msg_count > 15 { (true, 10) } else { (false, 0) }
             }
             ContextZone::Red => {
-                log::warn!(
-                    "[caduceus] Context zone RED ({:.0}% full, {} msgs)",
-                    fill_pct,
-                    msg_count
-                );
-                if msg_count > 10 {
-                    (true, 8)
-                } else {
-                    (false, 0)
-                }
+                log::warn!("[caduceus] Context zone RED ({:.0}% full, {} msgs)", fill_pct, msg_count);
+                if msg_count > 10 { (true, 8) } else { (false, 0) }
             }
             ContextZone::Critical => {
-                log::error!(
-                    "[caduceus] Context zone CRITICAL ({:.0}% full, {} msgs) — EMERGENCY compact",
-                    fill_pct,
-                    msg_count
-                );
+                log::error!("[caduceus] Context zone CRITICAL ({:.0}% full, {} msgs) — EMERGENCY compact", fill_pct, msg_count);
                 if msg_count > 5 { (true, 5) } else { (false, 0) }
             }
         };
@@ -1942,10 +1863,7 @@ impl Thread {
         let messages_to_compact = self.messages.len() - keep_recent;
         log::info!(
             "[caduceus] Compacting: {} msgs, {:.0}% tokens, zone {:?} → keeping last {}",
-            self.messages.len(),
-            fill_pct,
-            zone,
-            keep_recent
+            self.messages.len(), fill_pct, zone, keep_recent
         );
 
         // Guard: zero-budget means model lookup failed — don't compact
@@ -1968,15 +1886,10 @@ impl Thread {
             .iter()
             .map(|msg| match msg {
                 Message::User(u) => {
-                    let text: String = u
-                        .content
-                        .iter()
-                        .map(|c| match c {
-                            UserMessageContent::Text(t) => t.as_str(),
-                            _ => "[context]",
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                    let text: String = u.content.iter().map(|c| match c {
+                        UserMessageContent::Text(t) => t.as_str(),
+                        _ => "[context]",
+                    }).collect::<Vec<_>>().join(" ");
                     CompactMessage::new("user", text)
                 }
                 Message::Agent(a) => {
@@ -1984,8 +1897,7 @@ impl Thread {
                     let text = a.to_markdown();
                     let is_pure_tool = text.len() > 100
                         && (text.contains("Tool Call:") || text.contains("Status: Completed"))
-                        && !text.contains("I'll")
-                        && !text.contains("Let me");
+                        && !text.contains("I'll") && !text.contains("Let me");
                     if is_pure_tool {
                         CompactMessage::new("tool", "[tool calls executed]")
                     } else {
@@ -2028,9 +1940,7 @@ impl Thread {
 
         // Guard: if summary is degenerate (all tool calls, no real content), abort
         if summary.trim().is_empty()
-            || summary
-                .lines()
-                .all(|l| l.contains("[tool calls executed]") || l.contains("[session resumed]"))
+            || summary.lines().all(|l| l.contains("[tool calls executed]") || l.contains("[session resumed]"))
         {
             log::warn!("[caduceus] Compaction produced degenerate summary — aborting");
             caduceus_bridge::context_events::record_and_count(
@@ -2045,8 +1955,7 @@ impl Thread {
 
         log::info!(
             "[caduceus] Pipeline applied {} strategies, freed {} tokens",
-            result.strategies_applied.len(),
-            result.total_removed_tokens
+            result.strategies_applied.len(), result.total_removed_tokens
         );
 
         // Save context summary to project in background
@@ -2058,8 +1967,7 @@ impl Thread {
                 .spawn(async move {
                     let context_dir = root.join(".caduceus").join("context");
                     let _ = std::fs::create_dir_all(&context_dir);
-                    let filename =
-                        format!("compact-{}.md", crate::tools::truncate_str(&session_id, 8));
+                    let filename = format!("compact-{}.md", crate::tools::truncate_str(&session_id, 8));
                     let path = context_dir.join(&filename);
                     if std::fs::write(&path, &summary_clone).is_ok() {
                         log::info!("[caduceus] Context saved to {}", path.display());
@@ -2087,15 +1995,14 @@ impl Thread {
         log::info!(
             "[caduceus] Compacted: {} messages remain, ~{} tokens freed",
             self.messages.len(),
-            total_tokens
-                .saturating_sub(caduceus_bridge::orchestrator::count_tokens_exact(&summary))
+            total_tokens.saturating_sub(caduceus_bridge::orchestrator::count_tokens_exact(&summary))
         );
 
         self.compaction_cooldown.record_compaction();
         self.context_compacted_this_turn = true;
-        let tokens_freed = total_tokens
-            .saturating_sub(caduceus_bridge::orchestrator::count_tokens_exact(&summary))
-            as usize;
+        let tokens_freed = total_tokens.saturating_sub(
+            caduceus_bridge::orchestrator::count_tokens_exact(&summary),
+        ) as usize;
         caduceus_bridge::context_events::record_and_count(
             caduceus_bridge::context_events::ContextEventKind::AutoCompacted {
                 messages_compacted: messages_to_compact,
@@ -2606,11 +2513,9 @@ impl Thread {
         // cleanup, auto-extract, etc.) will see a stale generation and exit.
         self.turn_generation = self.turn_generation.wrapping_add(1);
         // Clean stale guardrail alert from memory
-        if self
-            .guardrail_alert
-            .as_ref()
-            .is_some_and(|(_, _, ts)| ts.elapsed() >= std::time::Duration::from_secs(10))
-        {
+        if self.guardrail_alert.as_ref().is_some_and(|(_, _, ts)| {
+            ts.elapsed() >= std::time::Duration::from_secs(10)
+        }) {
             self.guardrail_alert = None;
         }
 
@@ -2626,15 +2531,9 @@ impl Thread {
         // Caduceus: check context zone and warn user
         let zone = self.current_context_zone();
         match zone {
-            caduceus_bridge::orchestrator::ContextZone::Orange => {
-                log::warn!("[caduceus] Context 70-85% full — consider /compact")
-            }
-            caduceus_bridge::orchestrator::ContextZone::Red => {
-                log::warn!("[caduceus] Context 85-95% full — auto-compacting soon")
-            }
-            caduceus_bridge::orchestrator::ContextZone::Critical => {
-                log::error!("[caduceus] Context >95% full — EMERGENCY")
-            }
+            caduceus_bridge::orchestrator::ContextZone::Orange => log::warn!("[caduceus] Context 70-85% full — consider /compact"),
+            caduceus_bridge::orchestrator::ContextZone::Red => log::warn!("[caduceus] Context 85-95% full — auto-compacting soon"),
+            caduceus_bridge::orchestrator::ContextZone::Critical => log::error!("[caduceus] Context >95% full — EMERGENCY"),
             _ => {}
         }
 
@@ -2936,12 +2835,11 @@ impl Thread {
             // loop detected, missing tool) — these are not real tool failures.
             // Counting them feeds back into the breaker: a single guardrail
             // trip would itself trip the breaker on the next turn.
-            let is_synthetic_guardrail =
-                if let LanguageModelToolResultContent::Text(t) = &tool_result.content {
-                    is_synthetic_guardrail_text(t)
-                } else {
-                    false
-                };
+            let is_synthetic_guardrail = if let LanguageModelToolResultContent::Text(t) = &tool_result.content {
+                is_synthetic_guardrail_text(t)
+            } else {
+                false
+            };
             if !is_synthetic_guardrail {
                 this.circuit_breaker.record_result(tool_result.is_error);
             }
@@ -3145,25 +3043,15 @@ impl Thread {
         // Caduceus: enforce privilege rings — block disallowed tools immediately
         if !self.is_tool_allowed_in_current_mode(tool_use.name.as_ref()) {
             let mode = self.caduceus_mode_from_profile();
-            // P9: neutral denial — no fake mode-switch instruction, no
-            // "DO NOT retry" sermon. The LLM gets a plain statement of
-            // fact plus a pointer at the scope-expansion channel. The
-            // footgun text that told the LLM to call `caduceus_mode_request`
-            // and then retry (RC10) is gone.
             let content = format!(
-                "Tool '{}' is not permitted by the current permission envelope \
-                (mode: {}). This is a permission decision, not a transient failure. \
-                If the user needs this capability, they can grant a scope expansion \
-                via the profile dropdown or the caduceus_mode_request tool; that \
-                request is not automatic. Continue with tools that are permitted, \
-                or surface the blocker to the user and wait.",
-                tool_use.name, mode
+                "PERMISSION DENIED: '{}' is blocked in {} mode. \
+                DO NOT retry — this is a permission issue, not a transient error. \
+                Ask the user: \"I need {} to complete this task. \
+                Shall I switch to Act mode?\" \
+                Then use caduceus_mode_request to request the change.",
+                tool_use.name, mode, tool_use.name
             );
-            log::warn!(
-                "[caduceus] PERMISSION DENIED '{}' in {} mode",
-                tool_use.name,
-                mode
-            );
+            log::warn!("[caduceus] PERMISSION DENIED '{}' in {} mode", tool_use.name, mode);
             // Permission denials reset the circuit breaker (not real failures)
             self.circuit_breaker.record_permission_denied();
             return Some(Task::ready(LanguageModelToolResult {
@@ -3177,15 +3065,9 @@ impl Thread {
 
         // Caduceus: circuit breaker — stop after N consecutive tool failures
         if self.circuit_breaker.is_tripped() {
-            log::error!(
-                "[caduceus] Circuit breaker: {} consecutive failures",
-                self.circuit_breaker.consecutive_failures()
-            );
+            log::error!("[caduceus] Circuit breaker: {} consecutive failures", self.circuit_breaker.consecutive_failures());
             self.guardrail_alert = Some((
-                format!(
-                    "🔴 Circuit breaker: {} consecutive tool failures — execution paused",
-                    self.circuit_breaker.consecutive_failures()
-                ),
+                format!("🔴 Circuit breaker: {} consecutive tool failures — execution paused", self.circuit_breaker.consecutive_failures()),
                 AlertSeverity::Error,
                 std::time::Instant::now(),
             ));
@@ -3193,7 +3075,7 @@ impl Thread {
             cx.notify();
             return Some(Task::ready(LanguageModelToolResult {
                 content: LanguageModelToolResultContent::Text(Arc::from(
-                    "CIRCUIT BREAKER: 5 consecutive tool failures. Stop and explain the issue to the user.",
+                    "CIRCUIT BREAKER: 5 consecutive tool failures. Stop and explain the issue to the user."
                 )),
                 tool_use_id: tool_use.id,
                 tool_name: tool_use.name,
@@ -3214,9 +3096,7 @@ impl Thread {
                     self.loop_escalation_count += 1;
                     log::warn!(
                         "[caduceus] Loop detected: {} called too many times consecutively (escalation {}/{})",
-                        name,
-                        self.loop_escalation_count,
-                        LOOP_ESCALATION_THRESHOLD
+                        name, self.loop_escalation_count, LOOP_ESCALATION_THRESHOLD
                     );
 
                     if self.loop_escalation_count >= LOOP_ESCALATION_THRESHOLD {
@@ -3244,10 +3124,9 @@ impl Thread {
                         })
                         .detach();
                         return Some(Task::ready(LanguageModelToolResult {
-                            content: LanguageModelToolResultContent::Text(Arc::from(format!(
-                                "RUNAWAY LOOP: {} called repeatedly. Turn cancelled by safety guardrail. Wait for the user to provide a new prompt.",
-                                name
-                            ))),
+                            content: LanguageModelToolResultContent::Text(Arc::from(
+                                format!("RUNAWAY LOOP: {} called repeatedly. Turn cancelled by safety guardrail. Wait for the user to provide a new prompt.", name)
+                            )),
                             tool_use_id: tool_use.id,
                             tool_name: tool_use.name,
                             is_error: true,
@@ -3256,19 +3135,15 @@ impl Thread {
                     }
 
                     self.guardrail_alert = Some((
-                        format!(
-                            "⚠️ Loop detected: {} called too many times — trying different approach",
-                            name
-                        ),
+                        format!("⚠️ Loop detected: {} called too many times — trying different approach", name),
                         AlertSeverity::Warning,
                         std::time::Instant::now(),
                     ));
                     cx.notify();
                     return Some(Task::ready(LanguageModelToolResult {
-                        content: LanguageModelToolResultContent::Text(Arc::from(format!(
-                            "LOOP DETECTED: {} called too many times in a row. Try a different approach.",
-                            name
-                        ))),
+                        content: LanguageModelToolResultContent::Text(Arc::from(
+                            format!("LOOP DETECTED: {} called too many times in a row. Try a different approach.", name)
+                        )),
                         tool_use_id: tool_use.id,
                         tool_name: tool_use.name,
                         is_error: true,
@@ -3726,19 +3601,9 @@ impl Thread {
         self.update_active_context(cx);
         let last_user = self.messages.iter().rev().find_map(|m| {
             if let Message::User(u) = m {
-                Some(
-                    u.content
-                        .iter()
-                        .filter_map(|c| {
-                            if let UserMessageContent::Text(t) = c {
-                                Some(t.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                )
+                Some(u.content.iter().filter_map(|c| {
+                    if let UserMessageContent::Text(t) = c { Some(t.as_str()) } else { None }
+                }).collect::<Vec<_>>().join(" "))
             } else {
                 None
             }
@@ -3757,26 +3622,20 @@ impl Thread {
                 // Move extraction + disk I/O to background
                 cx.background_executor()
                     .spawn(async move {
-                        let memories =
-                            caduceus_bridge::orchestrator::OrchestratorBridge::extract_memories(
-                                &user_text,
-                                &agent_text,
-                            );
+                        let memories = caduceus_bridge::orchestrator::OrchestratorBridge::extract_memories(
+                            &user_text, &agent_text,
+                        );
                         for mem in &memories {
                             use std::hash::{Hash, Hasher};
                             let mut hasher = std::collections::hash_map::DefaultHasher::new();
                             mem.hash(&mut hasher);
                             let key = format!("auto:{:x}", hasher.finish());
-                            if let Err(e) = caduceus_bridge::memory::store_system(&root, &key, mem)
-                            {
+                            if let Err(e) = caduceus_bridge::memory::store_system(&root, &key, mem) {
                                 log::warn!("[caduceus] Failed to store auto-memory: {e}");
                             }
                         }
                         if !memories.is_empty() {
-                            log::debug!(
-                                "[caduceus] Auto-extracted {} memories from turn",
-                                memories.len()
-                            );
+                            log::debug!("[caduceus] Auto-extracted {} memories from turn", memories.len());
                         }
                     })
                     .detach();
@@ -3793,49 +3652,21 @@ impl Thread {
             let msg_count = self.messages.len();
 
             // Extract last user message as "current goal"
-            let goal = self
-                .messages
-                .iter()
-                .rev()
-                .find_map(|m| {
-                    if let Message::User(u) = m {
-                        Some(
-                            u.content
-                                .iter()
-                                .filter_map(|c| {
-                                    if let UserMessageContent::Text(t) = c {
-                                        Some(t.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                        )
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
+            let goal = self.messages.iter().rev().find_map(|m| {
+                if let Message::User(u) = m {
+                    Some(u.content.iter().filter_map(|c| {
+                        if let UserMessageContent::Text(t) = c { Some(t.as_str()) } else { None }
+                    }).collect::<Vec<_>>().join(" "))
+                } else { None }
+            }).unwrap_or_default();
             let goal_short: String = goal.chars().take(200).collect();
 
             // Count tool calls as "decisions made"
-            let tool_count: usize = self
-                .messages
-                .iter()
-                .filter_map(|m| {
-                    if let Message::Agent(a) = m {
-                        Some(
-                            a.content
-                                .iter()
-                                .filter(|c| matches!(c, AgentMessageContent::ToolUse(_)))
-                                .count(),
-                        )
-                    } else {
-                        None
-                    }
-                })
-                .sum();
+            let tool_count: usize = self.messages.iter().filter_map(|m| {
+                if let Message::Agent(a) = m {
+                    Some(a.content.iter().filter(|c| matches!(c, AgentMessageContent::ToolUse(_))).count())
+                } else { None }
+            }).sum();
 
             cx.background_executor()
                 .spawn(async move {
@@ -4036,7 +3867,11 @@ impl Thread {
         self.tools.keys().cloned().collect()
     }
 
-    pub(crate) fn register_running_subagent(&mut self, subagent: WeakEntity<Thread>, cx: &App) {
+    pub(crate) fn register_running_subagent(
+        &mut self,
+        subagent: WeakEntity<Thread>,
+        cx: &App,
+    ) {
         // Record parent → child spawn in the global Index DAG so the IDE
         // panel can show the full agent tree (not just resource accesses).
         let parent_id = self.id.0.to_string();
@@ -4130,21 +3965,19 @@ impl Thread {
         .context("failed to build system prompt")
         .expect("Invalid template");
 
-        // Inject Caduceus mode prefix into system prompt.
-        //
-        // P9: the prompt text comes from the engine via the bridge so there
-        // is a single source of truth. Zed no longer authors mode text.
-        // The legacy string-interpolated one-liner (`You are in X mode.
-        // {description}`) has been replaced with the full layered mode
-        // prompt that `AgentMode::config_with_lens` produces — same one the
-        // engine's `effective_system_prompt` uses.
+        // Inject Caduceus mode prefix into system prompt
         let system_prompt = {
+            use caduceus_bridge::orchestrator::BridgeAgentMode;
             let mode_str = self.caduceus_mode_from_profile();
-            let mode_text = caduceus_bridge::orchestrator::mode_prompt_for_profile(mode_str, None);
-            if mode_text.is_empty() {
+            let mode_prefix = if let Some(mode) = BridgeAgentMode::from_str_loose(mode_str) {
+                format!("You are in {} mode. {}\n\n", mode.name().to_uppercase(), mode.description())
+            } else {
+                String::new()
+            };
+            if mode_prefix.is_empty() {
                 system_prompt
             } else {
-                format!("{mode_text}\n\n{system_prompt}")
+                format!("{mode_prefix}{system_prompt}")
             }
         };
 
@@ -4185,41 +4018,25 @@ impl Thread {
                 }
 
                 // Wiki overview (compact)
-                if let Some(overview) = caduceus_bridge::memory::get(
-                    &root,
-                    caduceus_bridge::memory::KEY_PROJECT_OVERVIEW,
-                ) {
+                if let Some(overview) = caduceus_bridge::memory::get(&root, caduceus_bridge::memory::KEY_PROJECT_OVERVIEW) {
                     let compact: String = overview.chars().take(300).collect();
                     assembler.add_source(ContextSource::MemoryBank(compact));
                 }
 
                 // Inject pinned context items (survive compaction)
                 for pin in self.context_pins.list_pins() {
-                    assembler.add_source(ContextSource::Pinned(format!(
-                        "[Pinned: {}] {}",
-                        pin.label, pin.content
-                    )));
+                    assembler.add_source(ContextSource::Pinned(
+                        format!("[Pinned: {}] {}", pin.label, pin.content)
+                    ));
                 }
 
                 // Resolve @mentions from the latest user message
                 if let Some(last_user_text) = self.messages.iter().rev().find_map(|m| {
                     if let Message::User(u) = m {
-                        Some(
-                            u.content
-                                .iter()
-                                .filter_map(|c| {
-                                    if let UserMessageContent::Text(t) = c {
-                                        Some(t.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                        )
-                    } else {
-                        None
-                    }
+                        Some(u.content.iter().filter_map(|c| {
+                            if let UserMessageContent::Text(t) = c { Some(t.as_str()) } else { None }
+                        }).collect::<Vec<_>>().join(" "))
+                    } else { None }
                 }) {
                     let resolver = caduceus_bridge::orchestrator::MentionResolver::new(&root);
                     if let Ok(Some(resolved)) = resolver.resolve(&last_user_text) {
@@ -4290,12 +4107,8 @@ impl Thread {
             ));
 
             let assembled = assembler.assemble();
-            log::debug!(
-                "[caduceus] Context: {} tokens, {} included, {} truncated",
-                assembled.total_tokens,
-                assembled.sources_included.len(),
-                assembled.sources_truncated.len()
-            );
+            log::debug!("[caduceus] Context: {} tokens, {} included, {} truncated",
+                assembled.total_tokens, assembled.sources_included.len(), assembled.sources_truncated.len());
             assembled.content
         };
 
@@ -5806,9 +5619,7 @@ mod synthetic_guardrail_tests {
     /// tool would loop forever.
     #[test]
     fn does_not_misclassify_real_tool_errors() {
-        assert!(!is_synthetic_guardrail_text(
-            "Failed to read file: not found"
-        ));
+        assert!(!is_synthetic_guardrail_text("Failed to read file: not found"));
         assert!(!is_synthetic_guardrail_text("HTTP 500: upstream error"));
         assert!(!is_synthetic_guardrail_text(""));
         assert!(!is_synthetic_guardrail_text(

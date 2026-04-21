@@ -219,7 +219,7 @@ impl AgentTool for CaduceusTaskDecomposeTool {
                     } else {
                         let mut out = format!("{} tasks in DAG:\n", tasks.len());
                         let mut sorted: Vec<_> = tasks.iter().collect();
-                        sorted.sort_by(|a, b| a.0.cmp(b.0));
+                        sorted.sort_by_key(|(id, _)| id.clone());
                         for (id, t) in &sorted {
                             out.push_str(&format!("  [{:?}] {} — {}\n", t.status, id, t.title));
                         }
