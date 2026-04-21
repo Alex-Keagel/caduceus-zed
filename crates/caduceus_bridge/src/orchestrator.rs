@@ -1032,6 +1032,39 @@ impl OrchestratorBridge {
         self.attach_p12(base)
     }
 
+    /// ST-B1 / contract `harness-sink-v1` — build a harness pre-wired with
+    /// a `ReducerHandle` as its [`IntrospectionSink`], plus HITL approval
+    /// on the [`DEFAULT_APPROVAL_TOOLS`] set.
+    ///
+    /// This is the production entry point for IDE surfaces that need the
+    /// live Agents-DAG: the returned `ReducerHandle` is the same reducer
+    /// projections are read from, so every `IntrospectionEventV1` variant
+    /// the harness emits lands in the reducer without a separate wire-up
+    /// step.
+    ///
+    /// Returns `(harness, approval_tx, reducer_handle)`.
+    pub fn build_harness_with_sink(
+        &self,
+        provider: Arc<dyn LlmAdapter>,
+        tools: ToolRegistry,
+        system_prompt: &str,
+    ) -> (
+        AgentHarness,
+        tokio::sync::mpsc::Sender<(String, bool)>,
+        crate::dag_state::ReducerHandle,
+    ) {
+        let handle = self.new_reducer_handle();
+        let sink: Arc<dyn caduceus_orchestrator::IntrospectionSink> = Arc::new(handle.clone());
+        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
+            .with_tool_timeout(std::time::Duration::from_secs(120))
+            .with_instructions(&self.project_root)
+            .with_introspection_sink(sink);
+        let base = self.attach_p12(base);
+        let (harness, approval_tx) =
+            base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()));
+        (harness, approval_tx, handle)
+    }
+
     // ── Emitter / replay seam (G17) ──────────────────────────────────────
 
     /// Default in-flight buffer for the emitter mpsc channel handed to the
@@ -1366,6 +1399,84 @@ mod tests {
         // Channel still exists but no tool will ever block on it.
         let (_h, tx) = bridge.build_harness_with_approval::<&str>(provider, tools, "test", &[]);
         assert!(!tx.is_closed());
+    }
+
+    /// ST-B1 / `harness-sink-v1`: the harness built by `build_harness_with_sink`
+    /// must carry an introspection sink that feeds the same reducer the
+    /// returned handle reads from — so `spawn_critique_fanout_via_harness`
+    /// populates the Agents-DAG without any separate wire-up.
+    #[tokio::test]
+    async fn build_harness_with_sink_routes_fanout_events_to_reducer() {
+        use caduceus_orchestrator::critique_fanout::spawn_critique_fanout_via_harness;
+        use caduceus_orchestrator::modes::PersonaRegistry;
+        use caduceus_permissions::envelope::{FanoutPolicy, PermissionEnvelope};
+        use caduceus_providers::mock::MockLlmAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools = ToolRegistry::new();
+        let (harness, _tx, handle) = bridge.build_harness_with_sink(provider, tools, "test");
+
+        // Install a MultiPersona envelope so the fan-out has critics to spawn.
+        let env = {
+            let mut e = PermissionEnvelope::research_preset();
+            e.fanout_policy = FanoutPolicy::MultiPersona;
+            e
+        };
+        let harness = harness.with_permission_envelope(env);
+
+        let reg = PersonaRegistry::builtin_personas();
+        // StubRunner is not public; use the real spawn helper — it calls
+        // `self.critique(...)` through a trait we can define inline.
+        use async_trait::async_trait;
+        use caduceus_core::Critique;
+        use caduceus_core::CritiqueSeverity;
+        struct R;
+        #[async_trait]
+        impl caduceus_orchestrator::critique_fanout::CritiqueRunner for R {
+            async fn critique(
+                &self,
+                persona: &str,
+                _prefix: &str,
+                _plan: &str,
+                _env: &PermissionEnvelope,
+            ) -> Result<Critique, anyhow::Error> {
+                Ok(Critique {
+                    persona: persona.to_string(),
+                    severity: CritiqueSeverity::Info,
+                    findings: vec![],
+                    blocking: false,
+                })
+            }
+            fn model_metadata(&self, _persona: &str) -> (String, String) {
+                ("anthropic".into(), "opus".into())
+            }
+        }
+
+        let got = spawn_critique_fanout_via_harness(
+            &harness,
+            "plan body",
+            &["cloud", "qa"],
+            &reg,
+            &R,
+        )
+        .await;
+        assert_eq!(got.len(), 3, "rubber-duck + cloud + qa");
+
+        // The reducer handle returned by `build_harness_with_sink` MUST be
+        // the same reducer the harness sink fed — so the critic nodes show
+        // up in its Agents-DAG without any additional wire-up.
+        let agents = handle.active_agents_dag(true);
+        assert_eq!(
+            agents.nodes.len(),
+            3,
+            "3 critic nodes expected in the reducer the handle reads from"
+        );
+        assert!(
+            handle.last_event_id() > 0,
+            "reducer must have observed events through the harness sink"
+        );
     }
 
     #[test]
