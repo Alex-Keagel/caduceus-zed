@@ -45,6 +45,16 @@ pub use caduceus_permissions::envelope::{
     PermissionEnvelope as BridgePermissionEnvelope,
 };
 
+// ST-B3 / contract `context-injector-v1` — bridge re-exports the
+// scoped-context surface so IDE callers install injectors without
+// importing `caduceus-orchestrator` directly. The default installed by
+// `build_harness_with_injector` when the caller passes `None` is
+// `BuiltinScopedContextInjector::default()` — preserves today's behaviour.
+pub use caduceus_orchestrator::{
+    BuiltinScopedContextInjector, ContextInjector, PassthroughContextInjector, ScopeRequest,
+    ScopedContext,
+};
+
 // P13d — live two-DAG state reducer (features + agents + snapshot). IDE
 // clients feed AgentEvents in and call `active_*` projections to render.
 pub use dag_state::{

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::BridgePermissionEnvelope;
+use crate::{BuiltinScopedContextInjector, ContextInjector};
 
 // Re-export orchestrator types for consumers.
 pub use caduceus_orchestrator::{
@@ -1123,6 +1124,48 @@ impl OrchestratorBridge {
         (harness, approval_tx, handle)
     }
 
+    /// ST-B3 / contract `context-injector-v1` — build a harness pre-wired
+    /// with a caller-supplied [`BridgePermissionEnvelope`], an
+    /// introspection sink, AND a [`ContextInjector`]. The injector lets
+    /// the IDE hand each critic/subtask a narrowly-scoped
+    /// [`ScopedContext`] (bounded by `envelope.skill_budget`) so fan-out
+    /// workers don't receive the full plan body.
+    ///
+    /// When `injector` is `None`, a fresh
+    /// [`BuiltinScopedContextInjector::default`] is installed — this
+    /// preserves today's default scoping behaviour for callers that
+    /// migrate to this builder before configuring a custom injector.
+    ///
+    /// Returns `(harness, approval_tx, reducer_handle)`.
+    pub fn build_harness_with_envelope_sink_and_injector(
+        &self,
+        provider: Arc<dyn LlmAdapter>,
+        tools: ToolRegistry,
+        system_prompt: &str,
+        envelope: BridgePermissionEnvelope,
+        injector: Option<Arc<dyn ContextInjector>>,
+    ) -> (
+        AgentHarness,
+        tokio::sync::mpsc::Sender<(String, bool)>,
+        crate::dag_state::ReducerHandle,
+    ) {
+        let handle = self.new_reducer_handle();
+        let sink: Arc<dyn caduceus_orchestrator::IntrospectionSink> = Arc::new(handle.clone());
+        let inj = injector.unwrap_or_else(|| {
+            Arc::new(BuiltinScopedContextInjector::default()) as Arc<dyn ContextInjector>
+        });
+        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
+            .with_tool_timeout(std::time::Duration::from_secs(120))
+            .with_instructions(&self.project_root)
+            .with_permission_envelope(envelope)
+            .with_introspection_sink(sink)
+            .with_context_injector(inj);
+        let base = self.attach_p12(base);
+        let (harness, approval_tx) =
+            base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()));
+        (harness, approval_tx, handle)
+    }
+
     // ── Emitter / replay seam (G17) ──────────────────────────────────────
 
     /// Default in-flight buffer for the emitter mpsc channel handed to the
@@ -1542,6 +1585,7 @@ mod tests {
         assert_eq!(got_bytes, expected_bytes);
     }
 
+
     /// ST-B2 combined with ST-B1: `build_harness_with_envelope_and_sink`
     /// must thread BOTH the envelope AND the reducer-backed sink, and
     /// the returned reducer handle must be the one the sink feeds.
@@ -1606,6 +1650,123 @@ mod tests {
         let got = spawn_critique_fanout_via_harness(&harness, "plan", &["cloud"], &reg, &R).await;
         assert_eq!(got.len(), 2, "rubber-duck + cloud");
         assert_eq!(handle.active_agents_dag(true).nodes.len(), 2);
+    }
+
+    /// ST-B3 / `context-injector-v1`: the `*_sink_and_injector` builder
+    /// must thread an explicit `ContextInjector` through to the harness,
+    /// AND installing `None` must fall back to
+    /// `BuiltinScopedContextInjector::default()` (today's default
+    /// scoping behaviour).
+    #[tokio::test]
+    async fn build_harness_with_envelope_sink_and_injector_threads_injector() {
+        use caduceus_orchestrator::critique_fanout::spawn_critique_fanout_via_harness;
+        use caduceus_orchestrator::modes::PersonaRegistry;
+        use caduceus_orchestrator::{ContextInjector, ScopeRequest, ScopedContext};
+        use caduceus_permissions::envelope::{FanoutPolicy, PermissionEnvelope};
+        use caduceus_providers::mock::MockLlmAdapter;
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountingInjector {
+            count: AtomicUsize,
+            personas: Mutex<Vec<String>>,
+        }
+        impl ContextInjector for CountingInjector {
+            fn scope_for(&self, req: ScopeRequest<'_>) -> ScopedContext {
+                self.count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.personas.lock().unwrap().push(req.persona.to_string());
+                caduceus_orchestrator::PassthroughContextInjector.scope_for(req)
+            }
+        }
+
+        // Path 1: caller passes Some(custom injector) — must see each
+        // runnable critic routed through it.
+        let inj = Arc::new(CountingInjector {
+            count: AtomicUsize::new(0),
+            personas: Mutex::new(vec![]),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools = ToolRegistry::new();
+        let env = {
+            let mut e = PermissionEnvelope::research_preset();
+            e.fanout_policy = FanoutPolicy::MultiPersona;
+            e
+        };
+        let (harness, _tx, _h) = bridge.build_harness_with_envelope_sink_and_injector(
+            provider,
+            tools,
+            "test",
+            env.clone(),
+            Some(inj.clone() as Arc<dyn ContextInjector>),
+        );
+        use async_trait::async_trait;
+        use caduceus_core::Critique;
+        use caduceus_core::CritiqueSeverity;
+        struct R;
+        #[async_trait]
+        impl caduceus_orchestrator::critique_fanout::CritiqueRunner for R {
+            async fn critique(
+                &self,
+                persona: &str,
+                _prefix: &str,
+                _plan: &str,
+                _env: &PermissionEnvelope,
+            ) -> Result<Critique, anyhow::Error> {
+                Ok(Critique {
+                    persona: persona.to_string(),
+                    severity: CritiqueSeverity::Info,
+                    findings: vec![],
+                    blocking: false,
+                })
+            }
+            fn model_metadata(&self, _persona: &str) -> (String, String) {
+                ("anthropic".into(), "opus".into())
+            }
+        }
+        let reg = PersonaRegistry::builtin_personas();
+        let _got =
+            spawn_critique_fanout_via_harness(&harness, "plan", &["cloud", "qa"], &reg, &R).await;
+        assert_eq!(
+            inj.count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "explicit injector must be invoked once per runnable critic"
+        );
+
+        // Path 2: caller passes None — builder must install the default
+        // `BuiltinScopedContextInjector` so `harness.context_injector()` is Some.
+        let dir2 = tempfile::tempdir().unwrap();
+        let bridge2 = OrchestratorBridge::new(dir2.path());
+        let provider2: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools2 = ToolRegistry::new();
+        let (harness2, _tx2, _h2) = bridge2.build_harness_with_envelope_sink_and_injector(
+            provider2,
+            tools2,
+            "test",
+            env,
+            None,
+        );
+        assert!(
+            harness2.context_injector().is_some(),
+            "None must fall back to BuiltinScopedContextInjector::default()"
+        );
+    }
+
+    /// ST-B3 / `context-injector-v1`: `envelope.with_skill_budget(n)`
+    /// must set the bytes deterministically so IDE callers can tighten
+    /// skill activation without reaching into the struct fields.
+    #[test]
+    fn envelope_with_skill_budget_fluently_overrides_field() {
+        use caduceus_permissions::envelope::PermissionEnvelope;
+        let env = PermissionEnvelope::research_preset().with_skill_budget(2);
+        assert_eq!(env.skill_budget, 2);
+        // Narrowing then widening must not silently re-widen past the
+        // preset default (the builder is just a field write, but guard
+        // against accidental clamps being added).
+        let env2 = env.with_skill_budget(12);
+        assert_eq!(env2.skill_budget, 12);
     }
 
     /// ST-B1 / `harness-sink-v1`: the harness built by `build_harness_with_sink`
