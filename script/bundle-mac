@@ -344,13 +344,17 @@ gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed
 
 if [ "$clean_after" = true ]; then
     echo "Cleaning intermediate target/ artifacts (keeping .app + .dmg)..."
-    # Preserve final outputs (.app bundle lives under dmg/, .dmg file, gz'd remote server) by moving to a staging dir.
+    # Preserve final outputs by moving to a staging dir. Local-install mode puts
+    # the bundle under bundle/osx/; DMG mode puts it under release/dmg/.
     staging="target/_bundle_keep"
     rm -rf "$staging"
     mkdir -p "$staging"
-    if [ -d "target/${target_triple}/release/dmg" ]; then
-        mv "target/${target_triple}/release/dmg" "$staging/dmg"
-    fi
+    for src in "target/${target_triple}/release/dmg" "target/${target_triple}/release/bundle/osx"; do
+        if [ -d "$src" ]; then
+            mkdir -p "$staging/$(dirname "${src#target/${target_triple}/release/}")"
+            mv "$src" "$staging/${src#target/${target_triple}/release/}"
+        fi
+    done
     for f in "target/${target_triple}/release/Zed-${arch_suffix}.dmg" "target/zed-remote-server-macos-${arch_suffix}.gz"; do
         [ -f "$f" ] && mv "$f" "$staging/"
     done
@@ -360,10 +364,11 @@ if [ "$clean_after" = true ]; then
     # Restore outputs.
     mkdir -p "target/${target_triple}/release"
     [ -d "$staging/dmg" ] && mv "$staging/dmg" "target/${target_triple}/release/dmg"
+    [ -d "$staging/bundle" ] && mv "$staging/bundle" "target/${target_triple}/release/bundle"
     for f in "$staging"/*.dmg "$staging"/*.gz; do
         [ -f "$f" ] && mv "$f" "target/${target_triple}/release/" 2>/dev/null || true
     done
     rm -rf "$staging"
     echo "Kept:"
-    find "target/${target_triple}/release" -maxdepth 2 \( -name '*.app' -o -name '*.dmg' -o -name '*.gz' \) 2>/dev/null
+    find "target/${target_triple}/release" -maxdepth 4 \( -name '*.app' -o -name '*.dmg' -o -name '*.gz' \) 2>/dev/null
 fi
