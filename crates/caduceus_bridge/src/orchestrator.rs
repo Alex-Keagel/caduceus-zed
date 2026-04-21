@@ -537,6 +537,14 @@ pub struct OrchestratorBridge {
     /// Optional Tree-of-Thoughts planner config (P12.3) attached to
     /// every harness.
     tot_config: Option<caduceus_orchestrator::PlannerConfig>,
+    /// ST-B4a / `native-loop-prep-v1` — runtime flag that gates the
+    /// engine-driven turn loop (`run_caduceus_loop`). Off by default.
+    /// Stored as `Arc<AtomicBool>` so callers can clone a cheap handle
+    /// once and mutate the flag from settings without re-wiring the
+    /// bridge. `Relaxed`/`Acquire` ordering is sufficient — the flag
+    /// only gates entry into the loop; inside the loop, data flow is
+    /// coordinated by the harness's own synchronisation primitives.
+    native_loop_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Cheap, `Clone`-able handle to an `AgentEventEmitter`'s retention ring.
@@ -672,6 +680,7 @@ impl OrchestratorBridge {
             speculative_cache: None,
             reflexion: None,
             tot_config: None,
+            native_loop_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1227,6 +1236,136 @@ impl OrchestratorBridge {
     }
 
     // ── Agent turn execution ─────────────────────────────────────────────
+
+    /// ST-B4a / `native-loop-prep-v1` — is the engine-driven turn loop
+    /// enabled? The IDE reads this on every turn dispatch to decide
+    /// whether to call [`Self::run_caduceus_loop`] or fall back to its
+    /// own `model.stream_completion` loop. Default: `false`.
+    pub fn native_loop_enabled(&self) -> bool {
+        self.native_loop_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Toggle the native-loop flag at runtime. Intended to be wired to
+    /// a workspace setting (`caduceus.native_loop`) so operators can
+    /// bake the new path on a per-project basis without recompiling.
+    pub fn set_native_loop_enabled(&self, enabled: bool) {
+        self.native_loop_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Builder variant of [`Self::set_native_loop_enabled`] for
+    /// fluent test / bootstrap construction.
+    pub fn with_native_loop_enabled(self, enabled: bool) -> Self {
+        self.set_native_loop_enabled(enabled);
+        self
+    }
+
+    /// Cheap `Clone`-able handle to the shared native-loop flag. Lets a
+    /// background worker (e.g. settings watcher) flip the bit without
+    /// taking a reference to the whole `OrchestratorBridge`.
+    pub fn native_loop_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.native_loop_enabled.clone()
+    }
+
+    /// ST-B4a / `native-loop-prep-v1` — engine-driven turn loop.
+    ///
+    /// Drives [`AgentHarness::run`] on behalf of the IDE and forwards
+    /// every `AgentEvent` emitted during the turn into a session
+    /// [`ReducerHandle`](crate::dag_state::ReducerHandle) so the IDE's
+    /// feature / agent / session projections stay live without the IDE
+    /// having to translate `AgentEvent`s to ACP shapes itself.
+    ///
+    /// **Scope (explicit):** this is the *engine side* of the native
+    /// loop. The downstream IDE integration (ST-B4b) — making
+    /// `thread.rs` delegate to this function under the
+    /// `caduceus.native_loop` setting and translating the streamed
+    /// events to the IDE's `ThreadEventStream` / ACP surface — is
+    /// deferred to a follow-up PR because it requires a full
+    /// `AgentEvent` → ACP translator plus tool-dispatch redirection
+    /// away from Zed's `ToolRegistry`. Until then, `thread.rs` still
+    /// owns the user-visible loop and this function is reachable only
+    /// via tests and forthcoming IDE glue.
+    ///
+    /// Contract:
+    /// * Requires the native-loop flag to be on — returns an error
+    ///   otherwise. Callers must opt in explicitly so a mis-wired flag
+    ///   cannot silently change behaviour.
+    /// * `event_rx` MUST be the receiver half of the same
+    ///   [`AgentEventEmitter`] that was installed on `harness` via
+    ///   `AgentHarness::with_emitter`. If the two are mismatched the
+    ///   reducer will simply see no events — the harness never writes
+    ///   to a channel it does not own.
+    /// * Events emitted *before* the forwarder task is spawned are
+    ///   captured by the emitter's retention ring (P1.4 / G17) and can
+    ///   still be replayed via [`Self::replay_session_events`], so a
+    ///   slow task spawn does not lose state.
+    /// * Events emitted *after* `harness.run` returns but before the
+    ///   forwarder drains are still delivered — `run_caduceus_loop`
+    ///   waits for the forwarder to observe the channel-close or drain
+    ///   signal before returning.
+    /// * Cancellation and error propagation match
+    ///   [`AgentHarness::run`] verbatim — this function adds no new
+    ///   exit conditions beyond the engine's own.
+    pub async fn run_caduceus_loop(
+        &self,
+        harness: &AgentHarness,
+        state: &mut SessionState,
+        history: &mut ConversationHistory,
+        user_input: &str,
+        reducer: crate::dag_state::ReducerHandle,
+        mut event_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+    ) -> Result<String, String> {
+        if !self.native_loop_enabled() {
+            return Err(
+                "caduceus native loop is disabled; enable via set_native_loop_enabled(true) \
+                 (flag: caduceus.native_loop)"
+                    .into(),
+            );
+        }
+
+        // Forwarder pumps the emitter stream into the reducer until the
+        // harness side closes the channel OR a drain signal is sent.
+        // Using a oneshot drain signal (rather than just rx-close) lets
+        // us return from `run_caduceus_loop` deterministically without
+        // having to drop `harness` first — the harness is borrowed, so
+        // the caller may want to keep it alive for the next turn.
+        let reducer_fwd = reducer.clone();
+        let (drain_tx, mut drain_rx) = tokio::sync::oneshot::channel::<()>();
+        let forwarder = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    maybe_ev = event_rx.recv() => {
+                        match maybe_ev {
+                            Some(ev) => { let _ = reducer_fwd.ingest_event(&ev); }
+                            None => break,
+                        }
+                    }
+                    _ = &mut drain_rx => {
+                        // Drain already-buffered events before exiting so
+                        // post-`run()` tail events (e.g. `TurnComplete`)
+                        // don't get dropped.
+                        while let Ok(ev) = event_rx.try_recv() {
+                            let _ = reducer_fwd.ingest_event(&ev);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        let run_result = harness
+            .run(state, history, user_input)
+            .await
+            .map_err(|e| e.to_string());
+
+        // Signal drain; ignore send errors (forwarder already observed
+        // channel close, which is the preferred path anyway).
+        let _ = drain_tx.send(());
+        let _ = forwarder.await;
+
+        run_result
+    }
 
     /// Run a single agent turn (non-streaming).
     pub async fn run_turn(
@@ -3157,6 +3296,183 @@ mod tests {
         let _ = BridgeEnsembleCombiner::Mean;
         let _ = BridgeEnsembleCombiner::Median;
         let _ = BridgeEnsembleCombiner::Threshold(0.5);
+    }
+
+    // ── ST-B4a / native-loop-prep-v1 ─────────────────────────────────────
+
+    /// Flag surface: default off, set/get round-trips, cheap handle
+    /// observes writes through the bridge.
+    #[test]
+    fn b4a_native_loop_flag_default_off_and_toggleable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        assert!(
+            !bridge.native_loop_enabled(),
+            "native loop MUST be off by default — flipping it on is an explicit operator decision"
+        );
+        bridge.set_native_loop_enabled(true);
+        assert!(bridge.native_loop_enabled());
+
+        // Cloned handle sees the same shared atomic.
+        let flag = bridge.native_loop_flag();
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire));
+        bridge.set_native_loop_enabled(false);
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
+
+        // Fluent builder.
+        let bridge2 = OrchestratorBridge::new(dir.path()).with_native_loop_enabled(true);
+        assert!(bridge2.native_loop_enabled());
+    }
+
+    /// With the flag OFF, `run_caduceus_loop` MUST refuse to run.
+    /// Surprise-activation is exactly the class of regression the flag
+    /// exists to prevent.
+    #[tokio::test]
+    async fn b4a_native_loop_refuses_when_flag_off() {
+        use caduceus_orchestrator::AgentEventEmitter;
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools = ToolRegistry::new();
+        let (emitter, rx) = AgentEventEmitter::channel(16);
+        let harness = AgentHarness::new(provider, tools, 4096, "test").with_emitter(emitter);
+        let mut state = bridge.new_session("mock", "mock-model");
+        let mut history = OrchestratorBridge::new_history();
+        let handle = bridge.new_reducer_handle();
+
+        let res = bridge
+            .run_caduceus_loop(&harness, &mut state, &mut history, "hi", handle, rx)
+            .await;
+        assert!(res.is_err());
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("native loop is disabled"),
+            "error MUST name the flag so operators can find it: got {msg:?}"
+        );
+    }
+
+    /// PARITY: with the flag ON, `run_caduceus_loop` returns the same
+    /// assistant text as calling `harness.run` directly AND every
+    /// `AgentEvent` emitted during the turn flows through the reducer
+    /// handle (non-empty `last_event_id`). This is the core B4a
+    /// contract — "the bridge-driven loop is equivalent to the engine
+    /// loop *and* exposes live events to the IDE".
+    #[tokio::test]
+    async fn b4a_native_loop_parity_with_direct_harness_run() {
+        use caduceus_core::StopReason;
+        use caduceus_orchestrator::AgentEventEmitter;
+        use caduceus_providers::ChatResponse;
+        use caduceus_providers::mock::MockLlmAdapter;
+
+        fn reply(text: &str) -> ChatResponse {
+            ChatResponse {
+                content: text.into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                stop_reason: StopReason::EndTurn,
+                tool_calls: vec![],
+                logprobs: None,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Path A — direct harness.run with a sink-only reducer. No
+        // emitter here; reducer sees introspection events only (harness
+        // emits none for a plain reply, so projections are empty).
+        let bridge_a = OrchestratorBridge::new(dir.path());
+        let provider_a: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![reply("pong")]));
+        let harness_a =
+            AgentHarness::new(provider_a, ToolRegistry::new(), 4096, "system prompt A");
+        let mut state_a = bridge_a.new_session("mock", "mock-model");
+        let mut history_a = OrchestratorBridge::new_history();
+        let out_a = harness_a
+            .run(&mut state_a, &mut history_a, "ping")
+            .await
+            .expect("direct run must succeed");
+
+        // Path B — same inputs driven through the native loop with
+        // the flag ON. Reducer is wired; event_rx is consumed by the
+        // forwarder. The emitter is installed on harness_b so text
+        // deltas / TurnComplete events flow into the reducer.
+        let bridge_b = OrchestratorBridge::new(dir.path()).with_native_loop_enabled(true);
+        let provider_b: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![reply("pong")]));
+        let (emitter_b, rx_b) = AgentEventEmitter::channel(64);
+        let harness_b = AgentHarness::new(provider_b, ToolRegistry::new(), 4096, "system prompt A")
+            .with_emitter(emitter_b);
+        let mut state_b = bridge_b.new_session("mock", "mock-model");
+        let mut history_b = OrchestratorBridge::new_history();
+        let reducer_b = bridge_b.new_reducer_handle();
+
+        let out_b = bridge_b
+            .run_caduceus_loop(
+                &harness_b,
+                &mut state_b,
+                &mut history_b,
+                "ping",
+                reducer_b.clone(),
+                rx_b,
+            )
+            .await
+            .expect("native-loop run must succeed");
+
+        // 1. The assistant text is byte-equal.
+        assert_eq!(
+            out_a, out_b,
+            "native loop MUST produce the same output as direct harness.run"
+        );
+
+        // 2. The forwarder observed at least one event (harness.run
+        //    emits at minimum a TurnComplete when it finishes, plus
+        //    text deltas from the streaming path). If this is zero,
+        //    the forwarder wiring is broken and the IDE would see a
+        //    dead timeline.
+        assert!(
+            reducer_b.last_event_id() > 0,
+            "reducer MUST observe events from the native loop — got last_event_id=0"
+        );
+    }
+
+    /// Error propagation parity: when `harness.run` fails (here: a
+    /// pre-cancelled token), `run_caduceus_loop` MUST surface that
+    /// error verbatim (modulo the `Display` conversion) and still
+    /// cleanly join the forwarder task. A hang here would be
+    /// catastrophic — the IDE would wedge.
+    #[tokio::test]
+    async fn b4a_native_loop_propagates_cancellation_and_joins_forwarder() {
+        use caduceus_core::CancellationToken;
+        use caduceus_orchestrator::AgentEventEmitter;
+        use caduceus_providers::mock::MockLlmAdapter;
+
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path()).with_native_loop_enabled(true);
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let (emitter, rx) = AgentEventEmitter::channel(8);
+        let harness = AgentHarness::new(provider, ToolRegistry::new(), 4096, "sys")
+            .with_emitter(emitter)
+            .with_cancellation_token(token);
+        let mut state = bridge.new_session("mock", "mock-model");
+        let mut history = OrchestratorBridge::new_history();
+        let reducer = bridge.new_reducer_handle();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bridge.run_caduceus_loop(&harness, &mut state, &mut history, "hi", reducer, rx),
+        )
+        .await
+        .expect("run_caduceus_loop MUST NOT hang — forwarder join deadlock is a B4a regression");
+
+        let err = result.expect_err("pre-cancelled token MUST surface as Err");
+        assert!(
+            err.contains("Cancelled"),
+            "error MUST preserve the underlying cancellation reason: got {err:?}"
+        );
     }
 }
 
