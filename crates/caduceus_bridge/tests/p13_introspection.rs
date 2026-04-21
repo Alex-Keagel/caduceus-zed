@@ -297,3 +297,90 @@ fn p13e_reducer_handles_full_mode_and_envelope_flow() {
     let untrusted = r.active_session_snapshot(false);
     assert!(untrusted.envelope.unwrap().display_text.is_none());
 }
+
+/// P13 follow-up: proves `ReducerHandle` is a drop-in replacement for the
+/// ad-hoc `ReducerSink` pattern above. Production Zed wires the bridge's
+/// `new_reducer_handle()` directly into both the critique fan-out driver
+/// (via `handle.as_sink()`) and the session-event replay path (via
+/// `handle.ingest_event` / `ingest_many`) — ONE reducer per session, shared.
+#[tokio::test]
+async fn p13e_reducer_handle_round_trip_via_as_sink() {
+    let bridge = caduceus_bridge::orchestrator::OrchestratorBridge::new("/tmp");
+    let handle = bridge.new_reducer_handle();
+
+    let env = {
+        let mut e = PermissionEnvelope::research_preset();
+        e.fanout_policy = FanoutPolicy::MultiPersona;
+        e
+    };
+    let reg = PersonaRegistry::builtin_personas();
+    let alloc = AtomicU64::new(500);
+    let sink = handle.as_sink();
+    let ctx = FanoutIntrospectionCtx {
+        sink,
+        primary_execution_id: ExecutionId(1),
+        step_id: StepId(7),
+        execution_id_allocator: &alloc,
+    };
+
+    // Seed primary-executor assignment via the handle's IntrospectionSink
+    // impl — same API the orchestrator uses internally.
+    IntrospectionSink::emit(
+        &handle,
+        IntrospectionEventV1::StepAssigned {
+            assignment: caduceus_core::AssignmentSummaryV1 {
+                execution_id: ExecutionId(1),
+                step_id: StepId(7),
+                persona_id: "planner".into(),
+                model_vendor: "anthropic".into(),
+                model_tier: "opus".into(),
+                model_id_exact: None,
+                activated_skills_count: 0,
+                activated_agents_count: 0,
+                activated_skill_names: None,
+                activated_agent_names: None,
+                attempt: 1,
+            },
+        },
+    )
+    .await;
+
+    let got = spawn_critique_fanout_with_introspection(
+        &env,
+        "plan body",
+        &["cloud"],
+        &reg,
+        &OkRunner,
+        Some(&ctx),
+    )
+    .await;
+    assert_eq!(got.len(), 2, "rubber-duck + cloud");
+
+    // Same handle also ingests a non-introspection AgentEvent through the
+    // replay path — proves one reducer sees BOTH streams.
+    handle.ingest_event(&AgentEvent::PlanStepPending {
+        step: 1,
+        step_id: StepId(7),
+        revision: 0,
+        plan_revision: 1,
+        tool_name: "edit".into(),
+        description: "the task".into(),
+        depends_on: vec![],
+        parent_step_id: None,
+    });
+
+    let agents = handle.active_agents_dag(true);
+    assert_eq!(agents.nodes.len(), 3, "primary + 2 critics");
+    let features = handle.active_features_dag(false);
+    assert_eq!(features.steps.len(), 1);
+    assert_eq!(features.steps[0].tool_name, "edit");
+
+    // A cloned handle observes the SAME state — proof the bridge hands
+    // out cheap clones of the same underlying Arc<Mutex<…>>.
+    let clone = handle.clone();
+    assert_eq!(
+        clone.active_agents_dag(true).nodes.len(),
+        agents.nodes.len()
+    );
+    assert_eq!(clone.last_event_id(), handle.last_event_id());
+}
