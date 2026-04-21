@@ -2668,3 +2668,192 @@ mod tests {
         let _ = BridgeEnsembleCombiner::Threshold(0.5);
     }
 }
+
+// ── P9: dynamic mode / lens / tool-gate queries ───────────────────────────────
+//
+// The IDE (Zed) should hold no mode catalog, no read-only tool ring, and no
+// slash-help table. It queries this bridge instead, so adding a mode in the
+// engine does not require recompiling the IDE.
+
+/// Mode descriptor consumed by the IDE mode picker, slash-help generator,
+/// and any other UI affordance. Kept `Serialize` so it can cross any future
+/// process boundary; we don't actually cross one today.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BridgeModeDescriptor {
+    /// Canonical lowercase name (`plan` | `act` | `research` | `autopilot`).
+    pub name: String,
+    /// Human-readable label (`"Plan"`, `"Act"`, ...).
+    pub label: String,
+    /// Short description — what the user gets in this mode.
+    pub description: String,
+    /// Lenses valid for this mode. Empty for modes with no lens.
+    pub lenses: Vec<BridgeLensDescriptor>,
+}
+
+/// Lens descriptor — today lenses only apply to Act (`execute` / `debug` /
+/// `review`). Empty `lenses` vec elsewhere.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BridgeLensDescriptor {
+    pub name: String,
+    pub label: String,
+    pub description: String,
+}
+
+/// Coarse tool-allowance decision returned to the IDE.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum BridgeToolDecision {
+    /// Fire-and-forget allowed.
+    Allow,
+    /// Allowed but the orchestrator will synthesize a "would do" result
+    /// instead of executing (e.g. writes under Plan).
+    Intercept { reason: String },
+    /// Hard-denied — IDE should surface the reason to the user, NOT retry.
+    Deny { reason: String },
+}
+
+/// Enumerate the canonical modes plus their lenses. The IDE builds its mode
+/// picker from this list; adding a mode in the engine appears in the UI
+/// without IDE changes.
+pub fn list_modes() -> Vec<BridgeModeDescriptor> {
+    use caduceus_orchestrator::modes::{ActLens, AgentMode};
+    let lens_desc = |lens: ActLens| match lens {
+        ActLens::Normal => BridgeLensDescriptor {
+            name: "normal".into(),
+            label: "Execute".into(),
+            description: "Default execution — implement as requested.".into(),
+        },
+        ActLens::Debug => BridgeLensDescriptor {
+            name: "debug".into(),
+            label: "Debug".into(),
+            description: "Trace bugs, inspect failures, propose fixes.".into(),
+        },
+        ActLens::Review => BridgeLensDescriptor {
+            name: "review".into(),
+            label: "Review".into(),
+            description: "Critique diffs — findings list, minimal changes.".into(),
+        },
+    };
+    AgentMode::all_modes()
+        .iter()
+        .map(|mode| {
+            let lenses = match mode {
+                AgentMode::Act => vec![
+                    lens_desc(ActLens::Normal),
+                    lens_desc(ActLens::Debug),
+                    lens_desc(ActLens::Review),
+                ],
+                _ => Vec::new(),
+            };
+            BridgeModeDescriptor {
+                name: mode.name().to_string(),
+                label: {
+                    let mut chars = mode.name().chars();
+                    match chars.next() {
+                        Some(c) => c.to_uppercase().chain(chars).collect(),
+                        None => String::new(),
+                    }
+                },
+                description: mode.description().to_string(),
+                lenses,
+            }
+        })
+        .collect()
+}
+
+/// Return the lenses valid for a mode string. Empty vec for unknown modes or
+/// modes without lenses.
+pub fn list_lenses_for(mode: &str) -> Vec<BridgeLensDescriptor> {
+    list_modes()
+        .into_iter()
+        .find(|m| m.name == mode)
+        .map(|m| m.lenses)
+        .unwrap_or_default()
+}
+
+/// Return the full layered mode prompt for a (mode, lens) pair — this is what
+/// the engine's `effective_system_prompt` prepends. IDEs that build their own
+/// system prompt MUST source the mode section from here so there's a single
+/// source of truth.
+///
+/// Lens defaults to `normal` when None or unknown.
+pub fn mode_prompt_for_profile(mode: &str, lens: Option<&str>) -> String {
+    use caduceus_orchestrator::modes::{ActLens, AgentMode};
+    let agent_mode = AgentMode::from_str_loose(mode).unwrap_or(AgentMode::Plan);
+    let lens = lens
+        .and_then(ActLens::from_str_loose)
+        .unwrap_or(ActLens::Normal);
+    agent_mode.config_with_lens(lens).system_prompt_prefix
+}
+
+/// Coarse "does this mode allow writes without interception?" query. IDEs use
+/// this as a last-mile gate when they don't carry a full envelope. Research
+/// mode is reported as allowing writes because it allows markdown — the fine-
+/// grained file-extension check lives in the engine's envelope preflight.
+///
+/// Callers SHOULD additionally route through `envelope.preflight(...)` for
+/// the authoritative decision; this helper exists only to drive UI affordances.
+pub fn mode_allows_writes(mode: &str) -> bool {
+    use caduceus_orchestrator::modes::AgentMode;
+    match AgentMode::from_str_loose(mode).unwrap_or(AgentMode::Plan) {
+        AgentMode::Plan => false,
+        AgentMode::Research => true, // markdown only — engine enforces extension
+        AgentMode::Act => true,
+        AgentMode::Autopilot => true,
+    }
+}
+
+#[cfg(test)]
+mod p9_tests {
+    use super::*;
+
+    #[test]
+    fn list_modes_returns_4_canonical_modes_with_act_having_3_lenses() {
+        let modes = list_modes();
+        assert_eq!(modes.len(), 4);
+        let names: Vec<&str> = modes.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"plan"));
+        assert!(names.contains(&"act"));
+        assert!(names.contains(&"research"));
+        assert!(names.contains(&"autopilot"));
+        let act = modes.iter().find(|m| m.name == "act").unwrap();
+        assert_eq!(act.lenses.len(), 3);
+        assert_eq!(act.label, "Act");
+        // Other modes have no lenses.
+        for name in ["plan", "research", "autopilot"] {
+            let m = modes.iter().find(|m| m.name == name).unwrap();
+            assert!(m.lenses.is_empty(), "{name} should have no lenses");
+            assert!(!m.description.is_empty(), "{name} missing description");
+        }
+    }
+
+    #[test]
+    fn list_lenses_for_unknown_mode_is_empty() {
+        assert!(list_lenses_for("banana").is_empty());
+        assert!(list_lenses_for("plan").is_empty());
+    }
+
+    #[test]
+    fn list_lenses_for_act_has_three() {
+        let ls = list_lenses_for("act");
+        let names: Vec<&str> = ls.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, vec!["normal", "debug", "review"]);
+    }
+
+    #[test]
+    fn mode_prompt_for_profile_surfaces_mode_text() {
+        // Plan prompt mentions PLAN and read-only semantics.
+        let p = mode_prompt_for_profile("plan", None);
+        assert!(p.contains("PLAN"));
+        // Act prompt changes under the Debug lens.
+        let act_exec = mode_prompt_for_profile("act", Some("normal"));
+        let act_debug = mode_prompt_for_profile("act", Some("debug"));
+        assert_ne!(act_exec, act_debug);
+        assert!(act_debug.contains("Debug") || act_debug.contains("debug"));
+        // Legacy lens string "dbg" is accepted.
+        let act_dbg = mode_prompt_for_profile("act", Some("dbg"));
+        assert_eq!(act_dbg, act_debug);
+        // Unknown mode falls back to Plan.
+        let unknown = mode_prompt_for_profile("banana", None);
+        assert_eq!(unknown, p);
+    }
+}

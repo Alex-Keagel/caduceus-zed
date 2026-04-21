@@ -752,6 +752,7 @@ pub enum Effort {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
 }
 

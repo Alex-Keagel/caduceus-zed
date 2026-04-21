@@ -1668,7 +1668,11 @@ impl Thread {
     fn is_tool_allowed_in_current_mode(&self, tool_name: &str) -> bool {
         let mode = self.caduceus_mode_from_profile();
 
-        // Always allowed in any mode
+        // Always allowed in any mode — the escalation tool itself and
+        // sub-agent spawning. `caduceus_mode_request` remains an "always
+        // allowed" tool because if the LLM can't REQUEST a change, it can't
+        // escalate at all; but P9 rewrote its body so it no longer pretends
+        // the mode is automatically applied.
         let always_allowed = [
             "caduceus_mode_request",
             "spawn_agent",
@@ -1677,55 +1681,52 @@ impl Thread {
             return true;
         }
 
-        // Use engine's AgentMode for read-only classification
-        let is_read_only = caduceus_bridge::orchestrator::BridgeAgentMode::from_str_loose(mode)
-            .map(|m| matches!(m,
-                caduceus_bridge::orchestrator::BridgeAgentMode::Plan
-                | caduceus_bridge::orchestrator::BridgeAgentMode::Research
-                | caduceus_bridge::orchestrator::BridgeAgentMode::Architect
-                | caduceus_bridge::orchestrator::BridgeAgentMode::Review
-            ))
-            .unwrap_or(false);
-
-        if is_read_only {
-            let allowed_tools = [
-                // Zed built-in read tools (local only — no network)
-                "read_file", "find_path", "grep", "list_directory",
-                "diagnostics", "now", "open",
-                // Caduceus read-only tools (strictly no state mutation)
-                "caduceus_semantic_search", "caduceus_index",
-                "caduceus_code_graph", "caduceus_tree_sitter",
-                "caduceus_git_read", "caduceus_memory_read",
-                "caduceus_dependency_scan", "caduceus_security_scan",
-                "caduceus_error_analysis", "caduceus_mcp_security",
-                "caduceus_prd", "caduceus_progress",
-                "caduceus_telemetry", "caduceus_conversation",
-                "caduceus_marketplace",
-                "caduceus_project",
-                "caduceus_task_tree", "caduceus_time_tracking",
-                "caduceus_policy",
-                "caduceus_cross_search", "caduceus_api_registry",
-                "caduceus_architect", "caduceus_product",
-                // REMOVED from read-only: caduceus_wiki (write/delete),
-                // caduceus_project_wiki (write_page/auto_populate),
-                // caduceus_kanban (git worktree mutations),
-                // caduceus_checkpoint (create/restore),
-                // caduceus_storage (save/delete),
-                // caduceus_automations (add/remove/enable/disable),
-                // caduceus_scaffold (creates files)
-            ];
-            let allowed = allowed_tools.contains(&tool_name);
-            if !allowed {
-                log::warn!(
-                    "[caduceus] BLOCKED '{}' in {} mode. \
-                    Use caduceus_mode_request to escalate.",
-                    tool_name, mode
-                );
-            }
-            allowed
-        } else {
-            true // Ring 1+ allows everything
+        // P9: delegate the "does this mode permit writes?" question to the
+        // engine via the bridge instead of maintaining a parallel hardcoded
+        // catalog here. This fixes RC12 (the ring and the engine's envelope
+        // disagreeing on e.g. `web_fetch`). For the fine-grained
+        // per-folder / per-extension decision, the engine's envelope
+        // preflight is authoritative — see `PermissionEnvelope::preflight`.
+        //
+        // The small reverse-allowlist below only exists so the IDE has
+        // something sensible to do for tools whose write-ness we can't
+        // infer from name alone. When the envelope is wired end-to-end
+        // (the stretch goal of P9), this whole function collapses to a
+        // single `envelope.preflight(tool, path)` call.
+        if caduceus_bridge::orchestrator::mode_allows_writes(mode) {
+            return true;
         }
+
+        // Read-only mode: allow tools whose name structurally implies read
+        // or analysis. Anything else is conservatively denied; the user
+        // can grant scope expansion through the normal request flow.
+        const READ_ONLY_PREFIX_OR_NAME: &[&str] = &[
+            "read_file", "find_path", "grep", "list_directory",
+            "diagnostics", "now", "open", "web_fetch", "web_search",
+            // Caduceus read-only tools
+            "caduceus_semantic_search", "caduceus_index",
+            "caduceus_code_graph", "caduceus_tree_sitter",
+            "caduceus_git_read", "caduceus_memory_read",
+            "caduceus_dependency_scan", "caduceus_security_scan",
+            "caduceus_error_analysis", "caduceus_mcp_security",
+            "caduceus_prd", "caduceus_progress",
+            "caduceus_telemetry", "caduceus_conversation",
+            "caduceus_marketplace",
+            "caduceus_project",
+            "caduceus_task_tree", "caduceus_time_tracking",
+            "caduceus_policy",
+            "caduceus_cross_search", "caduceus_api_registry",
+            "caduceus_architect", "caduceus_product",
+        ];
+        let allowed = READ_ONLY_PREFIX_OR_NAME.contains(&tool_name);
+        if !allowed {
+            log::warn!(
+                "[caduceus] '{}' not in read-only allowlist for {} mode. \
+                Engine envelope will give the authoritative decision.",
+                tool_name, mode
+            );
+        }
+        allowed
     }
 
     /// Caduceus: unified max-token fallback for context budgeting.
@@ -3043,13 +3044,19 @@ impl Thread {
         // Caduceus: enforce privilege rings — block disallowed tools immediately
         if !self.is_tool_allowed_in_current_mode(tool_use.name.as_ref()) {
             let mode = self.caduceus_mode_from_profile();
+            // P9: neutral denial — no fake mode-switch instruction, no
+            // "DO NOT retry" sermon. The LLM gets a plain statement of
+            // fact plus a pointer at the scope-expansion channel. The
+            // footgun text that told the LLM to call `caduceus_mode_request`
+            // and then retry (RC10) is gone.
             let content = format!(
-                "PERMISSION DENIED: '{}' is blocked in {} mode. \
-                DO NOT retry — this is a permission issue, not a transient error. \
-                Ask the user: \"I need {} to complete this task. \
-                Shall I switch to Act mode?\" \
-                Then use caduceus_mode_request to request the change.",
-                tool_use.name, mode, tool_use.name
+                "Tool '{}' is not permitted by the current permission envelope \
+                (mode: {}). This is a permission decision, not a transient failure. \
+                If the user needs this capability, they can grant a scope expansion \
+                via the profile dropdown or the caduceus_mode_request tool; that \
+                request is not automatic. Continue with tools that are permitted, \
+                or surface the blocker to the user and wait.",
+                tool_use.name, mode
             );
             log::warn!("[caduceus] PERMISSION DENIED '{}' in {} mode", tool_use.name, mode);
             // Permission denials reset the circuit breaker (not real failures)
@@ -3965,19 +3972,21 @@ impl Thread {
         .context("failed to build system prompt")
         .expect("Invalid template");
 
-        // Inject Caduceus mode prefix into system prompt
+        // Inject Caduceus mode prefix into system prompt.
+        //
+        // P9: the prompt text comes from the engine via the bridge so there
+        // is a single source of truth. Zed no longer authors mode text.
+        // The legacy string-interpolated one-liner (`You are in X mode.
+        // {description}`) has been replaced with the full layered mode
+        // prompt that `AgentMode::config_with_lens` produces — same one the
+        // engine's `effective_system_prompt` uses.
         let system_prompt = {
-            use caduceus_bridge::orchestrator::BridgeAgentMode;
             let mode_str = self.caduceus_mode_from_profile();
-            let mode_prefix = if let Some(mode) = BridgeAgentMode::from_str_loose(mode_str) {
-                format!("You are in {} mode. {}\n\n", mode.name().to_uppercase(), mode.description())
-            } else {
-                String::new()
-            };
-            if mode_prefix.is_empty() {
+            let mode_text = caduceus_bridge::orchestrator::mode_prompt_for_profile(mode_str, None);
+            if mode_text.is_empty() {
                 system_prompt
             } else {
-                format!("{mode_prefix}{system_prompt}")
+                format!("{mode_text}\n\n{system_prompt}")
             }
         };
 
