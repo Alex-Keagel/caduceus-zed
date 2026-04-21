@@ -111,9 +111,7 @@ impl From<CaduceusProjectToolOutput> for LanguageModelToolResultContent {
     fn from(output: CaduceusProjectToolOutput) -> Self {
         match output {
             CaduceusProjectToolOutput::Text { text } => text.into(),
-            CaduceusProjectToolOutput::Error { error } => {
-                format!("Project error: {error}").into()
-            }
+            CaduceusProjectToolOutput::Error { error } => format!("Project error: {error}").into(),
         }
     }
 }
@@ -138,8 +136,7 @@ impl CaduceusProjectTool {
         }
         let data = std::fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read project.json: {e}"))?;
-        serde_json::from_str(&data)
-            .map_err(|e| format!("Failed to parse project.json: {e}"))
+        serde_json::from_str(&data).map_err(|e| format!("Failed to parse project.json: {e}"))
     }
 
     fn save_config(&self, config: &ProjectConfig) -> Result<(), String> {
@@ -152,8 +149,7 @@ impl CaduceusProjectTool {
         }
         let data = serde_json::to_string_pretty(config)
             .map_err(|e| format!("Failed to serialize config: {e}"))?;
-        std::fs::write(&config_path, data)
-            .map_err(|e| format!("Failed to write project.json: {e}"))
+        std::fs::write(&config_path, data).map_err(|e| format!("Failed to write project.json: {e}"))
     }
 }
 
@@ -195,22 +191,24 @@ impl AgentTool for CaduceusProjectTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusProjectToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusProjectToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             let result: Result<String, String> = match input.operation {
-                ProjectOperation::Load => {
-                    self.load_config().and_then(|config| {
-                        serde_json::to_string_pretty(&config)
-                            .map_err(|e| format!("Serialization error: {e}"))
-                    })
-                }
+                ProjectOperation::Load => self.load_config().and_then(|config| {
+                    serde_json::to_string_pretty(&config)
+                        .map_err(|e| format!("Serialization error: {e}"))
+                }),
                 ProjectOperation::Create { name, description } => {
                     let config = ProjectConfig {
-                        project: ProjectMeta { name: name.clone(), description },
+                        project: ProjectMeta {
+                            name: name.clone(),
+                            description,
+                        },
                         repos: BTreeMap::new(),
                         relationships: Vec::new(),
                     };
@@ -231,86 +229,89 @@ impl AgentTool for CaduceusProjectTool {
                         self.load_config().and_then(|mut config| {
                             config.repos.insert(
                                 name.clone(),
-                                RepoEntry { path, role, language, description },
+                                RepoEntry {
+                                    path,
+                                    role,
+                                    language,
+                                    description,
+                                },
                             );
-                            self.save_config(&config).map(|_| format!("Repo '{name}' added"))
+                            self.save_config(&config)
+                                .map(|_| format!("Repo '{name}' added"))
                         })
                     }
                 }
                 ProjectOperation::RemoveRepo { name } => {
                     self.load_config().and_then(|mut config| {
                         if config.repos.remove(&name).is_some() {
-                            config.relationships.retain(|r| r.from != name && r.to != name);
-                            self.save_config(&config).map(|_| format!("Repo '{name}' removed"))
+                            config
+                                .relationships
+                                .retain(|r| r.from != name && r.to != name);
+                            self.save_config(&config)
+                                .map(|_| format!("Repo '{name}' removed"))
                         } else {
                             Err(format!("Repo '{name}' not found"))
                         }
                     })
                 }
-                ProjectOperation::ListRepos => {
-                    self.load_config().map(|config| {
-                        if config.repos.is_empty() {
-                            "No repos configured".into()
-                        } else {
-                            let mut text = format!(
-                                "Project: {} — {} repos\n\n",
-                                config.project.name,
-                                config.repos.len()
-                            );
-                            for (name, repo) in &config.repos {
-                                text.push_str(&format!(
-                                    "- **{name}** ({}) — {} [{}]\n  {}\n",
-                                    repo.role, repo.language, repo.path, repo.description
-                                ));
-                            }
-                            text
+                ProjectOperation::ListRepos => self.load_config().map(|config| {
+                    if config.repos.is_empty() {
+                        "No repos configured".into()
+                    } else {
+                        let mut text = format!(
+                            "Project: {} — {} repos\n\n",
+                            config.project.name,
+                            config.repos.len()
+                        );
+                        for (name, repo) in &config.repos {
+                            text.push_str(&format!(
+                                "- **{name}** ({}) — {} [{}]\n  {}\n",
+                                repo.role, repo.language, repo.path, repo.description
+                            ));
                         }
-                    })
-                }
+                        text
+                    }
+                }),
                 ProjectOperation::AddRelationship {
                     from,
                     to,
                     relationship_type,
                     contract,
-                } => {
-                    self.load_config().and_then(|mut config| {
-                        if !config.repos.contains_key(&from) {
-                            return Err(format!("Repo '{from}' not found"));
+                } => self.load_config().and_then(|mut config| {
+                    if !config.repos.contains_key(&from) {
+                        return Err(format!("Repo '{from}' not found"));
+                    }
+                    if !config.repos.contains_key(&to) {
+                        return Err(format!("Repo '{to}' not found"));
+                    }
+                    config.relationships.push(Relationship {
+                        from: from.clone(),
+                        to: to.clone(),
+                        relationship_type: relationship_type.clone(),
+                        contract,
+                    });
+                    self.save_config(&config)
+                        .map(|_| format!("{from} → {to} ({relationship_type})"))
+                }),
+                ProjectOperation::ShowRelationships => self.load_config().map(|config| {
+                    if config.relationships.is_empty() {
+                        "No relationships configured".into()
+                    } else {
+                        let mut text = String::from("Relationships:\n");
+                        for r in &config.relationships {
+                            let contract = r
+                                .contract
+                                .as_deref()
+                                .map(|c| format!(" [contract: {c}]"))
+                                .unwrap_or_default();
+                            text.push_str(&format!(
+                                "- {} → {} ({}){}\n",
+                                r.from, r.to, r.relationship_type, contract
+                            ));
                         }
-                        if !config.repos.contains_key(&to) {
-                            return Err(format!("Repo '{to}' not found"));
-                        }
-                        config.relationships.push(Relationship {
-                            from: from.clone(),
-                            to: to.clone(),
-                            relationship_type: relationship_type.clone(),
-                            contract,
-                        });
-                        self.save_config(&config)
-                            .map(|_| format!("{from} → {to} ({relationship_type})"))
-                    })
-                }
-                ProjectOperation::ShowRelationships => {
-                    self.load_config().map(|config| {
-                        if config.relationships.is_empty() {
-                            "No relationships configured".into()
-                        } else {
-                            let mut text = String::from("Relationships:\n");
-                            for r in &config.relationships {
-                                let contract = r
-                                    .contract
-                                    .as_deref()
-                                    .map(|c| format!(" [contract: {c}]"))
-                                    .unwrap_or_default();
-                                text.push_str(&format!(
-                                    "- {} → {} ({}){}\n",
-                                    r.from, r.to, r.relationship_type, contract
-                                ));
-                            }
-                            text
-                        }
-                    })
-                }
+                        text
+                    }
+                }),
             };
 
             match result {
@@ -328,8 +329,8 @@ pub fn load_project_config(project_root: &std::path::Path) -> Result<ProjectConf
     if !path.exists() {
         return Err("No project.json found. Use `caduceus_project create` first.".into());
     }
-    let data = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read project.json: {e}"))?;
+    let data =
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read project.json: {e}"))?;
     serde_json::from_str(&data).map_err(|e| format!("Failed to parse project.json: {e}"))
 }
 
@@ -345,7 +346,10 @@ pub fn resolve_repo_path(
     repo_path: &str,
 ) -> Result<std::path::PathBuf, String> {
     if repo_path.contains("..") {
-        return Err(format!("Repo path '{}' contains '..' — path traversal not allowed", repo_path));
+        return Err(format!(
+            "Repo path '{}' contains '..' — path traversal not allowed",
+            repo_path
+        ));
     }
 
     let p = std::path::PathBuf::from(repo_path);
@@ -355,9 +359,9 @@ pub fn resolve_repo_path(
         project_root.join(repo_path)
     };
 
-    let canonical = resolved.canonicalize().map_err(|e| {
-        format!("Cannot resolve repo path '{}': {}", repo_path, e)
-    })?;
+    let canonical = resolved
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve repo path '{}': {}", repo_path, e))?;
 
     let project_canonical = project_root
         .canonicalize()

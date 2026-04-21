@@ -35,7 +35,11 @@ pub enum CaduceusErrorAnalysisToolOutput {
 impl From<CaduceusErrorAnalysisToolOutput> for LanguageModelToolResultContent {
     fn from(output: CaduceusErrorAnalysisToolOutput) -> Self {
         match output {
-            CaduceusErrorAnalysisToolOutput::Success { language, errors, analysis } => {
+            CaduceusErrorAnalysisToolOutput::Success {
+                language,
+                errors,
+                analysis,
+            } => {
                 let mut text = format!("Language: {language}\n");
                 if errors.is_empty() {
                     text.push_str("No parse errors detected.\n");
@@ -104,9 +108,12 @@ impl AgentTool for CaduceusErrorAnalysisTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let engine = self.engine.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusErrorAnalysisToolOutput::Error { error: format!("Failed to receive input: {e}") }
-            })?;
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusErrorAnalysisToolOutput::Error {
+                    error: format!("Failed to receive input: {e}"),
+                })?;
 
             let path = input.path.as_deref().unwrap_or("unknown");
             let language = engine.detect_language(std::path::Path::new(path));

@@ -61,17 +61,12 @@ impl From<CaduceusSecurityScanToolOutput> for LanguageModelToolResultContent {
                             f.severity,
                             f.category,
                             f.message,
-                            f.line
-                                .map(|l| format!(" (line {})", l))
-                                .unwrap_or_default()
+                            f.line.map(|l| format!(" (line {})", l)).unwrap_or_default()
                         ));
                     }
                 }
                 if !secrets_found.is_empty() {
-                    text.push_str(&format!(
-                        "\n## {} Exposed Secrets\n",
-                        secrets_found.len()
-                    ));
+                    text.push_str(&format!("\n## {} Exposed Secrets\n", secrets_found.len()));
                     for s in &secrets_found {
                         // Strip the redacted preview from the output: even an 8-char
                         // prefix can leak short secrets (passwords, short tokens).
@@ -137,11 +132,12 @@ impl AgentTool for CaduceusSecurityScanTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let engine = self.engine.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusSecurityScanToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusSecurityScanToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             let content = match &input.content {
                 Some(c) => c.clone(),
@@ -158,7 +154,9 @@ impl AgentTool for CaduceusSecurityScanTool {
                     let raw = std::path::Path::new(&input.path);
                     if raw.is_absolute() {
                         return Err(CaduceusSecurityScanToolOutput::Error {
-                            error: "Absolute paths not allowed — use relative paths from project root".to_string(),
+                            error:
+                                "Absolute paths not allowed — use relative paths from project root"
+                                    .to_string(),
                         });
                     }
                     if crate::tools::is_sensitive_file(&input.path) {
@@ -167,9 +165,8 @@ impl AgentTool for CaduceusSecurityScanTool {
                         });
                     }
                     let project_root = engine.project_root.clone();
-                    let project_canonical = project_root
-                        .canonicalize()
-                        .unwrap_or(project_root.clone());
+                    let project_canonical =
+                        project_root.canonicalize().unwrap_or(project_root.clone());
                     let resolved = project_root.join(&input.path);
                     let canonical = resolved.canonicalize().map_err(|e| {
                         CaduceusSecurityScanToolOutput::Error {
@@ -178,7 +175,10 @@ impl AgentTool for CaduceusSecurityScanTool {
                     })?;
                     if !canonical.starts_with(&project_canonical) {
                         return Err(CaduceusSecurityScanToolOutput::Error {
-                            error: format!("Path '{}' resolves outside the project root", input.path),
+                            error: format!(
+                                "Path '{}' resolves outside the project root",
+                                input.path
+                            ),
                         });
                     }
                     if crate::tools::is_sensitive_file(&canonical.to_string_lossy()) {
@@ -238,10 +238,7 @@ mod tests {
     #[test]
     fn redacts_preview_after_colon_space() {
         let raw = "[AWS_KEY] at position 12-32: AKIAIOSFODNN7EXAMPLE";
-        assert_eq!(
-            redact_secret_preview(raw),
-            "[AWS_KEY] at position 12-32"
-        );
+        assert_eq!(redact_secret_preview(raw), "[AWS_KEY] at position 12-32");
     }
 
     #[test]

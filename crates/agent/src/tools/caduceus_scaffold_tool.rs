@@ -90,11 +90,7 @@ impl AgentTool for CaduceusScaffoldTool {
                     format!("List {scaffold_type} templates").into()
                 }
                 ScaffoldOperation::Generate { description } => {
-                    format!(
-                        "Scaffold: {}",
-                        crate::tools::truncate_str(description, 40)
-                    )
-                    .into()
+                    format!("Scaffold: {}", crate::tools::truncate_str(description, 40)).into()
                 }
             }
         } else {
@@ -109,11 +105,12 @@ impl AgentTool for CaduceusScaffoldTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusScaffoldToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusScaffoldToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             match input.operation {
                 ScaffoldOperation::ListTemplates { scaffold_type } => {
@@ -128,10 +125,11 @@ impl AgentTool for CaduceusScaffoldTool {
                         "mcp" | "mcp_server" => caduceus_bridge::tools::ScaffoldType::McpServer,
                         _ => caduceus_bridge::tools::ScaffoldType::Skill,
                     };
-                    let templates = caduceus_bridge::tools::ToolsBridge::list_scaffold_templates(st)
-                        .into_iter()
-                        .map(|s| s.to_string())
-                        .collect();
+                    let templates =
+                        caduceus_bridge::tools::ToolsBridge::list_scaffold_templates(st)
+                            .into_iter()
+                            .map(|s| s.to_string())
+                            .collect();
                     Ok(CaduceusScaffoldToolOutput::Templates { templates })
                 }
                 ScaffoldOperation::Generate { description } => {

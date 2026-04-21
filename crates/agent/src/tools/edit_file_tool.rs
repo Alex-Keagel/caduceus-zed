@@ -35,10 +35,7 @@ const DEFAULT_UI_TEXT: &str = "Editing file";
 /// side is None matches the "skip the check" pessimistic-permissive
 /// behavior used at the call site (we'd rather miss a stale-write than
 /// spuriously block an edit on a filesystem with no mtime).
-pub(crate) fn mtime_changed(
-    last_read: Option<fs::MTime>,
-    current: Option<fs::MTime>,
-) -> bool {
+pub(crate) fn mtime_changed(last_read: Option<fs::MTime>, current: Option<fs::MTime>) -> bool {
     match (last_read, current) {
         (Some(a), Some(b)) => a != b,
         _ => false,

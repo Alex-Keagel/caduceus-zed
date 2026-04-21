@@ -89,14 +89,21 @@ impl AgentTool for CaduceusModeRequestTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusModeRequestToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusModeRequestToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             let valid_modes = [
-                "plan", "act", "research", "autopilot", "architect", "debug", "review",
+                "plan",
+                "act",
+                "research",
+                "autopilot",
+                "architect",
+                "debug",
+                "review",
             ];
 
             if !valid_modes.contains(&input.mode.as_str()) {

@@ -52,9 +52,7 @@ pub enum KanbanOperation {
         card_id: String,
     },
     /// Mark a card as complete — auto-starts any unblocked dependents
-    CompleteCard {
-        card_id: String,
-    },
+    CompleteCard { card_id: String },
     /// List cards that are ready to start (all dependencies met)
     ReadyCards,
 }
@@ -62,13 +60,29 @@ pub enum KanbanOperation {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CaduceusKanbanToolOutput {
-    Board { board: String },
-    CardAdded { card_id: String, message: String },
-    Moved { message: String },
-    Linked { message: String },
-    Completed { message: String, auto_started: Vec<String> },
-    Ready { cards: Vec<String> },
-    Error { error: String },
+    Board {
+        board: String,
+    },
+    CardAdded {
+        card_id: String,
+        message: String,
+    },
+    Moved {
+        message: String,
+    },
+    Linked {
+        message: String,
+    },
+    Completed {
+        message: String,
+        auto_started: Vec<String>,
+    },
+    Ready {
+        cards: Vec<String>,
+    },
+    Error {
+        error: String,
+    },
 }
 
 impl From<CaduceusKanbanToolOutput> for LanguageModelToolResultContent {
@@ -80,7 +94,10 @@ impl From<CaduceusKanbanToolOutput> for LanguageModelToolResultContent {
             }
             CaduceusKanbanToolOutput::Moved { message } => message.into(),
             CaduceusKanbanToolOutput::Linked { message } => message.into(),
-            CaduceusKanbanToolOutput::Completed { message, auto_started } => {
+            CaduceusKanbanToolOutput::Completed {
+                message,
+                auto_started,
+            } => {
                 if auto_started.is_empty() {
                     message.into()
                 } else {
@@ -98,9 +115,7 @@ impl From<CaduceusKanbanToolOutput> for LanguageModelToolResultContent {
                     text.into()
                 }
             }
-            CaduceusKanbanToolOutput::Error { error } => {
-                format!("Kanban error: {error}").into()
-            }
+            CaduceusKanbanToolOutput::Error { error } => format!("Kanban error: {error}").into(),
         }
     }
 }
@@ -112,13 +127,24 @@ pub struct CaduceusKanbanTool {
 
 impl CaduceusKanbanTool {
     pub fn new(project_root: PathBuf, engine: Arc<CaduceusEngine>) -> Self {
-        Self { project_root, engine }
+        Self {
+            project_root,
+            engine,
+        }
     }
 
     fn worktree_path(branch: &str) -> Result<String, String> {
         // SEC-19: Validate branch names to prevent path traversal
-        if branch.is_empty() || branch.contains("..") || branch.contains('/') || branch.contains('\\') || branch.starts_with('-') {
-            return Err(format!("Invalid branch name '{}' — must not contain ../ or path separators", branch));
+        if branch.is_empty()
+            || branch.contains("..")
+            || branch.contains('/')
+            || branch.contains('\\')
+            || branch.starts_with('-')
+        {
+            return Err(format!(
+                "Invalid branch name '{}' — must not contain ../ or path separators",
+                branch
+            ));
         }
         if branch.len() > 64 {
             return Err("Branch name too long (max 64 chars)".to_string());
@@ -127,8 +153,7 @@ impl CaduceusKanbanTool {
     }
 
     fn load_or_create_board(&self) -> Result<KanbanBoard, String> {
-        KanbanBoard::load_or_new(&self.project_root, "Caduceus Board")
-            .map_err(|e| format!("{e}"))
+        KanbanBoard::load_or_new(&self.project_root, "Caduceus Board").map_err(|e| format!("{e}"))
     }
 
     fn save_board(&self, board: &KanbanBoard) -> Result<(), String> {
@@ -146,17 +171,10 @@ impl CaduceusKanbanTool {
                 .iter()
                 .filter(|c| c.column_id == col.id)
                 .collect();
-            text.push_str(&format!(
-                "## {} ({} cards)\n",
-                col.name,
-                cards_in_col.len()
-            ));
+            text.push_str(&format!("## {} ({} cards)\n", col.name, cards_in_col.len()));
             for card in cards_in_col {
                 let status = format!("{:?}", card.status);
-                let branch = card
-                    .worktree_branch
-                    .as_deref()
-                    .unwrap_or("no branch");
+                let branch = card.worktree_branch.as_deref().unwrap_or("no branch");
                 let deps = if card.dependencies.is_empty() {
                     String::new()
                 } else {
@@ -211,27 +229,25 @@ impl AgentTool for CaduceusKanbanTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusKanbanToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusKanbanToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             let lock_path = self.project_root.join(".caduceus/kanban.json");
-            let _lock = acquire_file_lock(&lock_path).map_err(|e| {
-                CaduceusKanbanToolOutput::Error { error: e }
-            })?;
+            let _lock = acquire_file_lock(&lock_path)
+                .map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
 
-            let mut board = self.load_or_create_board().map_err(|e| {
-                CaduceusKanbanToolOutput::Error { error: e }
-            })?;
+            let mut board = self
+                .load_or_create_board()
+                .map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
 
             let result = match input.operation {
-                KanbanOperation::ShowBoard => {
-                    CaduceusKanbanToolOutput::Board {
-                        board: Self::render_board(&board),
-                    }
-                }
+                KanbanOperation::ShowBoard => CaduceusKanbanToolOutput::Board {
+                    board: Self::render_board(&board),
+                },
                 KanbanOperation::AddCard {
                     title,
                     description,
@@ -242,14 +258,13 @@ impl AgentTool for CaduceusKanbanTool {
                     card.worktree_branch = worktree_branch;
                     card.auto_commit = auto_commit;
                     let card_id = card.id.clone();
-                    board.add_card(card).map_err(|e| {
-                        CaduceusKanbanToolOutput::Error {
+                    board
+                        .add_card(card)
+                        .map_err(|e| CaduceusKanbanToolOutput::Error {
                             error: format!("{e}"),
-                        }
-                    })?;
-                    self.save_board(&board).map_err(|e| {
-                        CaduceusKanbanToolOutput::Error { error: e }
-                    })?;
+                        })?;
+                    self.save_board(&board)
+                        .map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
                     CaduceusKanbanToolOutput::CardAdded {
                         card_id,
                         message: format!("Added card: {title}"),
@@ -260,7 +275,8 @@ impl AgentTool for CaduceusKanbanTool {
                     if column_id == "in-progress" {
                         if let Some(card) = board.cards.iter().find(|c| c.id == card_id) {
                             if let Some(branch) = &card.worktree_branch {
-                                let wt_path = Self::worktree_path(branch).map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
+                                let wt_path = Self::worktree_path(branch)
+                                    .map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
                                 let _ = self.engine.git_create_worktree(branch, &wt_path);
                             }
                         }
@@ -270,9 +286,8 @@ impl AgentTool for CaduceusKanbanTool {
                             error: format!("{e}"),
                         }
                     })?;
-                    self.save_board(&board).map_err(|e| {
-                        CaduceusKanbanToolOutput::Error { error: e }
-                    })?;
+                    self.save_board(&board)
+                        .map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
                     CaduceusKanbanToolOutput::Moved {
                         message: format!("Moved {card_id} → {column_id}"),
                     }
@@ -286,9 +301,8 @@ impl AgentTool for CaduceusKanbanTool {
                             error: format!("{e}"),
                         }
                     })?;
-                    self.save_board(&board).map_err(|e| {
-                        CaduceusKanbanToolOutput::Error { error: e }
-                    })?;
+                    self.save_board(&board)
+                        .map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
                     CaduceusKanbanToolOutput::Linked {
                         message: format!("{card_id} now depends on {dependency_id}"),
                     }
@@ -301,16 +315,16 @@ impl AgentTool for CaduceusKanbanTool {
                         .find(|c| c.id == card_id)
                         .and_then(|c| c.worktree_branch.clone());
 
-                    let auto_started =
-                        board.on_card_complete(&card_id).map_err(|e| {
-                            CaduceusKanbanToolOutput::Error {
-                                error: format!("{e}"),
-                            }
-                        })?;
+                    let auto_started = board.on_card_complete(&card_id).map_err(|e| {
+                        CaduceusKanbanToolOutput::Error {
+                            error: format!("{e}"),
+                        }
+                    })?;
 
                     // Remove worktree for the completed card
                     if let Some(branch) = &completed_branch {
-                        let wt_path = Self::worktree_path(branch).map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
+                        let wt_path = Self::worktree_path(branch)
+                            .map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
                         let _ = self.engine.git_remove_worktree(&wt_path);
                     }
 
@@ -319,15 +333,15 @@ impl AgentTool for CaduceusKanbanTool {
                         let id_part = started_id.split(':').next().unwrap_or(started_id);
                         if let Some(card) = board.cards.iter().find(|c| c.id == id_part) {
                             if let Some(branch) = &card.worktree_branch {
-                                let wt_path = Self::worktree_path(branch).map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
+                                let wt_path = Self::worktree_path(branch)
+                                    .map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
                                 let _ = self.engine.git_create_worktree(branch, &wt_path);
                             }
                         }
                     }
 
-                    self.save_board(&board).map_err(|e| {
-                        CaduceusKanbanToolOutput::Error { error: e }
-                    })?;
+                    self.save_board(&board)
+                        .map_err(|e| CaduceusKanbanToolOutput::Error { error: e })?;
                     CaduceusKanbanToolOutput::Completed {
                         message: format!("Completed: {card_id}"),
                         auto_started,

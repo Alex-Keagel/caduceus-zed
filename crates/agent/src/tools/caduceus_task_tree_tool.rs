@@ -114,16 +114,15 @@ impl AgentTool for CaduceusTaskTreeTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let tree = self.tree.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusTaskTreeToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusTaskTreeToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
-            let mut guard = tree.lock().map_err(|e| {
-                CaduceusTaskTreeToolOutput::Error {
-                    error: format!("Lock poisoned: {e}"),
-                }
+            let mut guard = tree.lock().map_err(|e| CaduceusTaskTreeToolOutput::Error {
+                error: format!("Lock poisoned: {e}"),
             })?;
 
             let text = match input.operation {
@@ -145,8 +144,9 @@ impl AgentTool for CaduceusTaskTreeTool {
                     format!("Added task {id}: {full_title}")
                 }
                 TaskTreeOperation::Children { parent_id } => {
-                    let children =
-                        caduceus_bridge::orchestrator::OrchestratorBridge::children(&guard, parent_id);
+                    let children = caduceus_bridge::orchestrator::OrchestratorBridge::children(
+                        &guard, parent_id,
+                    );
                     if children.is_empty() {
                         format!("No children for task {parent_id}")
                     } else {
@@ -171,9 +171,8 @@ impl AgentTool for CaduceusTaskTreeTool {
                     }
                 }
                 TaskTreeOperation::ToTreeString => {
-                    let s = caduceus_bridge::orchestrator::OrchestratorBridge::to_tree_string(
-                        &guard,
-                    );
+                    let s =
+                        caduceus_bridge::orchestrator::OrchestratorBridge::to_tree_string(&guard);
                     if s.is_empty() {
                         "Empty task tree".to_string()
                     } else {
@@ -199,9 +198,7 @@ impl AgentTool for CaduceusTaskTreeTool {
                                     .filter(|c| c.is_alphanumeric() || *c == '_')
                                     .collect::<String>();
                                 let node_id = format!("n{depth}_{id}");
-                                mermaid.push_str(&format!(
-                                    "  {node_id}[\"{label}\"]\n"
-                                ));
+                                mermaid.push_str(&format!("  {node_id}[\"{label}\"]\n"));
                             }
                         }
                         mermaid.push_str("```");

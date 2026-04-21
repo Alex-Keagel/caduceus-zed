@@ -130,17 +130,18 @@ impl AgentTool for CaduceusMarketplaceTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let bridge = self.bridge.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusMarketplaceToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusMarketplaceToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
-            let mut guard = bridge.lock().map_err(|e| {
-                CaduceusMarketplaceToolOutput::Error {
+            let mut guard = bridge
+                .lock()
+                .map_err(|e| CaduceusMarketplaceToolOutput::Error {
                     error: format!("Lock poisoned: {e}"),
-                }
-            })?;
+                })?;
 
             let text = match input.operation {
                 MarketplaceOperation::Search { query } => {
@@ -207,8 +208,17 @@ impl AgentTool for CaduceusMarketplaceTool {
                     patterns,
                 } => {
                     let pattern_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
-                    guard.ingest_session(&session_id, &pattern_refs.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-                    format!("✅ Ingested {} patterns from session {session_id}", patterns.len())
+                    guard.ingest_session(
+                        &session_id,
+                        &pattern_refs
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>(),
+                    );
+                    format!(
+                        "✅ Ingested {} patterns from session {session_id}",
+                        patterns.len()
+                    )
                 }
                 MarketplaceOperation::TopPatterns { count } => {
                     let patterns = guard.top_patterns(count);

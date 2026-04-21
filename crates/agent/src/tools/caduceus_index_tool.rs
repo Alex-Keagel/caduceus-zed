@@ -39,9 +39,7 @@ impl From<CaduceusIndexToolOutput> for LanguageModelToolResultContent {
                 "Indexed {chunks_indexed} new chunks. Total chunks in index: {total_chunks}."
             )
             .into(),
-            CaduceusIndexToolOutput::Error { error } => {
-                format!("Indexing error: {error}").into()
-            }
+            CaduceusIndexToolOutput::Error { error } => format!("Indexing error: {error}").into(),
         }
     }
 }
@@ -86,17 +84,20 @@ impl AgentTool for CaduceusIndexTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let engine = self.engine.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusIndexToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusIndexToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             let path = PathBuf::from(&input.path);
 
             // Validate path is within project root (prevent indexing arbitrary filesystem paths)
             let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
-            let canonical_root = engine.project_root.canonicalize()
+            let canonical_root = engine
+                .project_root
+                .canonicalize()
                 .unwrap_or_else(|_| engine.project_root.clone());
             if !canonical_path.starts_with(&canonical_root) {
                 return Err(CaduceusIndexToolOutput::Error {

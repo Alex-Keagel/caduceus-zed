@@ -46,9 +46,7 @@ impl From<CaduceusProductToolOutput> for LanguageModelToolResultContent {
     fn from(output: CaduceusProductToolOutput) -> Self {
         match output {
             CaduceusProductToolOutput::Text { text } => text.into(),
-            CaduceusProductToolOutput::Error { error } => {
-                format!("Product error: {error}").into()
-            }
+            CaduceusProductToolOutput::Error { error } => format!("Product error: {error}").into(),
         }
     }
 }
@@ -202,7 +200,8 @@ impl CaduceusProductTool {
         if let Some(features) = milestone["features"].as_array() {
             text.push_str(&format!("\n## Features ({})\n", features.len()));
 
-            let all_features = self.load_product_section()
+            let all_features = self
+                .load_product_section()
                 .and_then(|p| p.get("features").and_then(|f| f.as_array().cloned()));
 
             for feat_name in features {
@@ -241,7 +240,11 @@ impl CaduceusProductTool {
                             .as_array()
                             .map(|d| d.len())
                             .unwrap_or(0);
-                        let priority = if deps == 0 { "🟢 no deps" } else { "🟡 has deps" };
+                        let priority = if deps == 0 {
+                            "🟢 no deps"
+                        } else {
+                            "🟡 has deps"
+                        };
                         text.push_str(&format!("- {title} ({priority})\n"));
                     }
                     text.push('\n');
@@ -307,9 +310,7 @@ impl AgentTool for CaduceusProductTool {
             match &input.operation {
                 ProductOperation::Status => "Project status".into(),
                 ProductOperation::Features => "List features".into(),
-                ProductOperation::Milestone { name } => {
-                    format!("Milestone: {name}").into()
-                }
+                ProductOperation::Milestone { name } => format!("Milestone: {name}").into(),
                 ProductOperation::Next => "Recommend next work".into(),
             }
         } else {
@@ -324,15 +325,16 @@ impl AgentTool for CaduceusProductTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusProductToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusProductToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
-            let config = self.load_project_config().map_err(|e| {
-                CaduceusProductToolOutput::Error { error: e }
-            })?;
+            let config = self
+                .load_project_config()
+                .map_err(|e| CaduceusProductToolOutput::Error { error: e })?;
 
             match input.operation {
                 ProductOperation::Status => {

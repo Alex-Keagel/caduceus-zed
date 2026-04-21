@@ -149,17 +149,13 @@ impl AgentTool for CaduceusCrossSearchTool {
     ) -> SharedString {
         if let Ok(input) = input {
             match &input.operation {
-                CrossSearchOperation::Search { query } => {
-                    format!(
-                        "Cross-repo search: \"{}\"",
-                        crate::tools::truncate_str(query, 40)
-                    )
-                    .into()
-                }
+                CrossSearchOperation::Search { query } => format!(
+                    "Cross-repo search: \"{}\"",
+                    crate::tools::truncate_str(query, 40)
+                )
+                .into(),
                 CrossSearchOperation::ListRepos => "List project repos".into(),
-                CrossSearchOperation::IndexRepo { name } => {
-                    format!("Index repo: {name}").into()
-                }
+                CrossSearchOperation::IndexRepo { name } => format!("Index repo: {name}").into(),
             }
         } else {
             "Cross-repo search".into()
@@ -173,15 +169,16 @@ impl AgentTool for CaduceusCrossSearchTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusCrossSearchToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusCrossSearchToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
-            let config = self.load_project_config().map_err(|e| {
-                CaduceusCrossSearchToolOutput::Error { error: e }
-            })?;
+            let config = self
+                .load_project_config()
+                .map_err(|e| CaduceusCrossSearchToolOutput::Error { error: e })?;
 
             match input.operation {
                 CrossSearchOperation::Search { query } => {
@@ -194,8 +191,7 @@ impl AgentTool for CaduceusCrossSearchTool {
                                 continue;
                             }
                         };
-                        let engine =
-                            caduceus_bridge::engine::CaduceusEngine::new(&repo_path);
+                        let engine = caduceus_bridge::engine::CaduceusEngine::new(&repo_path);
                         match engine
                             .semantic_search_as(
                                 format!("tool:caduceus_cross_search:{name}"),
@@ -207,11 +203,8 @@ impl AgentTool for CaduceusCrossSearchTool {
                         {
                             Ok(hits) => {
                                 for (content, score) in hits {
-                                    let path = content
-                                        .lines()
-                                        .next()
-                                        .unwrap_or("unknown")
-                                        .to_string();
+                                    let path =
+                                        content.lines().next().unwrap_or("unknown").to_string();
                                     // Skip sensitive files
                                     if crate::tools::is_sensitive_file(&path) {
                                         continue;
@@ -225,17 +218,20 @@ impl AgentTool for CaduceusCrossSearchTool {
                                 }
                             }
                             Err(e) => {
-                                log::warn!(
-                                    "[caduceus] Cross-search failed for repo {name}: {e}"
-                                );
+                                log::warn!("[caduceus] Cross-search failed for repo {name}: {e}");
                             }
                         }
                     }
-                    all_results
-                        .sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or_else(|| {
+                    all_results.sort_by(|a, b| {
+                        b.score.partial_cmp(&a.score).unwrap_or_else(|| {
                             // NaN scores pushed to end
-                            if a.score.is_nan() { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
-                        }));
+                            if a.score.is_nan() {
+                                std::cmp::Ordering::Greater
+                            } else {
+                                std::cmp::Ordering::Less
+                            }
+                        })
+                    });
                     all_results.truncate(10);
                     Ok(CaduceusCrossSearchToolOutput::SearchResults {
                         results: all_results,
@@ -245,17 +241,15 @@ impl AgentTool for CaduceusCrossSearchTool {
                     let repos: Vec<RepoIndexInfo> = config
                         .repos
                         .iter()
-                        .filter_map(|(name, repo)| {
-                            match self.resolve_repo_path(&repo.path) {
-                                Ok(repo_path) => Some(RepoIndexInfo {
-                                    name: name.clone(),
-                                    path: repo.path.clone(),
-                                    chunk_count: self.count_index_chunks(&repo_path),
-                                }),
-                                Err(e) => {
-                                    log::warn!("[caduceus] Skipping repo {name}: {e}");
-                                    None
-                                }
+                        .filter_map(|(name, repo)| match self.resolve_repo_path(&repo.path) {
+                            Ok(repo_path) => Some(RepoIndexInfo {
+                                name: name.clone(),
+                                path: repo.path.clone(),
+                                chunk_count: self.count_index_chunks(&repo_path),
+                            }),
+                            Err(e) => {
+                                log::warn!("[caduceus] Skipping repo {name}: {e}");
+                                None
                             }
                         })
                         .collect();
@@ -267,11 +261,10 @@ impl AgentTool for CaduceusCrossSearchTool {
                             error: format!("Repo '{name}' not found in project.json"),
                         }
                     })?;
-                    let repo_path = self.resolve_repo_path(&repo.path).map_err(|e| {
-                        CaduceusCrossSearchToolOutput::Error { error: e }
-                    })?;
-                    let engine =
-                        caduceus_bridge::engine::CaduceusEngine::new(&repo_path);
+                    let repo_path = self
+                        .resolve_repo_path(&repo.path)
+                        .map_err(|e| CaduceusCrossSearchToolOutput::Error { error: e })?;
+                    let engine = caduceus_bridge::engine::CaduceusEngine::new(&repo_path);
                     match engine
                         .index_directory_as(
                             format!("tool:caduceus_cross_search:index:{name}"),

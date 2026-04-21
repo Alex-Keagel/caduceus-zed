@@ -80,12 +80,8 @@ impl AgentTool for CaduceusMemoryWriteTool {
     ) -> SharedString {
         if let Ok(input) = input {
             match &input.operation {
-                MemoryWriteOperation::Store { key, .. } => {
-                    format!("Store memory: {key}").into()
-                }
-                MemoryWriteOperation::Delete { key } => {
-                    format!("Delete memory: {key}").into()
-                }
+                MemoryWriteOperation::Store { key, .. } => format!("Store memory: {key}").into(),
+                MemoryWriteOperation::Delete { key } => format!("Delete memory: {key}").into(),
             }
         } else {
             "Write memory".into()
@@ -100,11 +96,12 @@ impl AgentTool for CaduceusMemoryWriteTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let project_root = self.project_root.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusMemoryWriteToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusMemoryWriteToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             match input.operation {
                 MemoryWriteOperation::Store { key, value } => {

@@ -541,9 +541,7 @@ impl ReducerHandle {
     /// View the handle as an [`IntrospectionSink`] trait object. Hands
     /// out a `&dyn IntrospectionSink` backed by this same handle so
     /// callers can feed it straight into the critique fan-out driver.
-    pub fn as_sink(
-        &self,
-    ) -> &(dyn caduceus_orchestrator::critique_fanout::IntrospectionSink + '_) {
+    pub fn as_sink(&self) -> &(dyn caduceus_orchestrator::critique_fanout::IntrospectionSink + '_) {
         self
     }
 
@@ -980,7 +978,10 @@ mod tests {
         IntrospectionSink::emit(&h, ev).await;
         let snap = h.active_session_snapshot(true);
         assert!(snap.envelope.is_some());
-        assert_eq!(snap.envelope.as_ref().unwrap().display_text.as_deref(), Some("demo"));
+        assert_eq!(
+            snap.envelope.as_ref().unwrap().display_text.as_deref(),
+            Some("demo")
+        );
         // Redacted view strips display_text.
         let redacted = h.active_session_snapshot(false);
         assert!(redacted.envelope.as_ref().unwrap().display_text.is_none());

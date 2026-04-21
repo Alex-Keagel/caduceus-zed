@@ -98,15 +98,20 @@ impl AgentTool for CaduceusMcpSecurityTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let engine = self.engine.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusMcpSecurityToolOutput::Error { error: format!("Failed to receive input: {e}") }
-            })?;
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusMcpSecurityToolOutput::Error {
+                    error: format!("Failed to receive input: {e}"),
+                })?;
 
             let result = match input.operation {
                 McpSecurityOperation::CheckTyposquatting { tool_name } => {
                     let known_tools = &["read_file", "write_file", "execute", "search", "list_dir"];
                     match engine.mcp_check_typosquatting(&tool_name, known_tools) {
-                        Some(similar) => format!("⚠️ '{tool_name}' looks like typosquatting of '{similar}'!"),
+                        Some(similar) => {
+                            format!("⚠️ '{tool_name}' looks like typosquatting of '{similar}'!")
+                        }
                         None => format!("✅ '{tool_name}' appears legitimate."),
                     }
                 }
@@ -115,7 +120,8 @@ impl AgentTool for CaduceusMcpSecurityTool {
                     if findings.is_empty() {
                         "✅ No hidden instructions found.".to_string()
                     } else {
-                        let mut text = format!("⚠️ {} hidden instructions detected:\n", findings.len());
+                        let mut text =
+                            format!("⚠️ {} hidden instructions detected:\n", findings.len());
                         for f in &findings {
                             text.push_str(&format!("- {f}\n"));
                         }

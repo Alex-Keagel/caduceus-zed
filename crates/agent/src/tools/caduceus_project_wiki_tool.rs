@@ -11,15 +11,6 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput};
 
 use super::caduceus_project_tool::ProjectConfig;
 
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
-}
-
 /// Manage a file-based project wiki under `.caduceus/wiki/`. Supports reading,
 /// writing, listing, searching, and auto-populating wiki pages from project config.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -109,8 +100,7 @@ impl CaduceusProjectWikiTool {
         if !path.exists() {
             return Err(format!("Page '{page}' not found"));
         }
-        std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read page '{page}': {e}"))
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read page '{page}': {e}"))
     }
 
     fn write_page(&self, page: &str, content: &str) -> Result<(), String> {
@@ -121,8 +111,7 @@ impl CaduceusProjectWikiTool {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create wiki directory: {e}"))?;
         }
-        std::fs::write(&path, content)
-            .map_err(|e| format!("Failed to write page '{page}': {e}"))
+        std::fs::write(&path, content).map_err(|e| format!("Failed to write page '{page}': {e}"))
     }
 
     fn list_pages_recursive(&self, dir: &Path, prefix: &str) -> Vec<String> {
@@ -253,7 +242,16 @@ impl CaduceusProjectWikiTool {
             );
 
             // Try reading README from the repo
-            let repo_path = match crate::tools::caduceus_project_tool::resolve_repo_path(&self.project_root, &repo.path) { Ok(p) => p, Err(e) => { log::warn!("[caduceus] Skipping repo {}: {}", name, e); continue; } };
+            let repo_path = match crate::tools::caduceus_project_tool::resolve_repo_path(
+                &self.project_root,
+                &repo.path,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("[caduceus] Skipping repo {}: {}", name, e);
+                    continue;
+                }
+            };
             if let Ok(readme) = std::fs::read_to_string(repo_path.join("README.md")) {
                 let truncated: String = readme.lines().take(50).collect::<Vec<_>>().join("\n");
                 page.push_str(&format!("\n## README (excerpt)\n\n{truncated}\n"));
@@ -268,8 +266,22 @@ impl CaduceusProjectWikiTool {
         let mut api_page = String::from("# API Index\n\n");
         let mut found_apis = false;
         for (name, repo) in &config.repos {
-            let repo_path = match crate::tools::caduceus_project_tool::resolve_repo_path(&self.project_root, &repo.path) { Ok(p) => p, Err(e) => { log::warn!("[caduceus] Skipping repo {}: {}", name, e); continue; } };
-            let api_files = ["openapi.yaml", "openapi.json", "swagger.json", "swagger.yaml"];
+            let repo_path = match crate::tools::caduceus_project_tool::resolve_repo_path(
+                &self.project_root,
+                &repo.path,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("[caduceus] Skipping repo {}: {}", name, e);
+                    continue;
+                }
+            };
+            let api_files = [
+                "openapi.yaml",
+                "openapi.json",
+                "swagger.json",
+                "swagger.yaml",
+            ];
             for api_file in &api_files {
                 if repo_path.join(api_file).exists() {
                     api_page.push_str(&format!("- **{name}**: `{api_file}`\n"));
@@ -320,7 +332,11 @@ impl CaduceusProjectWikiTool {
         Ok(format!(
             "Auto-populated {} wiki pages:\n{}",
             generated.len(),
-            generated.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")
+            generated
+                .iter()
+                .map(|p| format!("- {p}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         ))
     }
 }

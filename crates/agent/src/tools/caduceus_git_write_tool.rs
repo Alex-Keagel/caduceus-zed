@@ -131,11 +131,12 @@ impl AgentTool for CaduceusGitWriteTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let engine = self.engine.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusGitWriteToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusGitWriteToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             let result = match input.operation {
                 GitWriteOperation::Stage { paths } => engine

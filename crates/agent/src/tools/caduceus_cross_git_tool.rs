@@ -30,9 +30,7 @@ pub enum CrossGitOperation {
         count: usize,
     },
     /// Create the same branch in all repos
-    CreateBranchAll {
-        branch_name: String,
-    },
+    CreateBranchAll { branch_name: String },
     /// Show which repos have uncommitted changes
     DirtyRepos,
 }
@@ -72,7 +70,8 @@ impl CaduceusCrossGitTool {
         let config = super::caduceus_project_tool::load_project_config(&self.project_root)?;
         let mut result: Vec<(String, PathBuf)> = Vec::new();
         for (name, repo) in &config.repos {
-            let path = super::caduceus_project_tool::resolve_repo_path(&self.project_root, &repo.path)?;
+            let path =
+                super::caduceus_project_tool::resolve_repo_path(&self.project_root, &repo.path)?;
             result.push((name.clone(), path));
         }
         Ok(result)
@@ -99,9 +98,11 @@ impl AgentTool for CaduceusCrossGitTool {
                 CrossGitOperation::StatusAll => "Git status (all repos)".into(),
                 CrossGitOperation::BranchAll => "Git branches (all repos)".into(),
                 CrossGitOperation::LogAll { .. } => "Git log (all repos)".into(),
-                CrossGitOperation::CreateBranchAll { branch_name } => {
-                    format!("Create branch '{}' (all repos)", crate::tools::truncate_str(branch_name, 20)).into()
-                }
+                CrossGitOperation::CreateBranchAll { branch_name } => format!(
+                    "Create branch '{}' (all repos)",
+                    crate::tools::truncate_str(branch_name, 20)
+                )
+                .into(),
                 CrossGitOperation::DirtyRepos => "Dirty repos".into(),
             }
         } else {
@@ -116,15 +117,16 @@ impl AgentTool for CaduceusCrossGitTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusCrossGitToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusCrossGitToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
-            let repos = self.load_repos().map_err(|e| {
-                CaduceusCrossGitToolOutput::Error { error: e }
-            })?;
+            let repos = self
+                .load_repos()
+                .map_err(|e| CaduceusCrossGitToolOutput::Error { error: e })?;
 
             if repos.is_empty() {
                 return Ok(CaduceusCrossGitToolOutput::Success {
@@ -140,7 +142,11 @@ impl AgentTool for CaduceusCrossGitTool {
                     for (name, path) in &repos {
                         let git_repo = caduceus_git::GitRepo::discover(path);
                         output.push_str(&format!("### {}\n", name));
-                        match git_repo.as_ref().map_err(|e| e.to_string()).and_then(|r| r.status().map_err(|e| e.to_string())) {
+                        match git_repo
+                            .as_ref()
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r.status().map_err(|e| e.to_string()))
+                        {
                             Ok(entries) if entries.is_empty() => {
                                 output.push_str("Clean ✅\n\n");
                             }
@@ -158,20 +164,34 @@ impl AgentTool for CaduceusCrossGitTool {
                     output.push_str("## Branches — All Repos\n\n");
                     for (name, path) in &repos {
                         let git_repo = caduceus_git::GitRepo::discover(path);
-                        let branch = git_repo.as_ref().map_err(|e| e.to_string()).and_then(|r| r.current_branch().map_err(|e| e.to_string())).unwrap_or_else(|e| format!("error: {e}"));
+                        let branch = git_repo
+                            .as_ref()
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r.current_branch().map_err(|e| e.to_string()))
+                            .unwrap_or_else(|e| format!("error: {e}"));
                         output.push_str(&format!("- **{}**: {}\n", name, branch));
                     }
                 }
                 CrossGitOperation::LogAll { count } => {
-                    output.push_str(&format!("## Recent Commits — All Repos (last {})\n\n", count));
+                    output.push_str(&format!(
+                        "## Recent Commits — All Repos (last {})\n\n",
+                        count
+                    ));
                     for (name, path) in &repos {
                         let git_repo = caduceus_git::GitRepo::discover(path);
                         output.push_str(&format!("### {}\n", name));
-                        match git_repo.as_ref().map_err(|e| e.to_string()).and_then(|r| r.log(count).map_err(|e| e.to_string())) {
+                        match git_repo
+                            .as_ref()
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r.log(count).map_err(|e| e.to_string()))
+                        {
                             Ok(commits) => {
                                 for c in &commits {
                                     let sha = &c.sha[..7.min(c.sha.len())];
-                                    output.push_str(&format!("  {} {} — {}\n", sha, c.message, c.author));
+                                    output.push_str(&format!(
+                                        "  {} {} — {}\n",
+                                        sha, c.message, c.author
+                                    ));
                                 }
                             }
                             Err(e) => output.push_str(&format!("  Error: {e}\n")),
@@ -180,12 +200,17 @@ impl AgentTool for CaduceusCrossGitTool {
                     }
                 }
                 CrossGitOperation::CreateBranchAll { branch_name } => {
-                    output.push_str(&format!("## Create Branch '{}' — All Repos\n\n", branch_name));
+                    output.push_str(&format!(
+                        "## Create Branch '{}' — All Repos\n\n",
+                        branch_name
+                    ));
                     for (name, path) in &repos {
                         // Branch creation is rare — use engine for this specific operation
                         let engine = caduceus_bridge::engine::CaduceusEngine::new(path);
                         match engine.git_create_task_branch(&branch_name) {
-                            Ok(branch) => output.push_str(&format!("- **{}**: ✅ Created {}\n", name, branch)),
+                            Ok(branch) => {
+                                output.push_str(&format!("- **{}**: ✅ Created {}\n", name, branch))
+                            }
                             Err(e) => output.push_str(&format!("- **{}**: ❌ {}\n", name, e)),
                         }
                     }
@@ -195,10 +220,18 @@ impl AgentTool for CaduceusCrossGitTool {
                     let mut dirty_count = 0;
                     for (name, path) in &repos {
                         let git_repo = caduceus_git::GitRepo::discover(path);
-                        match git_repo.as_ref().map_err(|e| e.to_string()).and_then(|r| r.status().map_err(|e| e.to_string())) {
+                        match git_repo
+                            .as_ref()
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r.status().map_err(|e| e.to_string()))
+                        {
                             Ok(entries) if !entries.is_empty() => {
                                 dirty_count += 1;
-                                output.push_str(&format!("- **{}**: {} changes\n", name, entries.len()));
+                                output.push_str(&format!(
+                                    "- **{}**: {} changes\n",
+                                    name,
+                                    entries.len()
+                                ));
                             }
                             Ok(_) => {}
                             Err(_) => {

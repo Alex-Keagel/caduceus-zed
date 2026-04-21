@@ -108,17 +108,18 @@ impl AgentTool for CaduceusTelemetryTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let bridge = self.bridge.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusTelemetryToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusTelemetryToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
-            let guard = bridge.lock().map_err(|e| {
-                CaduceusTelemetryToolOutput::Error {
+            let guard = bridge
+                .lock()
+                .map_err(|e| CaduceusTelemetryToolOutput::Error {
                     error: format!("Lock poisoned: {e}"),
-                }
-            })?;
+                })?;
 
             let text = match input.operation {
                 TelemetryOperation::SessionUsage => {
@@ -149,11 +150,12 @@ impl AgentTool for CaduceusTelemetryTool {
                 TelemetryOperation::ExportReport => guard.generate_report(),
                 TelemetryOperation::ExportOtlp { endpoint } => {
                     drop(guard);
-                    let mut guard = bridge.lock().map_err(|e| {
-                        CaduceusTelemetryToolOutput::Error {
-                            error: format!("Lock poisoned: {e}"),
-                        }
-                    })?;
+                    let mut guard =
+                        bridge
+                            .lock()
+                            .map_err(|e| CaduceusTelemetryToolOutput::Error {
+                                error: format!("Lock poisoned: {e}"),
+                            })?;
                     guard.configure_otlp_endpoint(&endpoint);
                     format!("OTLP exporter configured for {endpoint}")
                 }

@@ -56,9 +56,7 @@ impl From<CaduceusWikiToolOutput> for LanguageModelToolResultContent {
     fn from(output: CaduceusWikiToolOutput) -> Self {
         match output {
             CaduceusWikiToolOutput::Text { text } => text.into(),
-            CaduceusWikiToolOutput::Error { error } => {
-                format!("Wiki error: {error}").into()
-            }
+            CaduceusWikiToolOutput::Error { error } => format!("Wiki error: {error}").into(),
         }
     }
 }
@@ -70,11 +68,10 @@ pub struct CaduceusWikiTool {
 
 impl CaduceusWikiTool {
     pub fn new(project_root: PathBuf) -> Self {
-        let bridge = caduceus_bridge::storage::StorageBridge::open_default()
-            .unwrap_or_else(|_| {
-                caduceus_bridge::storage::StorageBridge::open_in_memory()
-                    .expect("in-memory storage should always succeed")
-            });
+        let bridge = caduceus_bridge::storage::StorageBridge::open_default().unwrap_or_else(|_| {
+            caduceus_bridge::storage::StorageBridge::open_in_memory()
+                .expect("in-memory storage should always succeed")
+        });
         Self {
             project_root,
             bridge: Arc::new(bridge),
@@ -120,11 +117,12 @@ impl AgentTool for CaduceusWikiTool {
         let bridge = self.bridge.clone();
         let project_root = self.project_root.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusWikiToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusWikiToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             let result: Result<String, String> = match input.operation {
                 WikiOperation::ListPages => bridge.list_pages(&project_root).map(|pages| {

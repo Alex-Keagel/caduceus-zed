@@ -98,7 +98,8 @@ impl From<CaduceusTreeSitterToolOutput> for LanguageModelToolResultContent {
                 }
             }
             CaduceusTreeSitterToolOutput::Languages { languages } => {
-                let mut text = format!("{} languages with Tree-sitter grammars:\n", languages.len());
+                let mut text =
+                    format!("{} languages with Tree-sitter grammars:\n", languages.len());
                 for l in &languages {
                     text.push_str(&format!("- {l}\n"));
                 }
@@ -161,11 +162,12 @@ impl AgentTool for CaduceusTreeSitterTool {
         let languages = project.read(cx).languages().clone();
 
         cx.spawn(async move |cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusTreeSitterToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusTreeSitterToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             match input.operation {
                 TreeSitterOperation::Outline { path } => {
@@ -188,7 +190,9 @@ impl AgentTool for CaduceusTreeSitterTool {
 
                     // Use bridge TreeSitterChunker for real AST parsing
                     let chunker = caduceus_bridge::tree_sitter::TreeSitterChunker::new();
-                    let chunks = caduceus_bridge::tree_sitter::TreeSitterChunker::chunk_file_static(&path, &content);
+                    let chunks = caduceus_bridge::tree_sitter::TreeSitterChunker::chunk_file_static(
+                        &path, &content,
+                    );
 
                     let entries: Vec<OutlineEntry> = chunks
                         .iter()
@@ -202,7 +206,11 @@ impl AgentTool for CaduceusTreeSitterTool {
 
                     Ok(CaduceusTreeSitterToolOutput::Outline { path, entries })
                 }
-                TreeSitterOperation::SymbolsAt { path, line, column: _ } => {
+                TreeSitterOperation::SymbolsAt {
+                    path,
+                    line,
+                    column: _,
+                } => {
                     if path.contains("..") || std::path::Path::new(&path).is_absolute() {
                         return Err(CaduceusTreeSitterToolOutput::Error {
                             error: "Path traversal or absolute paths not allowed".to_string(),
@@ -219,25 +227,20 @@ impl AgentTool for CaduceusTreeSitterTool {
                         }
                     })?;
 
-                    let target_line = content
-                        .lines()
-                        .nth(line as usize)
-                        .unwrap_or("")
-                        .to_string();
+                    let target_line = content.lines().nth(line as usize).unwrap_or("").to_string();
 
                     let symbols = vec![format!("Line {}: {}", line + 1, target_line.trim())];
 
                     Ok(CaduceusTreeSitterToolOutput::Symbols { path, symbols })
                 }
                 TreeSitterOperation::Languages => {
-                    let lang_names: Vec<String> = cx
-                        .update(|_cx| {
-                            languages
-                                .language_names()
-                                .into_iter()
-                                .map(|n| n.to_string())
-                                .collect::<Vec<String>>()
-                        });
+                    let lang_names: Vec<String> = cx.update(|_cx| {
+                        languages
+                            .language_names()
+                            .into_iter()
+                            .map(|n| n.to_string())
+                            .collect::<Vec<String>>()
+                    });
 
                     Ok(CaduceusTreeSitterToolOutput::Languages {
                         languages: lang_names,

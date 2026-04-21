@@ -47,9 +47,7 @@ impl From<CaduceusPolicyToolOutput> for LanguageModelToolResultContent {
     fn from(output: CaduceusPolicyToolOutput) -> Self {
         match output {
             CaduceusPolicyToolOutput::Text { text } => text.into(),
-            CaduceusPolicyToolOutput::Error { error } => {
-                format!("Policy error: {error}").into()
-            }
+            CaduceusPolicyToolOutput::Error { error } => format!("Policy error: {error}").into(),
         }
     }
 }
@@ -101,21 +99,24 @@ impl AgentTool for CaduceusPolicyTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let bridge = self.bridge.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| CaduceusPolicyToolOutput::Error {
-                error: format!("Failed to receive input: {e}"),
-            })?;
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusPolicyToolOutput::Error {
+                    error: format!("Failed to receive input: {e}"),
+                })?;
 
             let guard = bridge.lock().map_err(|e| CaduceusPolicyToolOutput::Error {
                 error: format!("Lock poisoned: {e}"),
             })?;
 
             let text = match input.operation {
-                PolicyOperation::Check { tool_name } => {
-                    match guard.check_permission(&tool_name) {
-                        Ok(()) => format!("✅ Tool '{tool_name}' is ALLOWED under current privilege ring."),
-                        Err(reason) => format!("❌ Tool '{tool_name}' is DENIED: {reason}"),
+                PolicyOperation::Check { tool_name } => match guard.check_permission(&tool_name) {
+                    Ok(()) => {
+                        format!("✅ Tool '{tool_name}' is ALLOWED under current privilege ring.")
                     }
-                }
+                    Err(reason) => format!("❌ Tool '{tool_name}' is DENIED: {reason}"),
+                },
                 PolicyOperation::Report => {
                     let report = guard.generate_security_report();
                     let score = guard.compliance_score();

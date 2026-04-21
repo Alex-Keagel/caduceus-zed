@@ -51,9 +51,7 @@ impl From<CaduceusStorageToolOutput> for LanguageModelToolResultContent {
     fn from(output: CaduceusStorageToolOutput) -> Self {
         match output {
             CaduceusStorageToolOutput::Text { text } => text.into(),
-            CaduceusStorageToolOutput::Error { error } => {
-                format!("Storage error: {error}").into()
-            }
+            CaduceusStorageToolOutput::Error { error } => format!("Storage error: {error}").into(),
         }
     }
 }
@@ -65,11 +63,10 @@ pub struct CaduceusStorageTool {
 
 impl CaduceusStorageTool {
     pub fn new(project_root: PathBuf) -> Self {
-        let bridge = caduceus_bridge::storage::StorageBridge::open_default()
-            .unwrap_or_else(|_| {
-                caduceus_bridge::storage::StorageBridge::open_in_memory()
-                    .expect("in-memory storage should always succeed")
-            });
+        let bridge = caduceus_bridge::storage::StorageBridge::open_default().unwrap_or_else(|_| {
+            caduceus_bridge::storage::StorageBridge::open_in_memory()
+                .expect("in-memory storage should always succeed")
+        });
         Self {
             project_root,
             bridge: Arc::new(bridge),
@@ -115,11 +112,12 @@ impl AgentTool for CaduceusStorageTool {
         let bridge = self.bridge.clone();
         let project_root = self.project_root.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusStorageToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusStorageToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             let result: Result<String, String> = match input.operation {
                 StorageOperation::ListTasks => bridge.list_tasks(&project_root).map(|tasks| {
@@ -135,12 +133,12 @@ impl AgentTool for CaduceusStorageTool {
                         })
                     }
                 }),
-                StorageOperation::SaveTask { task } => {
-                    bridge.save_task(&project_root, &task).map(|_| "Task saved".to_string())
-                }
-                StorageOperation::DeleteTask { id } => {
-                    bridge.delete_task(&project_root, &id).map(|_| format!("Task '{id}' deleted"))
-                }
+                StorageOperation::SaveTask { task } => bridge
+                    .save_task(&project_root, &task)
+                    .map(|_| "Task saved".to_string()),
+                StorageOperation::DeleteTask { id } => bridge
+                    .delete_task(&project_root, &id)
+                    .map(|_| format!("Task '{id}' deleted")),
                 StorageOperation::SnapshotProject => {
                     let snapshot = bridge.snapshot_project(&project_root);
                     Ok(format!("{} files snapshotted", snapshot.len()))

@@ -106,7 +106,11 @@ impl AgentTool for CaduceusSemanticSearchTool {
         _cx: &mut App,
     ) -> SharedString {
         if let Ok(input) = input {
-            format!("Semantic search: \"{}\"", crate::tools::truncate_str(&input.query, 50)).into()
+            format!(
+                "Semantic search: \"{}\"",
+                crate::tools::truncate_str(&input.query, 50)
+            )
+            .into()
         } else {
             "Semantic search".into()
         }
@@ -120,11 +124,13 @@ impl AgentTool for CaduceusSemanticSearchTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let engine = self.engine.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusSemanticSearchToolOutput::Error {
-                    error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+            let input =
+                input
+                    .recv()
+                    .await
+                    .map_err(|e| CaduceusSemanticSearchToolOutput::Error {
+                        error: format!("Failed to receive input: {e}"),
+                    })?;
 
             // Clamp top_k so a malformed/malicious request can't allocate
             // an unbounded result vector (usize::MAX would OOM the index walk).
@@ -153,9 +159,7 @@ impl AgentTool for CaduceusSemanticSearchTool {
                         .collect();
                     Ok(CaduceusSemanticSearchToolOutput::Success { results })
                 }
-                Err(e) => Err(CaduceusSemanticSearchToolOutput::Error {
-                    error: e,
-                }),
+                Err(e) => Err(CaduceusSemanticSearchToolOutput::Error { error: e }),
             }
         })
     }

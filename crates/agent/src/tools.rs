@@ -4,9 +4,9 @@ mod caduceus_automations_tool;
 mod caduceus_background_agent_tool;
 mod caduceus_checkpoint_tool;
 mod caduceus_code_graph_tool;
+mod caduceus_conversation_tool;
 mod caduceus_cross_git_tool;
 mod caduceus_cross_search_tool;
-mod caduceus_conversation_tool;
 mod caduceus_dependency_scan_tool;
 mod caduceus_error_analysis_tool;
 pub mod caduceus_file_lock;
@@ -18,20 +18,20 @@ mod caduceus_kill_switch_tool;
 mod caduceus_marketplace_tool;
 mod caduceus_mcp_security_tool;
 mod caduceus_memory_read_tool;
-mod caduceus_mode_request_tool;
 mod caduceus_memory_write_tool;
+mod caduceus_mode_request_tool;
 mod caduceus_policy_tool;
 mod caduceus_prd_tool;
 mod caduceus_product_tool;
+mod caduceus_progress_tool;
 mod caduceus_project_tool;
 mod caduceus_project_wiki_tool;
-mod caduceus_progress_tool;
 mod caduceus_scaffold_tool;
 mod caduceus_security_scan_tool;
 mod caduceus_semantic_search_tool;
 mod caduceus_storage_tool;
-mod caduceus_task_tree_tool;
 mod caduceus_task_decompose_tool;
+mod caduceus_task_tree_tool;
 mod caduceus_telemetry_tool;
 mod caduceus_time_tracking_tool;
 mod caduceus_tree_sitter_tool;
@@ -104,11 +104,27 @@ pub(crate) fn is_sensitive_file(path: &str) -> bool {
 
     // Exact filename matches
     const SENSITIVE_NAMES: &[&str] = &[
-        ".env", ".env.local", ".env.production", ".env.development", ".env.staging",
-        ".env.test", ".npmrc", ".pypirc", ".netrc", ".pgpass", ".my.cnf",
-        "credentials", "credentials.json", "service-account.json",
-        "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
-        ".htpasswd", "shadow", "passwd",
+        ".env",
+        ".env.local",
+        ".env.production",
+        ".env.development",
+        ".env.staging",
+        ".env.test",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".pgpass",
+        ".my.cnf",
+        "credentials",
+        "credentials.json",
+        "service-account.json",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        ".htpasswd",
+        "shadow",
+        "passwd",
     ];
     if SENSITIVE_NAMES.contains(&filename) {
         return true;
@@ -116,7 +132,12 @@ pub(crate) fn is_sensitive_file(path: &str) -> bool {
 
     // Extension matches
     const SENSITIVE_EXTENSIONS: &[&str] = &[
-        ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore",
+        ".pem",
+        ".key",
+        ".p12",
+        ".pfx",
+        ".jks",
+        ".keystore",
         ".env", // catches .env.anything
     ];
     for ext in SENSITIVE_EXTENSIONS {
@@ -139,7 +160,10 @@ pub(crate) fn is_sensitive_file(path: &str) -> bool {
 /// Redact sensitive content from a snippet before sending to LLM
 pub(crate) fn redact_if_sensitive(path: &str, content: &str) -> String {
     if is_sensitive_file(path) {
-        format!("[REDACTED — {} is a sensitive file and was not sent to the model]", path)
+        format!(
+            "[REDACTED — {} is a sensitive file and was not sent to the model]",
+            path
+        )
     } else {
         content.to_string()
     }
@@ -164,20 +188,20 @@ pub use caduceus_kill_switch_tool::*;
 pub use caduceus_marketplace_tool::*;
 pub use caduceus_mcp_security_tool::*;
 pub use caduceus_memory_read_tool::*;
-pub use caduceus_mode_request_tool::*;
 pub use caduceus_memory_write_tool::*;
+pub use caduceus_mode_request_tool::*;
 pub use caduceus_policy_tool::*;
 pub use caduceus_prd_tool::*;
 pub use caduceus_product_tool::*;
+pub use caduceus_progress_tool::*;
 pub use caduceus_project_tool::*;
 pub use caduceus_project_wiki_tool::*;
-pub use caduceus_progress_tool::*;
 pub use caduceus_scaffold_tool::*;
 pub use caduceus_security_scan_tool::*;
 pub use caduceus_semantic_search_tool::*;
 pub use caduceus_storage_tool::*;
-pub use caduceus_task_tree_tool::*;
 pub use caduceus_task_decompose_tool::*;
+pub use caduceus_task_tree_tool::*;
 pub use caduceus_telemetry_tool::*;
 pub use caduceus_time_tracking_tool::*;
 pub use caduceus_tree_sitter_tool::*;
@@ -340,16 +364,30 @@ mod sensitive_file_tests {
     /// the model never sees secret bytes.
     #[test]
     fn flags_dotenv_variants() {
-        for p in [".env", ".env.local", ".env.production", ".env.staging",
-                  "src/.env", "/abs/path/.env.test", "deep/nested/.env"] {
+        for p in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".env.staging",
+            "src/.env",
+            "/abs/path/.env.test",
+            "deep/nested/.env",
+        ] {
             assert!(is_sensitive_file(p), "{p} should be sensitive");
         }
     }
 
     #[test]
     fn flags_credential_files() {
-        for p in ["credentials.json", "service-account.json", ".npmrc",
-                  ".netrc", "id_rsa", "id_ed25519", ".pgpass"] {
+        for p in [
+            "credentials.json",
+            "service-account.json",
+            ".npmrc",
+            ".netrc",
+            "id_rsa",
+            "id_ed25519",
+            ".pgpass",
+        ] {
             assert!(is_sensitive_file(p), "{p}");
             assert!(is_sensitive_file(&format!("foo/bar/{p}")));
         }
@@ -357,7 +395,13 @@ mod sensitive_file_tests {
 
     #[test]
     fn flags_key_extensions() {
-        for p in ["server.pem", "auth.key", "store.p12", "ca.pfx", "android.jks"] {
+        for p in [
+            "server.pem",
+            "auth.key",
+            "store.p12",
+            "ca.pfx",
+            "android.jks",
+        ] {
             assert!(is_sensitive_file(p), "{p}");
         }
     }
@@ -380,8 +424,14 @@ mod sensitive_file_tests {
 
     #[test]
     fn does_not_flag_normal_files() {
-        for p in ["main.rs", "README.md", "Cargo.toml", "envvars.md",
-                  "credentials_template.md", "src/keystore_handler.rs"] {
+        for p in [
+            "main.rs",
+            "README.md",
+            "Cargo.toml",
+            "envvars.md",
+            "credentials_template.md",
+            "src/keystore_handler.rs",
+        ] {
             assert!(!is_sensitive_file(p), "{p} should NOT be sensitive");
         }
     }

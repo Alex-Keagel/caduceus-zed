@@ -74,11 +74,12 @@ impl AgentTool for CaduceusKillSwitchTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusKillSwitchToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusKillSwitchToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             if !input.confirm {
                 return Ok(CaduceusKillSwitchToolOutput::Text {

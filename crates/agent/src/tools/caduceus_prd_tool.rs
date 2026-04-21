@@ -85,7 +85,11 @@ impl From<CaduceusPrdToolOutput> for LanguageModelToolResultContent {
                 if !dependencies.is_empty() {
                     text.push_str("## Dependencies\n");
                     for (from, to) in &dependencies {
-                        text.push_str(&format!("- Task {} → Task {} (must complete first)\n", to + 1, from + 1));
+                        text.push_str(&format!(
+                            "- Task {} → Task {} (must complete first)\n",
+                            to + 1,
+                            from + 1
+                        ));
                     }
                 }
                 text.into()
@@ -106,9 +110,7 @@ impl From<CaduceusPrdToolOutput> for LanguageModelToolResultContent {
                     text.into()
                 }
             }
-            CaduceusPrdToolOutput::Error { error } => {
-                format!("PRD parse error: {error}").into()
-            }
+            CaduceusPrdToolOutput::Error { error } => format!("PRD parse error: {error}").into(),
         }
     }
 }
@@ -153,11 +155,12 @@ impl AgentTool for CaduceusPrdTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusPrdToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusPrdToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             match input.operation {
                 PrdOperation::Parse { text } => {
@@ -185,10 +188,9 @@ impl AgentTool for CaduceusPrdTool {
                 }
                 PrdOperation::RecommendNext { text, completed } => {
                     let tasks = caduceus_bridge::orchestrator::OrchestratorBridge::parse_prd(&text);
-                    let recs =
-                        caduceus_bridge::orchestrator::OrchestratorBridge::recommend_next(
-                            &tasks, &completed,
-                        );
+                    let recs = caduceus_bridge::orchestrator::OrchestratorBridge::recommend_next(
+                        &tasks, &completed,
+                    );
 
                     let recommendations: Vec<TaskRecommendationInfo> = recs
                         .into_iter()

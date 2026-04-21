@@ -110,11 +110,9 @@ impl CaduceusArchitectTool {
         for rel in &config.relationships {
             let from = Self::sanitize_mermaid_id(&rel.from);
             let to = Self::sanitize_mermaid_id(&rel.to);
-            let sanitized_type = Self::sanitize_mermaid_label(&rel.relationship_type.replace(' ', "_"));
-            mermaid.push_str(&format!(
-                "  {} -->|{}| {}\n",
-                from, sanitized_type, to
-            ));
+            let sanitized_type =
+                Self::sanitize_mermaid_label(&rel.relationship_type.replace(' ', "_"));
+            mermaid.push_str(&format!("  {} -->|{}| {}\n", from, sanitized_type, to));
         }
 
         // Add API nodes
@@ -147,8 +145,8 @@ impl CaduceusArchitectTool {
             let mut checks = Vec::new();
 
             // Check for README
-            let has_readme = repo_path.join("README.md").exists()
-                || repo_path.join("readme.md").exists();
+            let has_readme =
+                repo_path.join("README.md").exists() || repo_path.join("readme.md").exists();
             if has_readme {
                 score += 20;
                 checks.push("✅ README");
@@ -311,15 +309,16 @@ impl AgentTool for CaduceusArchitectTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusArchitectToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusArchitectToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
-            let config = self.load_project_config().map_err(|e| {
-                CaduceusArchitectToolOutput::Error { error: e }
-            })?;
+            let config = self
+                .load_project_config()
+                .map_err(|e| CaduceusArchitectToolOutput::Error { error: e })?;
 
             match input.operation {
                 ArchitectOperation::Diagram => {

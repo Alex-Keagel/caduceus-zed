@@ -122,11 +122,13 @@ impl AgentTool for CaduceusDependencyScanTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusDependencyScanToolOutput::Error {
-                    error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+            let input =
+                input
+                    .recv()
+                    .await
+                    .map_err(|e| CaduceusDependencyScanToolOutput::Error {
+                        error: format!("Failed to receive input: {e}"),
+                    })?;
 
             let lock_files: Vec<LockFileInfo> =
                 caduceus_bridge::tools::ToolsBridge::detect_lock_files(&input.directory)

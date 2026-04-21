@@ -89,8 +89,12 @@ impl AgentTool for CaduceusCodeGraphTool {
     ) -> SharedString {
         if let Ok(input) = input {
             match &input.operation {
-                CodeGraphOperation::Neighbors { node_id } => format!("Graph neighbors: {node_id}").into(),
-                CodeGraphOperation::AffectedBy { node_id } => format!("Affected by: {node_id}").into(),
+                CodeGraphOperation::Neighbors { node_id } => {
+                    format!("Graph neighbors: {node_id}").into()
+                }
+                CodeGraphOperation::AffectedBy { node_id } => {
+                    format!("Affected by: {node_id}").into()
+                }
                 CodeGraphOperation::Subgraph { node_id } => format!("Subgraph: {node_id}").into(),
             }
         } else {
@@ -106,9 +110,12 @@ impl AgentTool for CaduceusCodeGraphTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let engine = self.engine.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusCodeGraphToolOutput::Error { error: format!("Failed to receive input: {e}") }
-            })?;
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusCodeGraphToolOutput::Error {
+                    error: format!("Failed to receive input: {e}"),
+                })?;
 
             let nodes = match input.operation {
                 CodeGraphOperation::Neighbors { node_id } => engine.code_neighbors(&node_id),

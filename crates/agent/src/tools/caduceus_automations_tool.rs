@@ -10,8 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 
 use caduceus_bridge::orchestrator::{
-    Automation, AutomationAgentConfig, AutomationTrigger,
-    BridgeAgentMode, BridgeModelId,
+    Automation, AutomationAgentConfig, AutomationTrigger, BridgeAgentMode, BridgeModelId,
 };
 
 use crate::tools::caduceus_file_lock::acquire_file_lock;
@@ -128,20 +127,32 @@ impl CaduceusAutomationsTool {
                 Ok(AutomationTrigger::Cron(expr.to_string()))
             }
             "file_change" => {
-                let pattern = trigger_config.ok_or("file_change trigger requires trigger_config (glob)")?;
-                Ok(AutomationTrigger::FileChange { pattern: pattern.to_string() })
+                let pattern =
+                    trigger_config.ok_or("file_change trigger requires trigger_config (glob)")?;
+                Ok(AutomationTrigger::FileChange {
+                    pattern: pattern.to_string(),
+                })
             }
             "github_pr" => {
-                let repo = trigger_config.ok_or("github_pr trigger requires trigger_config (repo)")?;
-                Ok(AutomationTrigger::GitHubPR { repo: repo.to_string() })
+                let repo =
+                    trigger_config.ok_or("github_pr trigger requires trigger_config (repo)")?;
+                Ok(AutomationTrigger::GitHubPR {
+                    repo: repo.to_string(),
+                })
             }
             "github_push" => {
-                let branch = trigger_config.ok_or("github_push trigger requires trigger_config (branch)")?;
-                Ok(AutomationTrigger::GitHubPush { branch: branch.to_string() })
+                let branch =
+                    trigger_config.ok_or("github_push trigger requires trigger_config (branch)")?;
+                Ok(AutomationTrigger::GitHubPush {
+                    branch: branch.to_string(),
+                })
             }
             "webhook" => {
-                let path = trigger_config.ok_or("webhook trigger requires trigger_config (path)")?;
-                Ok(AutomationTrigger::Webhook { path: path.to_string() })
+                let path =
+                    trigger_config.ok_or("webhook trigger requires trigger_config (path)")?;
+                Ok(AutomationTrigger::Webhook {
+                    path: path.to_string(),
+                })
             }
             other => Err(format!("Unknown trigger type: {other}")),
         }
@@ -184,16 +195,16 @@ impl AgentTool for CaduceusAutomationsTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusAutomationsToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusAutomationsToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             let store = AutomationStore::new(&self.project_root);
-            let _lock = acquire_file_lock(&store.path).map_err(|e| {
-                CaduceusAutomationsToolOutput::Error { error: e }
-            })?;
+            let _lock = acquire_file_lock(&store.path)
+                .map_err(|e| CaduceusAutomationsToolOutput::Error { error: e })?;
 
             let result = match input.operation {
                 AutomationOperation::List => {
@@ -226,11 +237,8 @@ impl AgentTool for CaduceusAutomationsTool {
                             error: format!("Automation '{name}' already exists"),
                         });
                     }
-                    let trigger = Self::parse_trigger(
-                        &trigger_type,
-                        trigger_config.as_deref(),
-                    )
-                    .map_err(|e| CaduceusAutomationsToolOutput::Error { error: e })?;
+                    let trigger = Self::parse_trigger(&trigger_type, trigger_config.as_deref())
+                        .map_err(|e| CaduceusAutomationsToolOutput::Error { error: e })?;
 
                     let automation = Automation {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -251,9 +259,9 @@ impl AgentTool for CaduceusAutomationsTool {
                         run_count: 0,
                     };
                     autos.push(automation);
-                    store.save(&autos).map_err(|e| {
-                        CaduceusAutomationsToolOutput::Error { error: e }
-                    })?;
+                    store
+                        .save(&autos)
+                        .map_err(|e| CaduceusAutomationsToolOutput::Error { error: e })?;
                     CaduceusAutomationsToolOutput::Added {
                         message: format!("Added automation: {name}"),
                     }
@@ -267,9 +275,9 @@ impl AgentTool for CaduceusAutomationsTool {
                             error: format!("Automation '{name}' not found"),
                         });
                     }
-                    store.save(&autos).map_err(|e| {
-                        CaduceusAutomationsToolOutput::Error { error: e }
-                    })?;
+                    store
+                        .save(&autos)
+                        .map_err(|e| CaduceusAutomationsToolOutput::Error { error: e })?;
                     CaduceusAutomationsToolOutput::Removed {
                         message: format!("Removed automation: {name}"),
                     }
@@ -287,9 +295,9 @@ impl AgentTool for CaduceusAutomationsTool {
                         .agent_config
                         .prompt_template
                         .replace("{{event}}", "manual_trigger");
-                    store.save(&autos).map_err(|e| {
-                        CaduceusAutomationsToolOutput::Error { error: e }
-                    })?;
+                    store
+                        .save(&autos)
+                        .map_err(|e| CaduceusAutomationsToolOutput::Error { error: e })?;
                     CaduceusAutomationsToolOutput::Triggered {
                         message: format!("Triggered '{name}'. Prompt: {prompt}"),
                     }
@@ -302,9 +310,9 @@ impl AgentTool for CaduceusAutomationsTool {
                         }
                     })?;
                     auto.enabled = true;
-                    store.save(&autos).map_err(|e| {
-                        CaduceusAutomationsToolOutput::Error { error: e }
-                    })?;
+                    store
+                        .save(&autos)
+                        .map_err(|e| CaduceusAutomationsToolOutput::Error { error: e })?;
                     CaduceusAutomationsToolOutput::Toggled {
                         message: format!("Enabled automation: {name}"),
                     }
@@ -317,9 +325,9 @@ impl AgentTool for CaduceusAutomationsTool {
                         }
                     })?;
                     auto.enabled = false;
-                    store.save(&autos).map_err(|e| {
-                        CaduceusAutomationsToolOutput::Error { error: e }
-                    })?;
+                    store
+                        .save(&autos)
+                        .map_err(|e| CaduceusAutomationsToolOutput::Error { error: e })?;
                     CaduceusAutomationsToolOutput::Toggled {
                         message: format!("Disabled automation: {name}"),
                     }

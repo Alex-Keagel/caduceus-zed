@@ -103,16 +103,16 @@ impl AgentTool for CaduceusConversationTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusConversationToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusConversationToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             let text = match input.operation {
                 ConversationOperation::Serialize => {
-                    let history =
-                        caduceus_bridge::orchestrator::OrchestratorBridge::new_history();
+                    let history = caduceus_bridge::orchestrator::OrchestratorBridge::new_history();
                     caduceus_bridge::orchestrator::OrchestratorBridge::conversation_serialize(
                         &history,
                     )

@@ -114,16 +114,15 @@ impl AgentTool for CaduceusCheckpointTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let project_root = self.project_root.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusCheckpointToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusCheckpointToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             let result: Result<String, String> = match input.operation {
-                CheckpointOperation::Create { label } => {
-                    create_checkpoint(&project_root, &label)
-                }
+                CheckpointOperation::Create { label } => create_checkpoint(&project_root, &label),
                 CheckpointOperation::List => list_checkpoints(&project_root),
                 CheckpointOperation::Restore { checkpoint_id } => {
                     restore_checkpoint(&project_root, &checkpoint_id)
@@ -145,10 +144,7 @@ fn checkpoints_dir(project_root: &std::path::Path) -> PathBuf {
     project_root.join(".caduceus").join("checkpoints")
 }
 
-fn create_checkpoint(
-    project_root: &std::path::Path,
-    label: &str,
-) -> Result<String, String> {
+fn create_checkpoint(project_root: &std::path::Path, label: &str) -> Result<String, String> {
     // Get modified files via `git diff --name-only`
     let output = std::process::Command::new("git")
         .args(["diff", "--name-only"])
@@ -171,7 +167,13 @@ fn create_checkpoint(
     let timestamp = now.format("%Y%m%d-%H%M%S").to_string();
     let safe_label: String = label
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let checkpoint_name = format!("{timestamp}-{safe_label}");
     let checkpoint_dir = checkpoints_dir(project_root).join(&checkpoint_name);
@@ -187,8 +189,7 @@ fn create_checkpoint(
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create dir for {file}: {e}"))?;
             }
-            std::fs::copy(&src, &dest)
-                .map_err(|e| format!("Failed to copy {file}: {e}"))?;
+            std::fs::copy(&src, &dest).map_err(|e| format!("Failed to copy {file}: {e}"))?;
         }
     }
 
@@ -205,7 +206,11 @@ fn create_checkpoint(
     Ok(format!(
         "Checkpoint '{checkpoint_name}' created with {} file(s):\n{}",
         files.len(),
-        files.iter().map(|f| format!("  - {f}")).collect::<Vec<_>>().join("\n")
+        files
+            .iter()
+            .map(|f| format!("  - {f}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     ))
 }
 
@@ -216,8 +221,8 @@ fn list_checkpoints(project_root: &std::path::Path) -> Result<String, String> {
     }
 
     let mut entries: Vec<(String, CheckpointManifest)> = Vec::new();
-    let read_dir = std::fs::read_dir(&dir)
-        .map_err(|e| format!("Failed to read checkpoints dir: {e}"))?;
+    let read_dir =
+        std::fs::read_dir(&dir).map_err(|e| format!("Failed to read checkpoints dir: {e}"))?;
 
     for entry in read_dir {
         let entry = entry.map_err(|e| format!("Failed to read entry: {e}"))?;
@@ -226,10 +231,7 @@ fn list_checkpoints(project_root: &std::path::Path) -> Result<String, String> {
             let data = std::fs::read_to_string(&manifest_path)
                 .map_err(|e| format!("Failed to read manifest: {e}"))?;
             if let Ok(manifest) = serde_json::from_str::<CheckpointManifest>(&data) {
-                let name = entry
-                    .file_name()
-                    .to_string_lossy()
-                    .to_string();
+                let name = entry.file_name().to_string_lossy().to_string();
                 entries.push((name, manifest));
             }
         }
@@ -242,10 +244,21 @@ fn list_checkpoints(project_root: &std::path::Path) -> Result<String, String> {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let lines: Vec<String> = entries
         .iter()
-        .map(|(name, m)| format!("- **{name}** — \"{}\" ({} files, {})", m.label, m.files.len(), m.timestamp))
+        .map(|(name, m)| {
+            format!(
+                "- **{name}** — \"{}\" ({} files, {})",
+                m.label,
+                m.files.len(),
+                m.timestamp
+            )
+        })
         .collect();
 
-    Ok(format!("{} checkpoint(s):\n{}", entries.len(), lines.join("\n")))
+    Ok(format!(
+        "{} checkpoint(s):\n{}",
+        entries.len(),
+        lines.join("\n")
+    ))
 }
 
 fn validate_checkpoint_id(checkpoint_id: &str) -> Result<(), String> {
@@ -260,7 +273,9 @@ fn validate_checkpoint_id(checkpoint_id: &str) -> Result<(), String> {
     for c in p.components() {
         match c {
             std::path::Component::Normal(_) => components += 1,
-            _ => return Err("Checkpoint id must be a single non-traversing path segment".to_string()),
+            _ => {
+                return Err("Checkpoint id must be a single non-traversing path segment".to_string());
+            }
         }
     }
     if components != 1 {
@@ -280,7 +295,8 @@ fn restore_checkpoint(
     // does not exist, the id is invalid (we already rejected traversal above).
     let base = checkpoints_dir(project_root);
     let _ = std::fs::create_dir_all(&base);
-    let resolved = checkpoint_dir.canonicalize()
+    let resolved = checkpoint_dir
+        .canonicalize()
         .map_err(|_| format!("Checkpoint '{checkpoint_id}' not found."))?;
     let base_resolved = base.canonicalize().unwrap_or(base.clone());
     if !resolved.starts_with(&base_resolved) {
@@ -294,10 +310,12 @@ fn restore_checkpoint(
 
     let data = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("Failed to read manifest: {e}"))?;
-    let manifest: CheckpointManifest = serde_json::from_str(&data)
-        .map_err(|e| format!("Failed to parse manifest: {e}"))?;
+    let manifest: CheckpointManifest =
+        serde_json::from_str(&data).map_err(|e| format!("Failed to parse manifest: {e}"))?;
 
-    let project_canonical = project_root.canonicalize().unwrap_or(project_root.to_path_buf());
+    let project_canonical = project_root
+        .canonicalize()
+        .unwrap_or(project_root.to_path_buf());
 
     let mut restored = Vec::new();
     for file in &manifest.files {
@@ -306,7 +324,9 @@ fn restore_checkpoint(
             let mut p = project_root.to_path_buf();
             for component in std::path::Path::new(file).components() {
                 match component {
-                    std::path::Component::ParentDir => { p.pop(); }
+                    std::path::Component::ParentDir => {
+                        p.pop();
+                    }
                     std::path::Component::Normal(c) => p.push(c),
                     _ => {}
                 }
@@ -314,7 +334,10 @@ fn restore_checkpoint(
             p
         };
         if !dest_normalized.starts_with(&project_canonical) {
-            return Err(format!("Refusing to restore '{}': path escapes project root", file));
+            return Err(format!(
+                "Refusing to restore '{}': path escapes project root",
+                file
+            ));
         }
 
         let src = checkpoint_dir.join(file);
@@ -324,8 +347,7 @@ fn restore_checkpoint(
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create dir for {file}: {e}"))?;
             }
-            std::fs::copy(&src, &dest)
-                .map_err(|e| format!("Failed to restore {file}: {e}"))?;
+            std::fs::copy(&src, &dest).map_err(|e| format!("Failed to restore {file}: {e}"))?;
             restored.push(file.clone());
         }
     }
@@ -333,14 +355,15 @@ fn restore_checkpoint(
     Ok(format!(
         "Restored {} file(s) from checkpoint '{checkpoint_id}':\n{}",
         restored.len(),
-        restored.iter().map(|f| format!("  - {f}")).collect::<Vec<_>>().join("\n")
+        restored
+            .iter()
+            .map(|f| format!("  - {f}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     ))
 }
 
-fn diff_checkpoint(
-    project_root: &std::path::Path,
-    checkpoint_id: &str,
-) -> Result<String, String> {
+fn diff_checkpoint(project_root: &std::path::Path, checkpoint_id: &str) -> Result<String, String> {
     validate_checkpoint_id(checkpoint_id)?;
     let checkpoint_dir = checkpoints_dir(project_root).join(checkpoint_id);
 
@@ -348,7 +371,8 @@ fn diff_checkpoint(
     // silently falling back to the un-canonicalized path.
     let base = checkpoints_dir(project_root);
     let _ = std::fs::create_dir_all(&base);
-    let resolved = checkpoint_dir.canonicalize()
+    let resolved = checkpoint_dir
+        .canonicalize()
         .map_err(|_| format!("Checkpoint '{checkpoint_id}' not found."))?;
     let base_resolved = base.canonicalize().unwrap_or(base.clone());
     if !resolved.starts_with(&base_resolved) {
@@ -362,8 +386,8 @@ fn diff_checkpoint(
 
     let data = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("Failed to read manifest: {e}"))?;
-    let manifest: CheckpointManifest = serde_json::from_str(&data)
-        .map_err(|e| format!("Failed to parse manifest: {e}"))?;
+    let manifest: CheckpointManifest =
+        serde_json::from_str(&data).map_err(|e| format!("Failed to parse manifest: {e}"))?;
 
     let mut diffs = Vec::new();
     for file in &manifest.files {

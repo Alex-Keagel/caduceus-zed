@@ -41,9 +41,7 @@ pub enum CaduceusMemoryReadToolOutput {
 impl From<CaduceusMemoryReadToolOutput> for LanguageModelToolResultContent {
     fn from(output: CaduceusMemoryReadToolOutput) -> Self {
         match output {
-            CaduceusMemoryReadToolOutput::Value { key, value } => {
-                format!("{key}: {value}").into()
-            }
+            CaduceusMemoryReadToolOutput::Value { key, value } => format!("{key}: {value}").into(),
             CaduceusMemoryReadToolOutput::Entries { entries } => {
                 if entries.is_empty() {
                     "No memories stored.".into()
@@ -106,11 +104,12 @@ impl AgentTool for CaduceusMemoryReadTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let project_root = self.project_root.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusMemoryReadToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusMemoryReadToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             match input.operation {
                 MemoryReadOperation::Get { key } => {

@@ -67,7 +67,9 @@ impl BackgroundAgentConfig {
         match self.status.as_str() {
             "running" => caduceus_bridge::orchestrator::BackgroundStatus::Running,
             "paused" => caduceus_bridge::orchestrator::BackgroundStatus::Paused,
-            "completed" => caduceus_bridge::orchestrator::BackgroundStatus::Completed("done".into()),
+            "completed" => {
+                caduceus_bridge::orchestrator::BackgroundStatus::Completed("done".into())
+            }
             "stopped" | "cancelled" => caduceus_bridge::orchestrator::BackgroundStatus::Cancelled,
             _ => caduceus_bridge::orchestrator::BackgroundStatus::Failed(self.status.clone()),
         }
@@ -116,8 +118,7 @@ impl AgentConfigStore {
 
     fn load(&self, id: &str) -> Result<BackgroundAgentConfig, String> {
         let path = self.dir.join(format!("{id}.json"));
-        let json = std::fs::read_to_string(&path)
-            .map_err(|_| format!("Agent '{id}' not found"))?;
+        let json = std::fs::read_to_string(&path).map_err(|_| format!("Agent '{id}' not found"))?;
         serde_json::from_str(&json).map_err(|e| format!("Parse error: {e}"))
     }
 
@@ -128,11 +129,7 @@ impl AgentConfigStore {
         };
         entries
             .flatten()
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map_or(false, |ext| ext == "json")
-            })
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
             .filter_map(|e| {
                 std::fs::read_to_string(e.path())
                     .ok()
@@ -144,7 +141,9 @@ impl AgentConfigStore {
 
 fn validate_agent_id(id: &str) -> Result<(), String> {
     if id.contains('/') || id.contains('\\') || id.contains("..") || id.is_empty() {
-        return Err(format!("Invalid agent id: '{id}' — must not contain path separators"));
+        return Err(format!(
+            "Invalid agent id: '{id}' — must not contain path separators"
+        ));
     }
     Ok(())
 }

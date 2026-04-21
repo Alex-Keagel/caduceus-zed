@@ -59,9 +59,7 @@ impl From<CaduceusGitReadToolOutput> for LanguageModelToolResultContent {
     fn from(output: CaduceusGitReadToolOutput) -> Self {
         match output {
             CaduceusGitReadToolOutput::Text { text } => text.into(),
-            CaduceusGitReadToolOutput::Error { error } => {
-                format!("Git error: {error}").into()
-            }
+            CaduceusGitReadToolOutput::Error { error } => format!("Git error: {error}").into(),
         }
     }
 }
@@ -117,11 +115,12 @@ impl AgentTool for CaduceusGitReadTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let engine = self.engine.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusGitReadToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusGitReadToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             let result = match input.operation {
                 GitReadOperation::Branch => engine.git_branch(),
@@ -154,7 +153,14 @@ impl AgentTool for CaduceusGitReadTool {
                 GitReadOperation::Log => engine.git_log(input.count).map(|commits| {
                     commits
                         .iter()
-                        .map(|c| format!("{} {} — {}", crate::tools::truncate_str(&c.sha, 7), c.message, c.author))
+                        .map(|c| {
+                            format!(
+                                "{} {} — {}",
+                                crate::tools::truncate_str(&c.sha, 7),
+                                c.message,
+                                c.author
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join("\n")
                 }),
@@ -164,9 +170,13 @@ impl AgentTool for CaduceusGitReadTool {
                         f.commits_behind, f.is_diverged, f.is_stale
                     )
                 }),
-                GitReadOperation::Diverged => engine
-                    .git_check_diverged()
-                    .map(|d| if d { "Diverged from remote".to_string() } else { "In sync with remote".to_string() }),
+                GitReadOperation::Diverged => engine.git_check_diverged().map(|d| {
+                    if d {
+                        "Diverged from remote".to_string()
+                    } else {
+                        "In sync with remote".to_string()
+                    }
+                }),
                 GitReadOperation::Worktrees => engine.git_list_worktrees().map(|wts| {
                     if wts.is_empty() {
                         "No worktrees".to_string()

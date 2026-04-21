@@ -385,7 +385,9 @@ impl NativeAgent {
         let weak_thread = thread_handle.downgrade();
         thread_handle.update(cx, |thread, cx| {
             thread.set_summarization_model(summarization_model, cx);
-            let engine = self.projects.get(&project.entity_id())
+            let engine = self
+                .projects
+                .get(&project.entity_id())
                 .and_then(|ps| ps.caduceus_engine.clone());
             thread.add_default_tools(
                 Rc::new(NativeThreadEnvironment {
@@ -522,59 +524,94 @@ impl NativeAgent {
                         log::info!("[caduceus] Project already indexed, skipping");
                     } else {
                         log::info!("[caduceus] Auto-indexing project: {}", root.display());
-                    let ignore_patterns = load_caduceuignore(&root);
-                    if !ignore_patterns.is_empty() {
-                        log::info!("[caduceus] Loaded {} .caduceuignore patterns", ignore_patterns.len());
-                    }
-
-                    // Index project files in background using the shared engine
-                    match engine_clone.index_directory(&root).await {
-                        Ok(chunks) => log::info!("[caduceus] Indexed {} chunks", chunks),
-                        Err(e) => log::warn!("[caduceus] Index failed: {e}"),
-                    }
-
-                    // Populate wiki with project overview
-                    let wiki_root = root.clone();
-                    let readme_path = root.join("README.md");
-                    let readme = std::fs::read_to_string(&readme_path).unwrap_or_default();
-
-                    // Build project structure page
-                    let mut structure = String::from("# Project Structure\n\n");
-                    if let Ok(entries) = std::fs::read_dir(&root) {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            if name.starts_with('.') { continue; }
-                            if !should_index_path(&entry.path(), &ignore_patterns) { continue; }
-                            let kind = if entry.path().is_dir() { "📁" } else { "📄" };
-                            structure.push_str(&format!("- {kind} {name}\n"));
+                        let ignore_patterns = load_caduceuignore(&root);
+                        if !ignore_patterns.is_empty() {
+                            log::info!(
+                                "[caduceus] Loaded {} .caduceuignore patterns",
+                                ignore_patterns.len()
+                            );
                         }
-                    }
 
-                    // Write wiki pages
-                    let _ = caduceus_bridge::memory::store_system(&wiki_root, caduceus_bridge::memory::KEY_PROJECT_OVERVIEW, &structure);
-                    if !readme.is_empty() {
-                        let _ = caduceus_bridge::memory::store_system(&wiki_root, caduceus_bridge::memory::KEY_README, &readme);
-                    }
+                        // Index project files in background using the shared engine
+                        match engine_clone.index_directory(&root).await {
+                            Ok(chunks) => log::info!("[caduceus] Indexed {} chunks", chunks),
+                            Err(e) => log::warn!("[caduceus] Index failed: {e}"),
+                        }
 
-                    // Git context
-                    if let Ok(branch) = engine_clone.git_branch() {
-                        let _ = caduceus_bridge::memory::store_system(&wiki_root, caduceus_bridge::memory::KEY_GIT_BRANCH, &branch);
-                    }
-                    if let Ok(log) = engine_clone.git_log(10) {
-                        let log_text: String = log.iter()
-                            .map(|c| format!("{} — {}", crate::tools::truncate_str(&c.sha, 7), c.message))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let _ = caduceus_bridge::memory::store_system(&wiki_root, caduceus_bridge::memory::KEY_RECENT_COMMITS, &log_text);
-                    }
+                        // Populate wiki with project overview
+                        let wiki_root = root.clone();
+                        let readme_path = root.join("README.md");
+                        let readme = std::fs::read_to_string(&readme_path).unwrap_or_default();
 
-                    log::info!("[caduceus] Wiki populated for {}", root.display());
+                        // Build project structure page
+                        let mut structure = String::from("# Project Structure\n\n");
+                        if let Ok(entries) = std::fs::read_dir(&root) {
+                            for entry in entries.flatten() {
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                if name.starts_with('.') {
+                                    continue;
+                                }
+                                if !should_index_path(&entry.path(), &ignore_patterns) {
+                                    continue;
+                                }
+                                let kind = if entry.path().is_dir() {
+                                    "📁"
+                                } else {
+                                    "📄"
+                                };
+                                structure.push_str(&format!("- {kind} {name}\n"));
+                            }
+                        }
 
-                    // Memory size is now managed by JSON store with MAX_ENTRIES=100 cap.
-                    // No manual trimming needed — the store enforces limits on write.
+                        // Write wiki pages
+                        let _ = caduceus_bridge::memory::store_system(
+                            &wiki_root,
+                            caduceus_bridge::memory::KEY_PROJECT_OVERVIEW,
+                            &structure,
+                        );
+                        if !readme.is_empty() {
+                            let _ = caduceus_bridge::memory::store_system(
+                                &wiki_root,
+                                caduceus_bridge::memory::KEY_README,
+                                &readme,
+                            );
+                        }
+
+                        // Git context
+                        if let Ok(branch) = engine_clone.git_branch() {
+                            let _ = caduceus_bridge::memory::store_system(
+                                &wiki_root,
+                                caduceus_bridge::memory::KEY_GIT_BRANCH,
+                                &branch,
+                            );
+                        }
+                        if let Ok(log) = engine_clone.git_log(10) {
+                            let log_text: String = log
+                                .iter()
+                                .map(|c| {
+                                    format!(
+                                        "{} — {}",
+                                        crate::tools::truncate_str(&c.sha, 7),
+                                        c.message
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let _ = caduceus_bridge::memory::store_system(
+                                &wiki_root,
+                                caduceus_bridge::memory::KEY_RECENT_COMMITS,
+                                &log_text,
+                            );
+                        }
+
+                        log::info!("[caduceus] Wiki populated for {}", root.display());
+
+                        // Memory size is now managed by JSON store with MAX_ENTRIES=100 cap.
+                        // No manual trimming needed — the store enforces limits on write.
                     } // end if !already_indexed
                 }
-            }).detach();
+            })
+            .detach();
         }
     }
 
@@ -952,13 +989,17 @@ impl NativeAgent {
         // Caduceus built-in commands — always available, even without a project
         let mut commands = vec![
             acp::AvailableCommand::new("compact", "Compress conversation context to free tokens"),
-            acp::AvailableCommand::new("mode", "Show or switch Caduceus mode")
-                .input(acp::AvailableCommandInput::Unstructured(
-                    acp::UnstructuredCommandInput::new("<plan|act|research|autopilot|architect|debug|review>"),
+            acp::AvailableCommand::new("mode", "Show or switch Caduceus mode").input(
+                acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
+                    "<plan|act|research|autopilot|architect|debug|review>",
                 )),
+            ),
             acp::AvailableCommand::new("context", "Show context usage and zone status"),
             acp::AvailableCommand::new("checkpoint", "Create a code checkpoint for rollback"),
-            acp::AvailableCommand::new("dag", "Show the index-access DAG (which agents are reading/writing engine state)"),
+            acp::AvailableCommand::new(
+                "dag",
+                "Show the index-access DAG (which agents are reading/writing engine state)",
+            ),
             acp::AvailableCommand::new("help", "Show all Caduceus commands"),
             acp::AvailableCommand::new("review", "Review code for security issues"),
             acp::AvailableCommand::new("headless", "Generate CLI command for headless execution")
@@ -967,11 +1008,15 @@ impl NativeAgent {
                 )),
             acp::AvailableCommand::new("map", "Show project repo map (tree-sitter outline)"),
             acp::AvailableCommand::new("start", "Getting started guide for new users"),
-            acp::AvailableCommand::new("status", "Show unified Caduceus dashboard with all metrics"),
-            acp::AvailableCommand::new("search", "Semantic search across indexed code")
-                .input(acp::AvailableCommandInput::Unstructured(
-                    acp::UnstructuredCommandInput::new("<query>"),
+            acp::AvailableCommand::new(
+                "status",
+                "Show unified Caduceus dashboard with all metrics",
+            ),
+            acp::AvailableCommand::new("search", "Semantic search across indexed code").input(
+                acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
+                    "<query>",
                 )),
+            ),
             acp::AvailableCommand::new("index", "Index project for semantic search"),
         ];
 
@@ -2068,8 +2113,7 @@ impl CaduceusSessionModes {
         vec![
             acp::SessionMode::new("plan", "Plan")
                 .description("Read-only analysis and strategy. No code changes."),
-            acp::SessionMode::new("act", "Act")
-                .description("Execute code changes with approval."),
+            acp::SessionMode::new("act", "Act").description("Execute code changes with approval."),
             acp::SessionMode::new("research", "Research")
                 .description("Read-only exploration. Summarize findings."),
             acp::SessionMode::new("autopilot", "Autopilot")
@@ -2187,7 +2231,10 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         session_id: &acp::SessionId,
         cx: &App,
     ) -> Option<Rc<dyn acp_thread::AgentSessionModes>> {
-        self.0.read(cx).sessions.get(session_id)
+        self.0
+            .read(cx)
+            .sessions
+            .get(session_id)
             .map(|session| session.caduceus_modes.clone() as Rc<dyn acp_thread::AgentSessionModes>)
     }
 
@@ -2205,10 +2252,8 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         if let Some(acp::ContentBlock::Text(text)) = params.prompt.first() {
             let trimmed = text.text.trim();
             if let Some(cmd) = trimmed.strip_prefix('/') {
-                let (command, args) =
-                    cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
-                if let Some(response) =
-                    self.handle_caduceus_command(command, args, &session_id, cx)
+                let (command, args) = cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
+                if let Some(response) = self.handle_caduceus_command(command, args, &session_id, cx)
                 {
                     return response;
                 }

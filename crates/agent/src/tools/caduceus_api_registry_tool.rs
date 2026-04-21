@@ -165,13 +165,12 @@ impl CaduceusApiRegistryTool {
                 // Check exact filename matches
                 for (pattern, schema_type) in schema_patterns {
                     if file_name == *pattern {
-                        let (title, version, endpoint_count) = if *schema_type == "openapi"
-                            || *schema_type == "swagger"
-                        {
-                            Self::parse_openapi_basic(&path)
-                        } else {
-                            (None, None, 0)
-                        };
+                        let (title, version, endpoint_count) =
+                            if *schema_type == "openapi" || *schema_type == "swagger" {
+                                Self::parse_openapi_basic(&path)
+                            } else {
+                                (None, None, 0)
+                            };
                         apis.push(ApiEntry {
                             name: format!("{repo_name}/{file_name}"),
                             repo: repo_name.to_string(),
@@ -217,10 +216,7 @@ impl CaduceusApiRegistryTool {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
             let title = val["info"]["title"].as_str().map(String::from);
             let version = val["info"]["version"].as_str().map(String::from);
-            let endpoint_count = val["paths"]
-                .as_object()
-                .map(|p| p.len())
-                .unwrap_or(0);
+            let endpoint_count = val["paths"].as_object().map(|p| p.len()).unwrap_or(0);
             return (title, version, endpoint_count);
         }
 
@@ -233,7 +229,13 @@ impl CaduceusApiRegistryTool {
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("title:") {
-                title = Some(trimmed.trim_start_matches("title:").trim().trim_matches('"').to_string());
+                title = Some(
+                    trimmed
+                        .trim_start_matches("title:")
+                        .trim()
+                        .trim_matches('"')
+                        .to_string(),
+                );
             } else if trimmed.starts_with("version:") && version.is_none() {
                 version = Some(
                     trimmed
@@ -274,9 +276,7 @@ impl AgentTool for CaduceusApiRegistryTool {
             match &input.operation {
                 ApiRegistryOperation::Scan => "Scan for APIs".into(),
                 ApiRegistryOperation::List => "List APIs".into(),
-                ApiRegistryOperation::Show { api_name } => {
-                    format!("Show API: {api_name}").into()
-                }
+                ApiRegistryOperation::Show { api_name } => format!("Show API: {api_name}").into(),
             }
         } else {
             "API Registry".into()
@@ -290,17 +290,18 @@ impl AgentTool for CaduceusApiRegistryTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusApiRegistryToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusApiRegistryToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             match input.operation {
                 ApiRegistryOperation::Scan => {
-                    let config = self.load_project_config().map_err(|e| {
-                        CaduceusApiRegistryToolOutput::Error { error: e }
-                    })?;
+                    let config = self
+                        .load_project_config()
+                        .map_err(|e| CaduceusApiRegistryToolOutput::Error { error: e })?;
 
                     let mut all_apis = Vec::new();
                     for (name, repo) in &config.repos {
@@ -319,19 +320,21 @@ impl AgentTool for CaduceusApiRegistryTool {
 
                     let count = all_apis.len();
                     let registry = ApiRegistry { apis: all_apis };
-                    self.save_registry(&registry).map_err(|e| {
-                        CaduceusApiRegistryToolOutput::Error { error: e }
-                    })?;
+                    self.save_registry(&registry)
+                        .map_err(|e| CaduceusApiRegistryToolOutput::Error { error: e })?;
 
                     Ok(CaduceusApiRegistryToolOutput::Text {
-                        text: format!("Scanned {} repos, found {} API schemas. Saved to .caduceus/apis.json",
-                            config.repos.len(), count),
+                        text: format!(
+                            "Scanned {} repos, found {} API schemas. Saved to .caduceus/apis.json",
+                            config.repos.len(),
+                            count
+                        ),
                     })
                 }
                 ApiRegistryOperation::List => {
-                    let registry = self.load_registry().map_err(|e| {
-                        CaduceusApiRegistryToolOutput::Error { error: e }
-                    })?;
+                    let registry = self
+                        .load_registry()
+                        .map_err(|e| CaduceusApiRegistryToolOutput::Error { error: e })?;
 
                     if registry.apis.is_empty() {
                         Ok(CaduceusApiRegistryToolOutput::Text {
@@ -352,9 +355,9 @@ impl AgentTool for CaduceusApiRegistryTool {
                     }
                 }
                 ApiRegistryOperation::Show { api_name } => {
-                    let registry = self.load_registry().map_err(|e| {
-                        CaduceusApiRegistryToolOutput::Error { error: e }
-                    })?;
+                    let registry = self
+                        .load_registry()
+                        .map_err(|e| CaduceusApiRegistryToolOutput::Error { error: e })?;
 
                     if let Some(api) = registry.apis.iter().find(|a| a.name == api_name) {
                         let mut text = format!("# {}\n\n", api.name);
@@ -397,7 +400,9 @@ impl AgentTool for CaduceusApiRegistryTool {
                         Ok(CaduceusApiRegistryToolOutput::Text { text })
                     } else {
                         Err(CaduceusApiRegistryToolOutput::Error {
-                            error: format!("API '{api_name}' not found. Run `list` to see available APIs."),
+                            error: format!(
+                                "API '{api_name}' not found. Run `list` to see available APIs."
+                            ),
                         })
                     }
                 }

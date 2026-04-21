@@ -6882,16 +6882,19 @@ async fn test_caduceus_c5_token_cache_invalidates_on_send(cx: &mut TestAppContex
         .unwrap();
     cx.run_until_parked();
     fake_model.send_last_completion_stream_text_chunk("ok-1");
-    fake_model.send_last_completion_stream_event(
-        LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
-    );
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::EndTurn));
     fake_model.end_last_completion_stream();
     let _ = events.collect::<Vec<_>>().await;
 
     // Read the estimate — this populates the cache.
     let est1 = thread.update(cx, |t, _| t.estimate_total_tokens());
     let cached1 = thread.read_with(cx, |t, _| t.cached_token_estimate_for_test());
-    assert!(est1 > 0, "after one exchange estimate must be > 0, got {}", est1);
+    assert!(
+        est1 > 0,
+        "after one exchange estimate must be > 0, got {}",
+        est1
+    );
     assert_eq!(
         cached1,
         Some(est1),
@@ -6899,8 +6902,7 @@ async fn test_caduceus_c5_token_cache_invalidates_on_send(cx: &mut TestAppContex
     );
 
     // Send a much longer second message.
-    let long_text =
-        "This is a substantially longer second message intended to materially \
+    let long_text = "This is a substantially longer second message intended to materially \
          change the token count so the cache, if not invalidated, would report a \
          stale value below the true total.";
     let events = thread
@@ -6908,9 +6910,8 @@ async fn test_caduceus_c5_token_cache_invalidates_on_send(cx: &mut TestAppContex
         .unwrap();
     cx.run_until_parked();
     fake_model.send_last_completion_stream_text_chunk("ok-2");
-    fake_model.send_last_completion_stream_event(
-        LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
-    );
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::EndTurn));
     fake_model.end_last_completion_stream();
     let _ = events.collect::<Vec<_>>().await;
 
@@ -6934,9 +6935,15 @@ async fn test_caduceus_bug14_extract_gated_on_cancel(cx: &mut TestAppContext) {
 
     // Baseline: not cancelled, gen 0.
     let (cancelled0, gen0) = thread.read_with(cx, |t, _| {
-        (t.last_turn_cancelled_for_test(), t.turn_generation_for_test())
+        (
+            t.last_turn_cancelled_for_test(),
+            t.turn_generation_for_test(),
+        )
     });
-    assert!(!cancelled0, "fresh thread should not be flagged as cancelled");
+    assert!(
+        !cancelled0,
+        "fresh thread should not be flagged as cancelled"
+    );
     assert_eq!(gen0, 0);
 
     // Start a turn but cancel mid-stream (no Stop event sent → still in-flight).
@@ -6957,7 +6964,10 @@ async fn test_caduceus_bug14_extract_gated_on_cancel(cx: &mut TestAppContext) {
 
     // After cancel: flag is set, generation bumped — extraction is gated off.
     let (cancelled1, gen1) = thread.read_with(cx, |t, _| {
-        (t.last_turn_cancelled_for_test(), t.turn_generation_for_test())
+        (
+            t.last_turn_cancelled_for_test(),
+            t.turn_generation_for_test(),
+        )
     });
     assert!(
         cancelled1,
@@ -6978,14 +6988,16 @@ async fn test_caduceus_bug14_extract_gated_on_cancel(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
     fake_model.send_last_completion_stream_text_chunk("done");
-    fake_model.send_last_completion_stream_event(
-        LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
-    );
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::EndTurn));
     fake_model.end_last_completion_stream();
     let _ = events.collect::<Vec<_>>().await;
 
     let (cancelled2, gen2) = thread.read_with(cx, |t, _| {
-        (t.last_turn_cancelled_for_test(), t.turn_generation_for_test())
+        (
+            t.last_turn_cancelled_for_test(),
+            t.turn_generation_for_test(),
+        )
     });
     assert!(
         !cancelled2,
@@ -7007,18 +7019,14 @@ async fn test_caduceus_c2_turn_generation_monotonic(cx: &mut TestAppContext) {
     for i in 0..3 {
         let events = thread
             .update(cx, |t, cx| {
-                t.send(
-                    UserMessageId::new(),
-                    [format!("turn {i}").as_str()],
-                    cx,
-                )
+                t.send(UserMessageId::new(), [format!("turn {i}").as_str()], cx)
             })
             .unwrap();
         cx.run_until_parked();
         fake_model.send_last_completion_stream_text_chunk("x");
-        fake_model.send_last_completion_stream_event(
-            LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
-        );
+        fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(
+            StopReason::EndTurn,
+        ));
         fake_model.end_last_completion_stream();
         let _ = events.collect::<Vec<_>>().await;
 
@@ -7088,7 +7096,11 @@ async fn test_caduceus_bug20_session_scoped_tasks_abort_on_drop(cx: &mut TestApp
 
     // Drop the Vec — this is the session-drop equivalent. Every Task<()>
     // inside is dropped, and gpui aborts on drop.
-    drop(std::sync::Arc::try_unwrap(tasks).map(|m| m.into_inner().unwrap()).ok());
+    drop(
+        std::sync::Arc::try_unwrap(tasks)
+            .map(|m| m.into_inner().unwrap())
+            .ok(),
+    );
 
     // Advance the executor past the timer deadline. If the bug is back
     // (.detach() leaks the future), `completed` would flip to true.
@@ -7127,7 +7139,11 @@ async fn test_caduceus_c4_pin_ordering_survives_messages(cx: &mut TestAppContext
     });
     assert_eq!(
         labels0,
-        vec!["alpha".to_string(), "bravo".to_string(), "charlie".to_string()],
+        vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string()
+        ],
         "pins must be FIFO at insertion time"
     );
 
@@ -7145,9 +7161,9 @@ async fn test_caduceus_c4_pin_ordering_survives_messages(cx: &mut TestAppContext
             .unwrap();
         cx.run_until_parked();
         fake_model.send_last_completion_stream_text_chunk("ack");
-        fake_model.send_last_completion_stream_event(
-            LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
-        );
+        fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(
+            StopReason::EndTurn,
+        ));
         fake_model.end_last_completion_stream();
         let _ = events.collect::<Vec<_>>().await;
     }
@@ -7198,9 +7214,7 @@ async fn test_caduceus_c4_pin_ordering_survives_messages(cx: &mut TestAppContext
 // and the DAG so regressions cannot silently break the panel/`/dag` view.
 // ========================================================================
 #[gpui::test]
-async fn test_caduceus_register_running_subagent_records_dag_spawn(
-    cx: &mut TestAppContext,
-) {
+async fn test_caduceus_register_running_subagent_records_dag_spawn(cx: &mut TestAppContext) {
     init_test(cx);
     cx.update(|cx| {
         cx.update_flags(true, vec!["subagents".to_string()]);
@@ -7210,8 +7224,7 @@ async fn test_caduceus_register_running_subagent_records_dag_spawn(
     fs.insert_tree(path!("/test"), json!({})).await;
     let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
     let project_context = cx.new(|_cx| ProjectContext::default());
-    let context_server_store =
-        project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
     let context_server_registry =
         cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
     let model = Arc::new(FakeLanguageModel::default());
@@ -7234,9 +7247,7 @@ async fn test_caduceus_register_running_subagent_records_dag_spawn(
     // global registry, so we assert deltas, not absolute counts.
     let version_before = caduceus_bridge::index_dag::version();
     let spawns_before = caduceus_bridge::index_dag::spawn_snapshot();
-    let had_pair_before = spawns_before
-        .iter()
-        .any(|e| e.child_id == child_session_id);
+    let had_pair_before = spawns_before.iter().any(|e| e.child_id == child_session_id);
     assert!(
         !had_pair_before,
         "fresh subagent SessionId should not already have a spawn edge"

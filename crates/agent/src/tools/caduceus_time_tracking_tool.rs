@@ -112,17 +112,18 @@ impl AgentTool for CaduceusTimeTrackingTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         let tracker = self.tracker.clone();
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusTimeTrackingToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusTimeTrackingToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
-            let mut guard = tracker.lock().map_err(|e| {
-                CaduceusTimeTrackingToolOutput::Error {
+            let mut guard = tracker
+                .lock()
+                .map_err(|e| CaduceusTimeTrackingToolOutput::Error {
                     error: format!("Lock poisoned: {e}"),
-                }
-            })?;
+                })?;
 
             let text = match input.operation {
                 TimeTrackingOperation::StartTask {
@@ -152,8 +153,7 @@ impl AgentTool for CaduceusTimeTrackingTool {
                     format!("Completed task {task_id} (actual: {actual_minutes:.0} min)")
                 }
                 TimeTrackingOperation::Velocity => {
-                    let v =
-                        caduceus_bridge::orchestrator::OrchestratorBridge::velocity(&guard);
+                    let v = caduceus_bridge::orchestrator::OrchestratorBridge::velocity(&guard);
                     format!("Velocity: {v:.2}")
                 }
                 TimeTrackingOperation::OverdueTasks => {
@@ -174,10 +174,12 @@ impl AgentTool for CaduceusTimeTrackingTool {
                 }
                 TimeTrackingOperation::TotalEstimated => {
                     let total =
-                        caduceus_bridge::orchestrator::OrchestratorBridge::total_estimated(
-                            &guard,
-                        );
-                    format!("Total estimated: {:.1} hours ({:.0} min)", total, total * 60.0)
+                        caduceus_bridge::orchestrator::OrchestratorBridge::total_estimated(&guard);
+                    format!(
+                        "Total estimated: {:.1} hours ({:.0} min)",
+                        total,
+                        total * 60.0
+                    )
                 }
                 TimeTrackingOperation::TotalActual => {
                     let total =
