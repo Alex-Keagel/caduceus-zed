@@ -89,21 +89,21 @@ impl AgentTool for CaduceusModeRequestTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
-            let input = input.recv().await.map_err(|e| {
-                CaduceusModeRequestToolOutput::Error {
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| CaduceusModeRequestToolOutput::Error {
                     error: format!("Failed to receive input: {e}"),
-                }
-            })?;
+                })?;
 
             // P9: mode catalog is dynamic — source from the bridge so new
             // engine-side modes appear without a tool recompile. Legacy
             // names (architect/debug/review) still normalize via
             // `AgentMode::from_str_loose` on the engine side.
-            let canonical_modes: Vec<String> =
-                caduceus_bridge::orchestrator::list_modes()
-                    .into_iter()
-                    .map(|m| m.name)
-                    .collect();
+            let canonical_modes: Vec<String> = caduceus_bridge::orchestrator::list_modes()
+                .into_iter()
+                .map(|m| m.name)
+                .collect();
             let legacy_aliases = ["architect", "debug", "review", "auto"];
             let is_known = canonical_modes.iter().any(|m| m == &input.mode)
                 || legacy_aliases.contains(&input.mode.as_str());

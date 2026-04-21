@@ -1,20 +1,18 @@
 //! Orchestrator bridge — agent harness, conversation history, instructions,
 //! PRD parsing, task management, progress inference, scaffolding, and tree visualization.
 
-use caduceus_orchestrator::{
-    AgentHarness, ConversationHistory, execute_tool_calls,
-    AgentEventEmitter,
-    instructions::{self, InstructionLoader, InstructionSet},
-    PrdParser, PrdTask, TaskRecommender, TaskRecommendation,
-    ProgressInferrer, InferredProgress,
-    AgentScaffolder, SkillScaffolder,
-    ExecutionTreeViz,
-    TimeTracker,
-    TaskTree, HierarchicalTask,
-};
 use caduceus_core::AgentEvent;
 use caduceus_core::{ModelId, ProviderId, SessionState};
-use caduceus_mcp::{McpServerManager, mcp_tool_bridge::{McpToolBridge, McpInvoker}};
+use caduceus_mcp::{
+    McpServerManager,
+    mcp_tool_bridge::{McpInvoker, McpToolBridge},
+};
+use caduceus_orchestrator::{
+    AgentEventEmitter, AgentHarness, AgentScaffolder, ConversationHistory, ExecutionTreeViz,
+    HierarchicalTask, InferredProgress, PrdParser, PrdTask, ProgressInferrer, SkillScaffolder,
+    TaskRecommendation, TaskRecommender, TaskTree, TimeTracker, execute_tool_calls,
+    instructions::{self, InstructionLoader, InstructionSet},
+};
 use caduceus_providers::LlmAdapter;
 use caduceus_tools::ToolRegistry;
 use std::path::{Path, PathBuf};
@@ -22,68 +20,66 @@ use std::sync::Arc;
 
 // Re-export orchestrator types for consumers.
 pub use caduceus_orchestrator::{
-    PrdTask as BridgePrdTask,
-    TaskRecommendation as BridgeTaskRecommendation,
-    InferredProgress as BridgeInferredProgress,
-    ExecutionTreeViz as BridgeExecutionTreeViz,
+    ExecutionTreeViz as BridgeExecutionTreeViz, HierarchicalTask as BridgeHierarchicalTask,
+    InferredProgress as BridgeInferredProgress, PrdTask as BridgePrdTask,
+    TaskRecommendation as BridgeTaskRecommendation, TaskTree as BridgeTaskTree,
+    TimeEntry as BridgeTimeEntry, TimeTracker as BridgeTimeTracker,
     VizTreeNode as BridgeVizTreeNode,
-    TimeTracker as BridgeTimeTracker,
-    TimeEntry as BridgeTimeEntry,
-    TaskTree as BridgeTaskTree,
-    HierarchicalTask as BridgeHierarchicalTask,
-    kanban::{KanbanBoard, KanbanCard, KanbanColumn, CardStatus},
-    automations::{Automation, AutomationTrigger, AutomationAgentConfig, AutomationRegistry},
-    context::{self, ContextZone, ContextSource, ContextAssembler, AssembledContext, estimate_tokens, ContextManager, PinnedContext},
-    compaction::{self, CompactMessage, CompactionPipeline, ContextStats, CompactionTrigger},
-    workers::{TaskDAG, TaskDefinition, TaskStatus, SharedContext, TeamResult, AgentConfig},
+    automations::{Automation, AutomationAgentConfig, AutomationRegistry, AutomationTrigger},
     background::{BackgroundAgent, BackgroundStatus},
+    compaction::{self, CompactMessage, CompactionPipeline, CompactionTrigger, ContextStats},
+    context::{
+        self, AssembledContext, ContextAssembler, ContextManager, ContextSource, ContextZone,
+        PinnedContext, estimate_tokens,
+    },
     headless::{HeadlessConfig, HeadlessResult, OutputFormat as HeadlessOutputFormat},
+    kanban::{CardStatus, KanbanBoard, KanbanCard, KanbanColumn},
     mentions::MentionResolver,
+    workers::{AgentConfig, SharedContext, TaskDAG, TaskDefinition, TaskStatus, TeamResult},
 };
 
 // Re-export types needed by tools.
-pub use caduceus_orchestrator::modes::AgentMode as BridgeAgentMode;
-pub use caduceus_orchestrator::modes::{
-    ActionPlan as BridgeActionPlan, AmendError as BridgeAmendError,
-    AppliedAmendment as BridgeAppliedAmendment, PlanAmendment as BridgePlanAmendment,
-    PlannedAction as BridgePlannedAction,
+pub use caduceus_core::ModelId as BridgeModelId;
+pub use caduceus_core::TokenBudget as BridgeTokenBudget;
+pub use caduceus_orchestrator::automations::AutomationResult as BridgeAutomationResult;
+pub use caduceus_orchestrator::broadcast_bus::{
+    BroadcastBus as BridgeBroadcastBus, BusError as BridgeBusError, BusMessage as BridgeBusMessage,
+};
+pub use caduceus_orchestrator::checkpoint::{
+    BatchState as BridgeBatchState, CheckpointError as BridgeCheckpointError,
+    CheckpointId as BridgeCheckpointId, CheckpointStore as BridgeCheckpointStore,
+    FileSnapshot as BridgeFileSnapshot, ToolBatchCheckpoint as BridgeToolBatchCheckpoint,
+};
+pub use caduceus_orchestrator::compaction_scorer::{
+    self as bridge_compaction_scorer, BradleyTerryModel as BridgeBradleyTerryModel,
+    Pair as BridgeBradleyTerryPair,
+};
+pub use caduceus_orchestrator::compaction_telemetry::{
+    CompactionEvent as BridgeCompactionEvent, CompactionTelemetry as BridgeCompactionTelemetry,
+    StrategyName as BridgeStrategyName,
+};
+pub use caduceus_orchestrator::context_fold::{
+    ExpandError as BridgeExpandError, FoldedTranscript as BridgeFoldedTranscript,
+    TranscriptId as BridgeTranscriptId, TranscriptStore as BridgeTranscriptStore,
+};
+pub use caduceus_orchestrator::learned_selector::{
+    LearnedSelector as BridgeLearnedSelector, SelectionMode as BridgeSelectionMode,
 };
 pub use caduceus_orchestrator::memory_blocks::{
     ArchivalSummary as BridgeArchivalSummary, BlockLimits as BridgeBlockLimits,
     CompactionReport as BridgeMemoryCompactionReport, MemoryBlocks as BridgeMemoryBlocks,
     WorkingMessage as BridgeWorkingMessage,
 };
-pub use caduceus_orchestrator::context_fold::{
-    ExpandError as BridgeExpandError, FoldedTranscript as BridgeFoldedTranscript,
-    TranscriptId as BridgeTranscriptId, TranscriptStore as BridgeTranscriptStore,
-};
-pub use caduceus_orchestrator::compaction_telemetry::{
-    CompactionEvent as BridgeCompactionEvent,
-    CompactionTelemetry as BridgeCompactionTelemetry, StrategyName as BridgeStrategyName,
-};
-pub use caduceus_orchestrator::compaction_scorer::{
-    self as bridge_compaction_scorer, BradleyTerryModel as BridgeBradleyTerryModel,
-    Pair as BridgeBradleyTerryPair,
-};
-pub use caduceus_orchestrator::learned_selector::{
-    LearnedSelector as BridgeLearnedSelector, SelectionMode as BridgeSelectionMode,
-};
-pub use caduceus_core::TokenBudget as BridgeTokenBudget;
-pub use caduceus_orchestrator::checkpoint::{
-    BatchState as BridgeBatchState, CheckpointError as BridgeCheckpointError,
-    CheckpointId as BridgeCheckpointId, CheckpointStore as BridgeCheckpointStore,
-    FileSnapshot as BridgeFileSnapshot, ToolBatchCheckpoint as BridgeToolBatchCheckpoint,
-};
-pub use caduceus_orchestrator::broadcast_bus::{
-    BroadcastBus as BridgeBroadcastBus, BusError as BridgeBusError,
-    BusMessage as BridgeBusMessage,
+pub use caduceus_orchestrator::modes::AgentMode as BridgeAgentMode;
+pub use caduceus_orchestrator::modes::{
+    ActionPlan as BridgeActionPlan, AmendError as BridgeAmendError,
+    AppliedAmendment as BridgeAppliedAmendment, PlanAmendment as BridgePlanAmendment,
+    PlannedAction as BridgePlannedAction,
 };
 pub use caduceus_orchestrator::notifications::{
     self as bridge_notifications, NOTIFICATIONS_CHANNEL as BRIDGE_NOTIFICATIONS_CHANNEL,
     Notification as BridgeNotification, Severity as BridgeNotificationSeverity,
 };
-pub use caduceus_orchestrator::automations::AutomationResult as BridgeAutomationResult;
-pub use caduceus_core::ModelId as BridgeModelId;
 
 // ── P7.1 — StepId on SessionState (G26) ─────────────────────────────────
 pub use caduceus_core::StepId as BridgeStepId;
@@ -104,11 +100,9 @@ pub use caduceus_eval::{
 
 // ── P8.1 / P8.2 / P8.4 — Step verification & process-reward ─────────────
 pub use caduceus_core::{
-    EnsembleCombiner as BridgeEnsembleCombiner,
-    EnsembleStepVerifier as BridgeEnsembleStepVerifier,
+    EnsembleCombiner as BridgeEnsembleCombiner, EnsembleStepVerifier as BridgeEnsembleStepVerifier,
     ObservedToolCall as BridgeObservedToolCall, OffStepVerifier as BridgeOffStepVerifier,
-    StepScore as BridgeStepScore, StepVerifier as BridgeStepVerifier,
-    StepView as BridgeStepView,
+    StepScore as BridgeStepScore, StepVerifier as BridgeStepVerifier, StepView as BridgeStepView,
 };
 pub use caduceus_orchestrator::rollout_prm::RolloutPrmVerifier as BridgeRolloutPrmVerifier;
 
@@ -126,8 +120,8 @@ pub fn apply_plan_amendment(
     plan: &mut BridgeActionPlan,
     amendment_json: &str,
 ) -> Result<BridgeAppliedAmendment, BridgeAmendError> {
-    let amendment: BridgePlanAmendment = serde_json::from_str(amendment_json)
-        .map_err(|_| BridgeAmendError::StaleRevision {
+    let amendment: BridgePlanAmendment =
+        serde_json::from_str(amendment_json).map_err(|_| BridgeAmendError::StaleRevision {
             expected: 0,
             actual: plan.revision,
         })?;
@@ -278,10 +272,7 @@ pub fn new_memory_blocks(limits: BridgeBlockLimits) -> BridgeMemoryBlocks {
 
 /// Set the persona block. Returns the number of chars dropped due to
 /// the cap (0 if under limit).
-pub fn set_memory_persona(
-    blocks: &mut BridgeMemoryBlocks,
-    text: impl Into<String>,
-) -> usize {
+pub fn set_memory_persona(blocks: &mut BridgeMemoryBlocks, text: impl Into<String>) -> usize {
     blocks.set_persona(text)
 }
 
@@ -294,10 +285,7 @@ pub fn set_memory_project_context(
 }
 
 /// Append a single message to working history.
-pub fn append_working_message(
-    blocks: &mut BridgeMemoryBlocks,
-    msg: BridgeWorkingMessage,
-) {
+pub fn append_working_message(blocks: &mut BridgeMemoryBlocks, msg: BridgeWorkingMessage) {
     blocks.append_working(msg);
 }
 
@@ -398,10 +386,7 @@ pub fn new_compaction_telemetry() -> BridgeCompactionTelemetry {
 
 /// Append an event to the ring. Oldest event is evicted FIFO when
 /// the ring is full.
-pub fn record_compaction_event(
-    tel: &mut BridgeCompactionTelemetry,
-    ev: BridgeCompactionEvent,
-) {
+pub fn record_compaction_event(tel: &mut BridgeCompactionTelemetry, ev: BridgeCompactionEvent) {
     tel.record(ev);
 }
 
@@ -526,9 +511,7 @@ pub fn count_tokens_exact(text: &str) -> u32 {
     use std::sync::OnceLock;
     static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
 
-    let bpe = BPE.get_or_init(|| {
-        tiktoken_rs::get_bpe_from_model("gpt-4o").ok()
-    });
+    let bpe = BPE.get_or_init(|| tiktoken_rs::get_bpe_from_model("gpt-4o").ok());
 
     match bpe {
         Some(encoder) => encoder.encode_ordinary(text).len() as u32,
@@ -547,8 +530,7 @@ pub struct OrchestratorBridge {
     /// Optional per-project Reflexion memory (P12.4). Wrapped in
     /// `Arc<Mutex<…>>` so the bridge, harness, and IPC handlers all
     /// share the same instance.
-    reflexion:
-        Option<Arc<std::sync::Mutex<caduceus_orchestrator::reflexion::ReflexionMemory>>>,
+    reflexion: Option<Arc<std::sync::Mutex<caduceus_orchestrator::reflexion::ReflexionMemory>>>,
     /// Optional Tree-of-Thoughts planner config (P12.3) attached to
     /// every harness.
     tot_config: Option<caduceus_orchestrator::branching_planner::PlannerConfig>,
@@ -675,8 +657,7 @@ pub fn wrap_event_json(event: &AgentEvent) -> Result<String, String> {
 /// flag set when the producer's schema version is newer than this build —
 /// the UI can then surface a "client out of date" hint.
 pub fn parse_versioned_event_json(s: &str) -> Result<(AgentEvent, bool), String> {
-    let envelope: BridgeVersionedAgentEvent =
-        serde_json::from_str(s).map_err(|e| e.to_string())?;
+    let envelope: BridgeVersionedAgentEvent = serde_json::from_str(s).map_err(|e| e.to_string())?;
     let from_newer = envelope.is_from_newer_producer();
     Ok((envelope.event, from_newer))
 }
@@ -698,10 +679,7 @@ impl OrchestratorBridge {
     /// cloneable; the same `Arc`-backed map is shared by the bridge,
     /// harness, and any external prefetcher (UI worker) that calls
     /// [`OrchestratorBridge::speculative_cache`].
-    pub fn with_speculative_cache(
-        mut self,
-        cache: caduceus_tools::SpeculativeCache,
-    ) -> Self {
+    pub fn with_speculative_cache(mut self, cache: caduceus_tools::SpeculativeCache) -> Self {
         self.speculative_cache = Some(cache);
         self
     }
@@ -725,9 +703,7 @@ impl OrchestratorBridge {
     /// to the IPC layer.
     pub fn with_reflexion(
         mut self,
-        memory: Arc<
-            std::sync::Mutex<caduceus_orchestrator::reflexion::ReflexionMemory>,
-        >,
+        memory: Arc<std::sync::Mutex<caduceus_orchestrator::reflexion::ReflexionMemory>>,
     ) -> Self {
         self.reflexion = Some(memory);
         self
@@ -743,8 +719,7 @@ impl OrchestratorBridge {
     /// outcomes from the agent panel after each turn completes.
     pub fn reflexion(
         &self,
-    ) -> Option<&Arc<std::sync::Mutex<caduceus_orchestrator::reflexion::ReflexionMemory>>>
-    {
+    ) -> Option<&Arc<std::sync::Mutex<caduceus_orchestrator::reflexion::ReflexionMemory>>> {
         self.reflexion.as_ref()
     }
 
@@ -780,15 +755,11 @@ impl OrchestratorBridge {
     /// Convenience: install the planner config defaults
     /// (`PlannerConfig::default`).
     pub fn with_default_tot_config(self) -> Self {
-        self.with_tot_config(
-            caduceus_orchestrator::branching_planner::PlannerConfig::default(),
-        )
+        self.with_tot_config(caduceus_orchestrator::branching_planner::PlannerConfig::default())
     }
 
     /// Borrow the bound ToT planner config (if any).
-    pub fn tot_config(
-        &self,
-    ) -> Option<&caduceus_orchestrator::branching_planner::PlannerConfig> {
+    pub fn tot_config(&self) -> Option<&caduceus_orchestrator::branching_planner::PlannerConfig> {
         self.tot_config.as_ref()
     }
 
@@ -831,9 +802,7 @@ impl OrchestratorBridge {
                 let name = tool_name.clone();
                 Box::pin(async move {
                     match mgr.call_tool(&name, input).await {
-                        Ok(value) => Ok(caduceus_core::ToolResult::success(
-                            value.to_string(),
-                        )),
+                        Ok(value) => Ok(caduceus_core::ToolResult::success(value.to_string())),
                         Err(e) => Ok(caduceus_core::ToolResult::error(format!(
                             "mcp call '{name}' failed: {e}"
                         ))),
@@ -875,8 +844,7 @@ impl OrchestratorBridge {
         prior_mcp_names: &std::collections::HashSet<String>,
     ) -> (usize, usize, std::collections::HashSet<String>) {
         let defs = manager.all_tools().await;
-        let live: std::collections::HashSet<String> =
-            defs.iter().map(|d| d.name.clone()).collect();
+        let live: std::collections::HashSet<String> = defs.iter().map(|d| d.name.clone()).collect();
 
         // Removals first so a name reused by a different server is
         // re‑bound cleanly.
@@ -1012,7 +980,12 @@ impl OrchestratorBridge {
         tools: ToolRegistry,
         system_prompt: &str,
     ) -> (AgentHarness, tokio::sync::mpsc::Sender<(String, bool)>) {
-        self.build_harness_with_approval(provider, tools, system_prompt, Self::DEFAULT_APPROVAL_TOOLS)
+        self.build_harness_with_approval(
+            provider,
+            tools,
+            system_prompt,
+            Self::DEFAULT_APPROVAL_TOOLS,
+        )
     }
 
     /// Build a harness with a caller-supplied approval set. Pass an empty
@@ -1079,8 +1052,7 @@ impl OrchestratorBridge {
         ReplayHandle,
         tokio::sync::mpsc::Receiver<AgentEvent>,
     ) {
-        let (emitter, event_rx) =
-            AgentEventEmitter::channel(Self::DEFAULT_EVENT_CHANNEL_BUFFER);
+        let (emitter, event_rx) = AgentEventEmitter::channel(Self::DEFAULT_EVENT_CHANNEL_BUFFER);
         let replay_handle = ReplayHandle::new(emitter.clone());
         let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
             .with_tool_timeout(std::time::Duration::from_secs(120))
@@ -1116,7 +1088,10 @@ impl OrchestratorBridge {
         state: &mut SessionState,
         user_input: &str,
     ) -> Result<String, String> {
-        harness.run_turn(state, user_input).await.map_err(|e| e.to_string())
+        harness
+            .run_turn(state, user_input)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Run a single agent turn with streaming.
@@ -1125,7 +1100,10 @@ impl OrchestratorBridge {
         state: &mut SessionState,
         user_input: &str,
     ) -> Result<String, String> {
-        harness.stream_turn(state, user_input).await.map_err(|e| e.to_string())
+        harness
+            .stream_turn(state, user_input)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     // ── PRD parsing ──────────────────────────────────────────────────────
@@ -1324,22 +1302,31 @@ mod tests {
 
     #[test]
     fn orchestrator_extract_memories_no_signal() {
-        let memories = OrchestratorBridge::extract_memories(
-            "What is 2+2?",
-            "4.",
-        );
+        let memories = OrchestratorBridge::extract_memories("What is 2+2?", "4.");
         assert!(memories.is_empty(), "No preference signal");
     }
 
     #[test]
     fn default_approval_tools_covers_destructive_set() {
-        let set: std::collections::HashSet<_> =
-            OrchestratorBridge::DEFAULT_APPROVAL_TOOLS.iter().copied().collect();
+        let set: std::collections::HashSet<_> = OrchestratorBridge::DEFAULT_APPROVAL_TOOLS
+            .iter()
+            .copied()
+            .collect();
         // Regression guard: removing any of these silently disables HITL for
         // a tool that mutates user state. If you intentionally drop one,
         // delete the assertion together with the constant entry.
-        for required in ["bash", "shell", "write_file", "edit_file", "delete_file", "apply_patch"] {
-            assert!(set.contains(required), "DEFAULT_APPROVAL_TOOLS missing {required}");
+        for required in [
+            "bash",
+            "shell",
+            "write_file",
+            "edit_file",
+            "delete_file",
+            "apply_patch",
+        ] {
+            assert!(
+                set.contains(required),
+                "DEFAULT_APPROVAL_TOOLS missing {required}"
+            );
         }
     }
 
@@ -1387,7 +1374,7 @@ mod tests {
                 content_blocks: None,
                 tool_calls: vec![],
                 tool_result: None,
-            cache_breakpoint: false,
+                cache_breakpoint: false,
             });
         }
         assert_eq!(history.len(), 10);
@@ -1453,9 +1440,8 @@ mod tests {
 
     #[test]
     fn orchestrator_infer_dependencies() {
-        let tasks = OrchestratorBridge::parse_prd(
-            "# Auth\nBuild auth.\n# API\nRequires Auth module.",
-        );
+        let tasks =
+            OrchestratorBridge::parse_prd("# Auth\nBuild auth.\n# API\nRequires Auth module.");
         let deps = OrchestratorBridge::infer_dependencies(&tasks);
         // "API" description mentions "Auth", so (1, 0) expected
         assert!(!deps.is_empty());
@@ -1466,9 +1452,8 @@ mod tests {
 
     #[test]
     fn orchestrator_recommend_next() {
-        let tasks = OrchestratorBridge::parse_prd(
-            "# Setup\nInit project.\n# Build\nBuild features.",
-        );
+        let tasks =
+            OrchestratorBridge::parse_prd("# Setup\nInit project.\n# Build\nBuild features.");
         let recs = OrchestratorBridge::recommend_next(&tasks, &[]);
         assert_eq!(recs.len(), 2);
         assert!(recs[0].score >= recs[1].score);
@@ -1696,7 +1681,10 @@ mod tests {
         // must outlive the call, and the replay handle must report the
         // emitter's configured cap (default = 200, per orchestrator).
         assert!(!approval_tx.is_closed(), "approval channel should be live");
-        assert!(replay_handle.retention_cap() > 0, "replay handle must wrap a retention-enabled emitter");
+        assert!(
+            replay_handle.retention_cap() > 0,
+            "replay handle must wrap a retention-enabled emitter"
+        );
         // Empty replay before any events have been emitted.
         let snap = OrchestratorBridge::replay_session_events(&replay_handle);
         assert!(snap.is_empty(), "replay must be empty before any emit");
@@ -1706,8 +1694,8 @@ mod tests {
 
     #[tokio::test]
     async fn replay_handle_observes_events_emitted_by_harness() {
-        use caduceus_providers::mock::MockLlmAdapter;
         use caduceus_core::SessionState;
+        use caduceus_providers::mock::MockLlmAdapter;
         // End-to-end: emitter wired into the harness, the bridge's
         // ReplayHandle observes events emitted during a real `run` call.
         let dir = tempfile::tempdir().unwrap();
@@ -1758,11 +1746,8 @@ mod tests {
     fn bridge_attaches_speculative_cache_to_harness() {
         use caduceus_providers::mock::MockLlmAdapter;
         let dir = tempfile::tempdir().unwrap();
-        let cache = caduceus_tools::SpeculativeCache::new(
-            std::time::Duration::from_secs(30),
-        );
-        let bridge = OrchestratorBridge::new(dir.path())
-            .with_speculative_cache(cache.clone());
+        let cache = caduceus_tools::SpeculativeCache::new(std::time::Duration::from_secs(30));
+        let bridge = OrchestratorBridge::new(dir.path()).with_speculative_cache(cache.clone());
         let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
         let h = bridge.build_harness_no_approval(provider, ToolRegistry::new(), "sys");
         assert!(
@@ -1848,13 +1833,11 @@ mod tests {
         let mut reg = ToolRegistry::new();
         let prior: HashSet<String> = HashSet::new();
         let (added, removed, live) =
-            OrchestratorBridge::register_mcp_tools_diff(mgr.clone(), &mut reg, &prior)
-                .await;
+            OrchestratorBridge::register_mcp_tools_diff(mgr.clone(), &mut reg, &prior).await;
         assert_eq!((added, removed), (0, 0));
         assert!(live.is_empty());
         // Idempotent: calling again with the new live set yields zero.
-        let (a2, r2, _) =
-            OrchestratorBridge::register_mcp_tools_diff(mgr, &mut reg, &live).await;
+        let (a2, r2, _) = OrchestratorBridge::register_mcp_tools_diff(mgr, &mut reg, &live).await;
         assert_eq!((a2, r2), (0, 0));
     }
 
@@ -1910,9 +1893,7 @@ mod tests {
         use caduceus_orchestrator::reflexion::ReflexionMemory;
         use caduceus_providers::mock::MockLlmAdapter;
         let dir = tempfile::tempdir().unwrap();
-        let cache = caduceus_tools::SpeculativeCache::new(
-            std::time::Duration::from_secs(60),
-        );
+        let cache = caduceus_tools::SpeculativeCache::new(std::time::Duration::from_secs(60));
         let mem = Arc::new(std::sync::Mutex::new(ReflexionMemory::new(4)));
         let bridge = OrchestratorBridge::new(dir.path())
             .with_speculative_cache(cache)
@@ -1932,7 +1913,10 @@ mod tests {
     fn p3_1_apply_replace_amendment_via_bridge() {
         let mut plan = BridgeActionPlan::new();
         plan.add("read_file", &serde_json::json!({"path": "/a"}));
-        plan.add("write_file", &serde_json::json!({"path": "/b", "content": "x"}));
+        plan.add(
+            "write_file",
+            &serde_json::json!({"path": "/b", "content": "x"}),
+        );
         let rev = plan.actions[0].revision;
         let amend = serde_json::json!({
             "kind": "replace",
@@ -2030,13 +2014,7 @@ mod tests {
             Some("old".into()),
         )
         .unwrap();
-        record_checkpoint_edit(
-            &mut store,
-            id,
-            PathBuf::from("/repo/new_file.rs"),
-            None,
-        )
-        .unwrap();
+        record_checkpoint_edit(&mut store, id, PathBuf::from("/repo/new_file.rs"), None).unwrap();
         commit_checkpoint(&mut store, id).unwrap();
 
         let snaps = revert_checkpoint(&mut store, id).unwrap();
@@ -2050,13 +2028,8 @@ mod tests {
         let mut store = new_checkpoint_store();
         let id = begin_checkpoint(&mut store, 0, "noop", 0);
         commit_checkpoint(&mut store, id).unwrap();
-        let err = record_checkpoint_edit(
-            &mut store,
-            id,
-            PathBuf::from("/x"),
-            Some("y".into()),
-        )
-        .unwrap_err();
+        let err = record_checkpoint_edit(&mut store, id, PathBuf::from("/x"), Some("y".into()))
+            .unwrap_err();
         assert!(matches!(err, BridgeCheckpointError::AlreadyCommitted(_)));
     }
 
@@ -2071,8 +2044,7 @@ mod tests {
     fn p3_3_double_revert_fails_closed() {
         let mut store = new_checkpoint_store();
         let id = begin_checkpoint(&mut store, 0, "edit", 0);
-        record_checkpoint_edit(&mut store, id, PathBuf::from("/a"), Some("x".into()))
-            .unwrap();
+        record_checkpoint_edit(&mut store, id, PathBuf::from("/a"), Some("x".into())).unwrap();
         commit_checkpoint(&mut store, id).unwrap();
         revert_checkpoint(&mut store, id).unwrap();
         let err = revert_checkpoint(&mut store, id).unwrap_err();
@@ -2128,13 +2100,10 @@ mod tests {
         let n = BridgeNotification::info("test", "title", "body");
         let delivered = publish_notification(&bus, n.clone()).unwrap();
         assert_eq!(delivered, 1);
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(msg.channel, BRIDGE_NOTIFICATIONS_CHANNEL);
         let parsed = parse_notification(&msg).unwrap();
         assert_eq!(parsed, n);
@@ -2145,13 +2114,10 @@ mod tests {
         let bus = BridgeBroadcastBus::new();
         let mut rx = subscribe_notifications(&bus);
         publish_automation_completion(&bus, &dummy_automation_result(true)).unwrap();
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let n = parse_notification(&msg).unwrap();
         assert_eq!(n.severity, BridgeNotificationSeverity::Info);
         assert_eq!(n.source, "automation:nightly");
@@ -2162,13 +2128,10 @@ mod tests {
         let bus = BridgeBroadcastBus::new();
         let mut rx = subscribe_notifications(&bus);
         publish_automation_completion(&bus, &dummy_automation_result(false)).unwrap();
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let n = parse_notification(&msg).unwrap();
         assert_eq!(n.severity, BridgeNotificationSeverity::Error);
         assert!(n.title.contains("failed"));
@@ -2325,7 +2288,12 @@ mod tests {
 
     // ── P5.1 — CompactionTelemetry bridge ────────────────────────────────
 
-    fn dummy_event(strategy: &str, t_before: u32, t_after: u32, turn: u32) -> BridgeCompactionEvent {
+    fn dummy_event(
+        strategy: &str,
+        t_before: u32,
+        t_after: u32,
+        turn: u32,
+    ) -> BridgeCompactionEvent {
         BridgeCompactionEvent {
             strategy: strategy.into(),
             tokens_before: t_before,
@@ -2407,7 +2375,11 @@ mod tests {
         ];
         let model = fit_bradley_terry(&events);
         let s_summ = model.scores.get("summarize").copied().unwrap_or(f64::NAN);
-        let s_tool = model.scores.get("tool_collapse").copied().unwrap_or(f64::NAN);
+        let s_tool = model
+            .scores
+            .get("tool_collapse")
+            .copied()
+            .unwrap_or(f64::NAN);
         assert!(
             s_summ > s_tool,
             "summarize ({s_summ}) should beat tool_collapse ({s_tool})"
@@ -2488,8 +2460,7 @@ mod tests {
             new_learned_selector(trained_model()),
             BridgeSelectionMode::Learned,
         );
-        let (top, margin) =
-            select_with_confidence(&sel, &["tool_collapse", "summarize"]).unwrap();
+        let (top, margin) = select_with_confidence(&sel, &["tool_collapse", "summarize"]).unwrap();
         assert_eq!(top, "summarize");
         // 0.9 - (-0.2) = 1.1
         assert!((margin - 1.1).abs() < 1e-9, "margin = {margin}");
@@ -2523,11 +2494,23 @@ mod tests {
 
     #[test]
     fn p6_7_mcp_error_kind_label_is_stable() {
-        assert_eq!(mcp_error_kind_label(BridgeMcpErrorKind::Transient), "transient");
+        assert_eq!(
+            mcp_error_kind_label(BridgeMcpErrorKind::Transient),
+            "transient"
+        );
         assert_eq!(mcp_error_kind_label(BridgeMcpErrorKind::Auth), "auth");
-        assert_eq!(mcp_error_kind_label(BridgeMcpErrorKind::NotFound), "not_found");
-        assert_eq!(mcp_error_kind_label(BridgeMcpErrorKind::Permission), "permission");
-        assert_eq!(mcp_error_kind_label(BridgeMcpErrorKind::Permanent), "permanent");
+        assert_eq!(
+            mcp_error_kind_label(BridgeMcpErrorKind::NotFound),
+            "not_found"
+        );
+        assert_eq!(
+            mcp_error_kind_label(BridgeMcpErrorKind::Permission),
+            "permission"
+        );
+        assert_eq!(
+            mcp_error_kind_label(BridgeMcpErrorKind::Permanent),
+            "permanent"
+        );
         assert_eq!(mcp_error_kind_label(BridgeMcpErrorKind::Config), "config");
     }
 
@@ -2541,7 +2524,11 @@ mod tests {
             BridgeMcpErrorKind::NotFound,
             BridgeMcpErrorKind::Permission,
         ] {
-            assert!(!mcp_error_kind_is_retryable(k), "{:?} must NOT be retryable", k);
+            assert!(
+                !mcp_error_kind_is_retryable(k),
+                "{:?} must NOT be retryable",
+                k
+            );
         }
     }
 
@@ -2551,8 +2538,14 @@ mod tests {
         ctx.write("a", "1").await;
         ctx.write("b", "2").await;
         let json = recorded_writes_json(&ctx).await;
-        assert!(json.contains("\"a\""), "audit json must include first key: {json}");
-        assert!(json.contains("\"b\""), "audit json must include second key: {json}");
+        assert!(
+            json.contains("\"a\""),
+            "audit json must include first key: {json}"
+        );
+        assert!(
+            json.contains("\"b\""),
+            "audit json must include second key: {json}"
+        );
         assert!(!shared_context_had_collisions(&ctx).await);
     }
 
@@ -2562,7 +2555,10 @@ mod tests {
         ctx.write("k", "v1").await;
         ctx.write("k", "v2").await; // collision
         let collisions = recorded_collisions_json(&ctx).await;
-        assert!(collisions.contains("\"overwrote\":true"), "collisions must record overwrite: {collisions}");
+        assert!(
+            collisions.contains("\"overwrote\":true"),
+            "collisions must record overwrite: {collisions}"
+        );
         assert!(shared_context_had_collisions(&ctx).await);
     }
 
@@ -2577,7 +2573,9 @@ mod tests {
 
     #[test]
     fn p6_9_wrap_round_trips_through_versioned_envelope() {
-        let event = AgentEvent::TextDelta { text: "hi".to_string() };
+        let event = AgentEvent::TextDelta {
+            text: "hi".to_string(),
+        };
         let json = wrap_event_json(&event).expect("wrap");
         assert!(json.contains(&format!("\"v\":{}", BRIDGE_AGENT_EVENT_SCHEMA_VERSION)));
         let (decoded, from_newer) = parse_versioned_event_json(&json).expect("parse");
@@ -2592,7 +2590,9 @@ mod tests {
     fn p6_9_newer_producer_is_flagged() {
         // Hand-craft an envelope claiming a newer schema version.
         let future_v = BRIDGE_AGENT_EVENT_SCHEMA_VERSION + 5;
-        let event = AgentEvent::TextDelta { text: "future".to_string() };
+        let event = AgentEvent::TextDelta {
+            text: "future".to_string(),
+        };
         let body = serde_json::to_string(&event).unwrap();
         let json = format!("{{\"v\":{},\"event\":{}}}", future_v, body);
         let (_decoded, from_newer) = parse_versioned_event_json(&json).expect("parse");
@@ -2802,6 +2802,158 @@ pub fn mode_allows_writes(mode: &str) -> bool {
     }
 }
 
+// ── P13c — catalog endpoints (personas, skills, models) ────────────────────
+//
+// The IDE renders the "who / what / how" of the agents-DAG and features-DAG
+// by querying these at startup + on-change. No hardcoded lists in the IDE.
+
+/// A persona the engine can spawn — e.g. `rubber-duck`, `cloud-architect`.
+///
+/// The Agents-DAG nodes (see `AssignmentSummaryV1`) carry a `persona_id`
+/// that MUST exist in this catalog; the IDE uses this to render labels,
+/// tooltips, and default-mode badges.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct BridgePersonaDescriptor {
+    pub name: String,
+    pub description: String,
+    /// Default mode this persona ships with (e.g. `plan`, `act`). Opaque
+    /// to the IDE — passed back to `mode_prompt_for_profile` if needed.
+    pub default_mode: String,
+    /// Tools this persona is pre-registered for. Advisory — the envelope
+    /// is the source of truth on what's actually allowed at runtime.
+    pub preferred_tools: Vec<String>,
+    /// Bounded model knobs — useful for UI cost/latency estimates.
+    pub temperature: f64,
+    pub max_tokens: u32,
+}
+
+/// Enumerate the built-in personas the orchestrator can dispatch. Returns
+/// a deterministic alphabetical order so the IDE mode-picker / sidebar is
+/// stable across runs.
+pub fn list_personas() -> Vec<BridgePersonaDescriptor> {
+    use caduceus_orchestrator::modes::PersonaRegistry;
+    let reg = PersonaRegistry::builtin_personas();
+    reg.list()
+        .into_iter()
+        .map(|p| BridgePersonaDescriptor {
+            name: p.name.clone(),
+            description: p.description.clone(),
+            default_mode: p.default_mode.clone(),
+            preferred_tools: p.preferred_tools.clone(),
+            temperature: p.temperature,
+            max_tokens: p.max_tokens,
+        })
+        .collect()
+}
+
+/// A skill the engine can activate from the workspace's `.caduceus/skills/`.
+///
+/// The IDE can render the Features-DAG with skill badges and let the user
+/// preview the full body on hover. `body_chars` is exposed separately from
+/// `body` so the UI can render a char-count without paying for the full
+/// prose until it's actually needed (all bundled skills already fit inside
+/// `MAX_INSTRUCTION_FILE_CHARS`, but the split keeps future truncation
+/// policies cheap).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct BridgeSkillDescriptor {
+    pub name: String,
+    pub description: String,
+    /// Full prose body. May have been truncated at load time (P3 loader);
+    /// check `budget_hint_chars` for the per-skill cap.
+    pub body: String,
+    pub body_chars: usize,
+    pub trigger_phrases: Vec<String>,
+    pub budget_hint_chars: Option<usize>,
+}
+
+/// Enumerate skills loaded from the workspace. Empty Vec for workspaces
+/// with no `.caduceus/skills/` dir. Result is alphabetized by name.
+///
+/// The IDE SHOULD call this on workspace open + when `.caduceus/skills/`
+/// mutates on disk (file watcher). Not event-driven via `AgentEvent`
+/// today — add a `SkillCatalogChanged` event if UIs need live updates
+/// without polling.
+pub fn list_bundled_skills(workspace_root: &Path) -> Result<Vec<BridgeSkillDescriptor>, String> {
+    let set = InstructionLoader::new(workspace_root)
+        .load()
+        .map_err(|e| e.to_string())?;
+    let mut out: Vec<BridgeSkillDescriptor> = set
+        .available_skills
+        .into_iter()
+        .map(|s| BridgeSkillDescriptor {
+            name: s.name,
+            description: s.description,
+            body_chars: s.body.chars().count(),
+            body: s.body,
+            trigger_phrases: s.trigger_phrases,
+            budget_hint_chars: s.budget_hint_chars,
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Coarse vendor + tier catalog for models the orchestrator can route to.
+///
+/// Exposes ONLY vendor + tier + a human label + the safety/cost class —
+/// never exact `model_id` strings. Exact ids are operator-configured and
+/// considered sensitive; they appear in `AssignmentSummaryV1.model_id_exact`
+/// only when `include_sensitive=true` is threaded from the bridge layer
+/// (P13d). This keeps rogue UIs or log scrapers from lifting the full
+/// routing config.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct BridgeModelDescriptor {
+    pub vendor: String,
+    pub tier: String,
+    pub label: String,
+    pub latency_class: String,
+    pub cost_class: String,
+}
+
+/// Return the vendor/tier catalog. Deliberately small — just Anthropic
+/// and OpenAI tiers that the orchestrator actively routes to. Adding a
+/// new vendor/tier here does NOT enable it in routing; that's operator
+/// config. This is purely the rendering vocabulary.
+pub fn list_models() -> Vec<BridgeModelDescriptor> {
+    vec![
+        BridgeModelDescriptor {
+            vendor: "anthropic".into(),
+            tier: "opus".into(),
+            label: "Anthropic · Opus tier".into(),
+            latency_class: "slow".into(),
+            cost_class: "high".into(),
+        },
+        BridgeModelDescriptor {
+            vendor: "anthropic".into(),
+            tier: "sonnet".into(),
+            label: "Anthropic · Sonnet tier".into(),
+            latency_class: "medium".into(),
+            cost_class: "medium".into(),
+        },
+        BridgeModelDescriptor {
+            vendor: "anthropic".into(),
+            tier: "haiku".into(),
+            label: "Anthropic · Haiku tier".into(),
+            latency_class: "fast".into(),
+            cost_class: "low".into(),
+        },
+        BridgeModelDescriptor {
+            vendor: "openai".into(),
+            tier: "opus".into(),
+            label: "OpenAI · top tier (GPT-5-class)".into(),
+            latency_class: "slow".into(),
+            cost_class: "high".into(),
+        },
+        BridgeModelDescriptor {
+            vendor: "openai".into(),
+            tier: "mini".into(),
+            label: "OpenAI · mini tier".into(),
+            latency_class: "fast".into(),
+            cost_class: "low".into(),
+        },
+    ]
+}
+
 #[cfg(test)]
 mod p9_tests {
     use super::*;
@@ -2855,5 +3007,114 @@ mod p9_tests {
         // Unknown mode falls back to Plan.
         let unknown = mode_prompt_for_profile("banana", None);
         assert_eq!(unknown, p);
+    }
+}
+
+#[cfg(test)]
+mod p13c_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn list_personas_includes_domain_specialists_and_is_alphabetized() {
+        let p = list_personas();
+        assert!(!p.is_empty());
+        // Must expose the 7 domain specialists used by the critique fan-out.
+        for want in [
+            "rubber-duck",
+            "cloud-architect",
+            "ml-architect",
+            "data-engineer",
+            "data-researcher",
+            "data-scientist",
+            "qa-strategist",
+        ] {
+            assert!(
+                p.iter().any(|pp| pp.name == want),
+                "missing persona {want} in catalog"
+            );
+        }
+        // Alphabetical order — stable UI.
+        let mut sorted: Vec<&str> = p.iter().map(|pp| pp.name.as_str()).collect();
+        sorted.sort();
+        let got: Vec<&str> = p.iter().map(|pp| pp.name.as_str()).collect();
+        assert_eq!(got, sorted, "personas must be returned alphabetized");
+    }
+
+    #[test]
+    fn list_personas_default_mode_is_valid_mode_name() {
+        let modes: Vec<String> = list_modes().into_iter().map(|m| m.name).collect();
+        for p in list_personas() {
+            assert!(
+                modes.contains(&p.default_mode),
+                "persona {} has unknown default_mode {}",
+                p.name,
+                p.default_mode
+            );
+        }
+    }
+
+    #[test]
+    fn list_bundled_skills_empty_workspace_is_ok_and_empty() {
+        // Empty tempdir — no .caduceus/skills/ at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let got = list_bundled_skills(tmp.path()).expect("load succeeds");
+        assert!(got.is_empty(), "empty workspace → empty skills catalog");
+    }
+
+    #[test]
+    fn list_bundled_skills_reads_dir_based_layout_and_sorts() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let skills_dir = root.join(".caduceus").join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        for name in ["zebra", "alpha", "mango"] {
+            let d = skills_dir.join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(
+                d.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: {name} does a thing.\n---\n\nBody for {name}.\n"
+                ),
+            )
+            .unwrap();
+        }
+        let got = list_bundled_skills(root).expect("load succeeds");
+        assert_eq!(got.len(), 3);
+        let names: Vec<&str> = got.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mango", "zebra"], "alphabetized");
+        for s in &got {
+            assert!(!s.description.is_empty());
+            assert!(s.body.contains("Body for"));
+            assert_eq!(s.body.chars().count(), s.body_chars);
+        }
+    }
+
+    #[test]
+    fn list_models_exposes_vendor_tier_but_no_exact_ids() {
+        let m = list_models();
+        assert!(!m.is_empty());
+        // At minimum, Anthropic opus + OpenAI opus tier must be present —
+        // these are the primary orchestrator + cross-check vendors.
+        assert!(m.iter().any(|x| x.vendor == "anthropic" && x.tier == "opus"));
+        assert!(m.iter().any(|x| x.vendor == "openai" && x.tier == "opus"));
+        // Cost / latency classes are present on every entry.
+        for entry in &m {
+            assert!(!entry.latency_class.is_empty());
+            assert!(!entry.cost_class.is_empty());
+            assert!(!entry.label.is_empty());
+        }
+        // Security: descriptor must not leak exact model ids. Serialize
+        // and assert no `model_id` field exists in the wire format.
+        let wire = serde_json::to_string(&m[0]).unwrap();
+        assert!(
+            !wire.contains("model_id"),
+            "list_models() wire format must NOT expose exact model_id — got {wire}"
+        );
+    }
+
+    #[test]
+    fn list_models_is_deterministic_across_calls() {
+        assert_eq!(list_models(), list_models());
     }
 }
