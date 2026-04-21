@@ -33,6 +33,18 @@ pub mod tree_sitter;
 
 pub use engine::CaduceusEngine;
 
+// ST-B2 / contract `envelope-surface-v1` — Bridge re-exports
+// `PermissionEnvelope` as `BridgePermissionEnvelope` so downstream IDE
+// consumers (agent panel, settings UI, tool gates) don't have to reach
+// across crates into `caduceus-permissions`. The type *is* the
+// orchestrator's `caduceus_permissions::PermissionEnvelope` — no serde
+// mirror, no boilerplate copy — so preset bytes round-trip byte-equal
+// in both directions (golden-bytes test in `orchestrator::tests`).
+pub use caduceus_permissions::envelope::{
+    ApprovalCadence, EnvelopeScope, ExecPolicy, FanoutPolicy, NetworkPolicy, PathAllowlist,
+    PermissionEnvelope as BridgePermissionEnvelope,
+};
+
 // P13d — live two-DAG state reducer (features + agents + snapshot). IDE
 // clients feed AgentEvents in and call `active_*` projections to render.
 pub use dag_state::{

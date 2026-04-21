@@ -18,6 +18,8 @@ use caduceus_tools::ToolRegistry;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::BridgePermissionEnvelope;
+
 // Re-export orchestrator types for consumers.
 pub use caduceus_orchestrator::{
     ExecutionTreeViz as BridgeExecutionTreeViz, HierarchicalTask as BridgeHierarchicalTask,
@@ -1065,6 +1067,62 @@ impl OrchestratorBridge {
         (harness, approval_tx, handle)
     }
 
+    /// ST-B2 / contract `envelope-surface-v1` — build a harness pre-wired
+    /// with a caller-supplied [`BridgePermissionEnvelope`] (plus HITL
+    /// approval on the default tool set). The envelope flows straight
+    /// through to `AgentHarness::with_permission_envelope` — no
+    /// translation layer, no serde mirror, so the same bytes produced by
+    /// `PermissionEnvelope::*_preset()` drive the harness's runtime
+    /// permission checks.
+    ///
+    /// Note: this builder does **not** install an introspection sink. For
+    /// the full Phase-B surface (envelope + sink + DAG handle), use
+    /// [`build_harness_with_envelope_and_sink`].
+    pub fn build_harness_with_envelope(
+        &self,
+        provider: Arc<dyn LlmAdapter>,
+        tools: ToolRegistry,
+        system_prompt: &str,
+        envelope: BridgePermissionEnvelope,
+    ) -> (AgentHarness, tokio::sync::mpsc::Sender<(String, bool)>) {
+        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
+            .with_tool_timeout(std::time::Duration::from_secs(120))
+            .with_instructions(&self.project_root)
+            .with_permission_envelope(envelope);
+        let base = self.attach_p12(base);
+        base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()))
+    }
+
+    /// ST-B2 / contract `envelope-surface-v1` combined with `harness-sink-v1`
+    /// — the canonical Phase-B entry point. Returns a harness pre-wired
+    /// with both a permission envelope AND an introspection sink; returns
+    /// the approval channel and the reducer handle alongside the harness.
+    ///
+    /// Returns `(harness, approval_tx, reducer_handle)`.
+    pub fn build_harness_with_envelope_and_sink(
+        &self,
+        provider: Arc<dyn LlmAdapter>,
+        tools: ToolRegistry,
+        system_prompt: &str,
+        envelope: BridgePermissionEnvelope,
+    ) -> (
+        AgentHarness,
+        tokio::sync::mpsc::Sender<(String, bool)>,
+        crate::dag_state::ReducerHandle,
+    ) {
+        let handle = self.new_reducer_handle();
+        let sink: Arc<dyn caduceus_orchestrator::IntrospectionSink> = Arc::new(handle.clone());
+        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
+            .with_tool_timeout(std::time::Duration::from_secs(120))
+            .with_instructions(&self.project_root)
+            .with_permission_envelope(envelope)
+            .with_introspection_sink(sink);
+        let base = self.attach_p12(base);
+        let (harness, approval_tx) =
+            base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()));
+        (harness, approval_tx, handle)
+    }
+
     // ── Emitter / replay seam (G17) ──────────────────────────────────────
 
     /// Default in-flight buffer for the emitter mpsc channel handed to the
@@ -1399,6 +1457,155 @@ mod tests {
         // Channel still exists but no tool will ever block on it.
         let (_h, tx) = bridge.build_harness_with_approval::<&str>(provider, tools, "test", &[]);
         assert!(!tx.is_closed());
+    }
+
+    /// ST-B2 / `envelope-surface-v1` — preset-bytes round-trip.
+    ///
+    /// The bridge-level `BridgePermissionEnvelope` is a straight
+    /// re-export of `caduceus_permissions::PermissionEnvelope`, so
+    /// serialising a preset built through either the bridge path or the
+    /// engine path MUST produce byte-equal JSON. This is the invariant
+    /// that lets both layers share the same envelope without a
+    /// translation layer.
+    #[test]
+    fn envelope_surface_preset_bytes_round_trip_equal() {
+        use caduceus_permissions::envelope::PermissionEnvelope;
+
+        let presets: &[(&str, BridgePermissionEnvelope, PermissionEnvelope)] = &[
+            (
+                "plan",
+                PermissionEnvelope::plan_preset(),
+                PermissionEnvelope::plan_preset(),
+            ),
+            (
+                "research",
+                PermissionEnvelope::research_preset(),
+                PermissionEnvelope::research_preset(),
+            ),
+            (
+                "act",
+                PermissionEnvelope::act_preset(vec!["src/**".into()], vec![]),
+                PermissionEnvelope::act_preset(vec!["src/**".into()], vec![]),
+            ),
+            (
+                "autopilot",
+                PermissionEnvelope::autopilot_preset(vec!["src/**".into()], vec![]),
+                PermissionEnvelope::autopilot_preset(vec!["src/**".into()], vec![]),
+            ),
+        ];
+        for (label, bridge, engine) in presets {
+            let b = serde_json::to_vec(bridge).unwrap();
+            let e = serde_json::to_vec(engine).unwrap();
+            assert_eq!(
+                b, e,
+                "{label}: BridgePermissionEnvelope bytes must equal engine bytes"
+            );
+            // And the round-trip must be semantically stable too.
+            let back: PermissionEnvelope = serde_json::from_slice(&b).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&back).unwrap(),
+                b,
+                "{label}: deserialize→reserialize must be byte-stable"
+            );
+        }
+    }
+
+    /// ST-B2 / `envelope-surface-v1` — `build_harness_with_envelope`
+    /// must thread the caller's envelope through to
+    /// `AgentHarness::permission_envelope()` unchanged.
+    #[tokio::test]
+    async fn build_harness_with_envelope_threads_envelope_to_harness() {
+        use caduceus_permissions::envelope::{FanoutPolicy, PermissionEnvelope};
+        use caduceus_providers::mock::MockLlmAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools = ToolRegistry::new();
+
+        // Pick a non-default envelope so the assertion actually proves threading.
+        let env = {
+            let mut e = PermissionEnvelope::research_preset();
+            e.fanout_policy = FanoutPolicy::MultiPersona;
+            e.skill_budget = 7;
+            e
+        };
+        let expected_bytes = serde_json::to_vec(&env).unwrap();
+
+        let (harness, _tx) =
+            bridge.build_harness_with_envelope(provider, tools, "test", env.clone());
+
+        let got = harness
+            .permission_envelope()
+            .expect("harness must carry the envelope threaded through by the bridge");
+        let got_bytes = serde_json::to_vec(got).unwrap();
+        assert_eq!(got_bytes, expected_bytes);
+    }
+
+    /// ST-B2 combined with ST-B1: `build_harness_with_envelope_and_sink`
+    /// must thread BOTH the envelope AND the reducer-backed sink, and
+    /// the returned reducer handle must be the one the sink feeds.
+    #[tokio::test]
+    async fn build_harness_with_envelope_and_sink_threads_both() {
+        use caduceus_orchestrator::critique_fanout::spawn_critique_fanout_via_harness;
+        use caduceus_orchestrator::modes::PersonaRegistry;
+        use caduceus_permissions::envelope::{FanoutPolicy, PermissionEnvelope};
+        use caduceus_providers::mock::MockLlmAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools = ToolRegistry::new();
+
+        let env = {
+            let mut e = PermissionEnvelope::research_preset();
+            e.fanout_policy = FanoutPolicy::MultiPersona;
+            e
+        };
+        let (harness, _tx, handle) = bridge.build_harness_with_envelope_and_sink(
+            provider,
+            tools,
+            "test",
+            env.clone(),
+        );
+
+        // Envelope threaded.
+        let got_env = harness.permission_envelope().expect("envelope");
+        assert_eq!(
+            serde_json::to_vec(got_env).unwrap(),
+            serde_json::to_vec(&env).unwrap()
+        );
+
+        // Sink threaded — driving the harness-aware fan-out must populate
+        // the reducer handle returned by the builder.
+        let reg = PersonaRegistry::builtin_personas();
+        use async_trait::async_trait;
+        use caduceus_core::Critique;
+        use caduceus_core::CritiqueSeverity;
+        struct R;
+        #[async_trait]
+        impl caduceus_orchestrator::critique_fanout::CritiqueRunner for R {
+            async fn critique(
+                &self,
+                persona: &str,
+                _prefix: &str,
+                _plan: &str,
+                _env: &PermissionEnvelope,
+            ) -> Result<Critique, anyhow::Error> {
+                Ok(Critique {
+                    persona: persona.to_string(),
+                    severity: CritiqueSeverity::Info,
+                    findings: vec![],
+                    blocking: false,
+                })
+            }
+            fn model_metadata(&self, _persona: &str) -> (String, String) {
+                ("anthropic".into(), "opus".into())
+            }
+        }
+        let got = spawn_critique_fanout_via_harness(&harness, "plan", &["cloud"], &reg, &R).await;
+        assert_eq!(got.len(), 2, "rubber-duck + cloud");
+        assert_eq!(handle.active_agents_dag(true).nodes.len(), 2);
     }
 
     /// ST-B1 / `harness-sink-v1`: the harness built by `build_harness_with_sink`
