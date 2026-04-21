@@ -8,6 +8,7 @@ target_dir="release"
 open_result=false
 local_install=false
 can_code_sign=false
+clean_after=false
 
 # This must match the team in the provisioning profile.
 IDENTITY="Zed Industries, Inc."
@@ -23,11 +24,12 @@ Options:
   -d    Compile in debug mode
   -o    Open dir with the resulting DMG or launch the app itself in local mode.
   -i    Install the resulting DMG into /Applications.
+  -c    Clean intermediate target/ artifacts after bundling (keeps .app + .dmg).
   -h    Display this help and exit.
   "
 }
 
-while getopts 'dloih' flag
+while getopts 'dloich' flag
 do
     case "${flag}" in
         o) open_result=true;;
@@ -38,6 +40,7 @@ do
             target_dir="debug"
             ;;
         i) local_install=true;;
+        c) clean_after=true;;
         h)
            help_info
            exit 0
@@ -338,3 +341,29 @@ sign_app_binaries
 
 sign_binary "target/$target_triple/release/remote_server"
 gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+
+if [ "$clean_after" = true ]; then
+    echo "Cleaning intermediate target/ artifacts (keeping .app + .dmg)..."
+    # Preserve final outputs (.app bundle lives under dmg/, .dmg file, gz'd remote server) by moving to a staging dir.
+    staging="target/_bundle_keep"
+    rm -rf "$staging"
+    mkdir -p "$staging"
+    if [ -d "target/${target_triple}/release/dmg" ]; then
+        mv "target/${target_triple}/release/dmg" "$staging/dmg"
+    fi
+    for f in "target/${target_triple}/release/Zed-${arch_suffix}.dmg" "target/zed-remote-server-macos-${arch_suffix}.gz"; do
+        [ -f "$f" ] && mv "$f" "$staging/"
+    done
+    # Nuke the heavy dirs.
+    chmod -R u+w "target/${target_triple}" "target/release" 2>/dev/null || true
+    rm -rf "target/${target_triple}" "target/release"
+    # Restore outputs.
+    mkdir -p "target/${target_triple}/release"
+    [ -d "$staging/dmg" ] && mv "$staging/dmg" "target/${target_triple}/release/dmg"
+    for f in "$staging"/*.dmg "$staging"/*.gz; do
+        [ -f "$f" ] && mv "$f" "target/${target_triple}/release/" 2>/dev/null || true
+    done
+    rm -rf "$staging"
+    echo "Kept:"
+    find "target/${target_triple}/release" -maxdepth 2 \( -name '*.app' -o -name '*.dmg' -o -name '*.gz' \) 2>/dev/null
+fi
