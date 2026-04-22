@@ -155,6 +155,7 @@ dependencies = [
  "caduceus-marketplace",
  "caduceus-orchestrator",
  "caduceus-permissions",
+ "caduceus-providers",
  "caduceus-tools",
  "caduceus_bridge",
  "chrono",

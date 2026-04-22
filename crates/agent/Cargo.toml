@@ -37,6 +37,7 @@ caduceus-core.workspace = true
 caduceus-marketplace.workspace = true
 caduceus-orchestrator.workspace = true
 caduceus-permissions.workspace = true
+caduceus-providers.workspace = true
 collections.workspace = true
 context_server.workspace = true
 db.workspace = true

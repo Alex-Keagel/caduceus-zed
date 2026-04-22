@@ -5170,7 +5170,11 @@ fn dispatch_translated_event(
                 EngineDiagnosticSeverity::Info,
             );
         }
-        T::ToolResult { id, content, is_error } => {
+        T::ToolResult {
+            id,
+            content,
+            is_error,
+        } => {
             let severity = if *is_error {
                 EngineDiagnosticSeverity::Warning
             } else {
@@ -5187,7 +5191,11 @@ fn dispatch_translated_event(
         // `ToolCallAuthorization` is deferred to provider-adapter
         // since the oneshot response channel needs engine-side
         // plumbing through `approval_tx`.
-        T::PermissionRequest { id, tool, description } => {
+        T::PermissionRequest {
+            id,
+            tool,
+            description,
+        } => {
             stream.send_engine_diagnostic(
                 "permission.request",
                 format!("id={id} tool={tool}: {description}"),
@@ -5196,23 +5204,34 @@ fn dispatch_translated_event(
         }
 
         // Context notices — informational.
-        T::ContextWarning { level, used, max } => stream.send_context_notice(
-            "context.warning",
-            format!("{level}: {used}/{max} tokens"),
-        ),
-        T::ContextCompacted { freed, before, after } => stream.send_context_notice(
+        T::ContextWarning { level, used, max } => {
+            stream.send_context_notice("context.warning", format!("{level}: {used}/{max} tokens"))
+        }
+        T::ContextCompacted {
+            freed,
+            before,
+            after,
+        } => stream.send_context_notice(
             "context.compacted",
             format!("freed {freed} tokens ({before} → {after})"),
         ),
-        T::ContextEvicted { strategy, groups, total_tokens } => stream.send_context_notice(
+        T::ContextEvicted {
+            strategy,
+            groups,
+            total_tokens,
+        } => stream.send_context_notice(
             "context.evicted",
             format!("{strategy}: {groups} groups, {total_tokens} tokens"),
         ),
-        T::ModeChanged { from_mode, to_mode, .. } => stream.send_context_notice(
-            "mode.changed",
-            format!("{from_mode} → {to_mode}"),
-        ),
-        T::ScopeExpansion { capability, resource, tool, reason } => {
+        T::ModeChanged {
+            from_mode, to_mode, ..
+        } => stream.send_context_notice("mode.changed", format!("{from_mode} → {to_mode}")),
+        T::ScopeExpansion {
+            capability,
+            resource,
+            tool,
+            reason,
+        } => {
             stream.send_engine_diagnostic(
                 "scope.expansion",
                 format!("tool={tool} capability={capability} resource={resource}: {reason}"),
@@ -5226,22 +5245,25 @@ fn dispatch_translated_event(
         // adapter will reinstate once AttemptStatus is available.
         T::Retry { kind, message } => {
             let label = format!("{kind:?}: {message}");
-            stream.send_engine_diagnostic(
-                "retry",
-                label,
-                EngineDiagnosticSeverity::Warning,
-            );
+            stream.send_engine_diagnostic("retry", label, EngineDiagnosticSeverity::Warning);
         }
 
         // Plan — context notice until full acp::Plan mapping lands.
-        T::PlanStep { step, tool, description, .. } => stream.send_context_notice(
-            "plan.step",
-            format!("#{step} {tool}: {description}"),
-        ),
-        T::PlanAmended { kind, step, ok, reason, .. } => stream.send_context_notice(
-            "plan.amended",
-            format!("#{step} {kind} ok={ok}: {reason}"),
-        ),
+        T::PlanStep {
+            step,
+            tool,
+            description,
+            ..
+        } => stream.send_context_notice("plan.step", format!("#{step} {tool}: {description}")),
+        T::PlanAmended {
+            kind,
+            step,
+            ok,
+            reason,
+            ..
+        } => {
+            stream.send_context_notice("plan.amended", format!("#{step} {kind} ok={ok}: {reason}"))
+        }
 
         // Turn lifecycle.
         T::TurnComplete { stop, .. } => {
@@ -6300,8 +6322,8 @@ mod native_dispatch_tests {
         RetryKind as TRetryKind, StopReasonKind as TStop, TokenUsageMirror,
         TranslatedThreadEvent as T,
     };
-    use futures::channel::mpsc;
     use futures::StreamExt;
+    use futures::channel::mpsc;
 
     fn dispatch_one(ev: T) -> Vec<ThreadEvent> {
         let (tx, mut rx) = mpsc::unbounded::<Result<ThreadEvent>>();
@@ -6535,4 +6557,3 @@ mod native_dispatch_tests {
         });
     }
 }
-
