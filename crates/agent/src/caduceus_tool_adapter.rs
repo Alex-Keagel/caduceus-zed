@@ -234,6 +234,74 @@ pub async fn drive<Spawn, Fut>(
     }
 }
 
+// ── ST-A1 — build_zed_tool_registry ─────────────────────────────────
+//
+// Contract `tool-registry-builder-v1`. Given the Thread's enabled tool
+// map and a dispatcher handle, produce a `caduceus_tools::ToolRegistry`
+// with one `ZedToolAdapter` per Zed tool. The dispatcher itself is
+// spawned separately (ST-A2) on the gpui main thread; this helper only
+// wires the spec-registration side, which needs no `cx`.
+//
+// Why a helper: `ensure_caduceus_harness` was a blocker for the native
+// loop because there was no bulk adapter — only the single-tool
+// `ZedToolAdapter::new`. Without this, wiring 40+ Zed tools would
+// require 40+ lines of hand-rolled setup every turn.
+
+use std::collections::BTreeMap;
+
+/// acp::ToolKind → caduceus_core::ToolKind. Conservative on unknowns:
+/// anything not obviously read-only maps to Destructive so engine-side
+/// batching serialises it.
+fn map_acp_kind(kind: agent_client_protocol::ToolKind) -> ToolKind {
+    use agent_client_protocol::ToolKind as A;
+    match kind {
+        A::Read | A::Search | A::Think => ToolKind::ReadOnly,
+        A::Fetch => ToolKind::Idempotent,
+        _ => ToolKind::Destructive,
+    }
+}
+
+/// Derive a `ToolSpec` from any Zed `AnyAgentTool`. Pulls the JSON
+/// schema via `input_schema(OpenAi)` so the spec matches what a native
+/// provider would see.
+fn tool_spec_for(tool: &dyn crate::thread::AnyAgentTool) -> anyhow::Result<ToolSpec> {
+    use language_model::LanguageModelToolSchemaFormat;
+    let schema = tool.input_schema(LanguageModelToolSchemaFormat::JsonSchema)?;
+    Ok(ToolSpec {
+        name: tool.name().to_string(),
+        description: tool.description().to_string(),
+        input_schema: schema,
+        required_capability: None,
+    })
+}
+
+/// Build a fresh `ToolRegistry` from Zed's per-Thread tool map.
+///
+/// `handle` is the dispatcher handle every adapter will forward through.
+/// `filter` lets callers skip tools the envelope would deny (pass
+/// `|_name| true` for no filtering).
+///
+/// Returns `Err` if any tool's input_schema rejects (malformed derive).
+/// In practice Zed tools always succeed here — the `Result` is defense
+/// against a custom tool that lies in its derive macro.
+pub fn build_zed_tool_registry(
+    tools: &BTreeMap<gpui::SharedString, Arc<dyn crate::thread::AnyAgentTool>>,
+    handle: DispatcherHandle,
+    mut filter: impl FnMut(&str) -> bool,
+) -> anyhow::Result<caduceus_tools::ToolRegistry> {
+    let mut registry = caduceus_tools::ToolRegistry::new();
+    for (name, tool) in tools.iter() {
+        if !filter(name.as_ref()) {
+            continue;
+        }
+        let spec = tool_spec_for(tool.as_ref())?;
+        let kind = map_acp_kind(tool.kind());
+        let adapter = ZedToolAdapter::new(spec, handle.clone()).with_kind(kind);
+        registry.register(Arc::new(adapter));
+    }
+    Ok(registry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +316,24 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             required_capability: None,
         }
+    }
+
+    /// ST-A1 — acp::ToolKind translation is the one piece of
+    /// build_zed_tool_registry we can test without GPUI. The registry
+    /// end-to-end is covered by the ST-A2 integration tests once the
+    /// dispatcher is wired.
+    #[test]
+    fn map_acp_kind_read_only_surfaces_parallel_safe() {
+        use agent_client_protocol::ToolKind as A;
+        assert_eq!(map_acp_kind(A::Read), ToolKind::ReadOnly);
+        assert_eq!(map_acp_kind(A::Search), ToolKind::ReadOnly);
+        assert_eq!(map_acp_kind(A::Think), ToolKind::ReadOnly);
+        assert_eq!(map_acp_kind(A::Fetch), ToolKind::Idempotent);
+        // Everything else is conservative.
+        assert_eq!(map_acp_kind(A::Edit), ToolKind::Destructive);
+        assert_eq!(map_acp_kind(A::Execute), ToolKind::Destructive);
+        assert_eq!(map_acp_kind(A::Delete), ToolKind::Destructive);
+        assert_eq!(map_acp_kind(A::Other), ToolKind::Destructive);
     }
 
     fn ok_result(text: &str) -> ToolResult {
