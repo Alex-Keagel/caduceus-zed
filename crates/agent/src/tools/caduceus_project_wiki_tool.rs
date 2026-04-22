@@ -36,6 +36,11 @@ pub enum ProjectWikiOperation {
     },
     /// List all wiki pages hierarchically.
     ListPages,
+    /// Delete a wiki page by path.
+    DeletePage {
+        /// Page path relative to the wiki root (without .md extension).
+        path: String,
+    },
     /// Search across all wiki pages for a query string.
     Search {
         /// The text to search for (case-insensitive substring match).
@@ -112,6 +117,18 @@ impl CaduceusProjectWikiTool {
                 .map_err(|e| format!("Failed to create wiki directory: {e}"))?;
         }
         std::fs::write(&path, content).map_err(|e| format!("Failed to write page '{page}': {e}"))
+    }
+
+    /// F3: ported from the legacy `caduceus_wiki_tool`. Removes a page from the
+    /// filesystem wiki — VCS tracks the deletion.
+    fn delete_page(&self, page: &str) -> Result<(), String> {
+        let path = self.page_path(page)?;
+        if !path.exists() {
+            return Err(format!("Page '{page}' not found"));
+        }
+        let _lock = super::caduceus_file_lock::acquire_file_lock(&path)
+            .map_err(|e| format!("Failed to lock wiki page '{page}': {e}"))?;
+        std::fs::remove_file(&path).map_err(|e| format!("Failed to delete page '{page}': {e}"))
     }
 
     fn list_pages_recursive(&self, dir: &Path, prefix: &str) -> Vec<String> {
@@ -361,6 +378,7 @@ impl AgentTool for CaduceusProjectWikiTool {
                 ProjectWikiOperation::ReadPage { .. } => "read page",
                 ProjectWikiOperation::WritePage { .. } => "write page",
                 ProjectWikiOperation::ListPages => "list pages",
+                ProjectWikiOperation::DeletePage { .. } => "delete page",
                 ProjectWikiOperation::Search { .. } => "search",
                 ProjectWikiOperation::AutoPopulate => "auto-populate",
             };
@@ -389,6 +407,9 @@ impl AgentTool for CaduceusProjectWikiTool {
                     self.write_page(&path, &content)
                         .map(|_| format!("Page '{path}' saved"))
                 }
+                ProjectWikiOperation::DeletePage { path } => self
+                    .delete_page(&path)
+                    .map(|_| format!("Page '{path}' deleted")),
                 ProjectWikiOperation::ListPages => {
                     let wiki_root = self.wiki_root();
                     if !wiki_root.exists() {

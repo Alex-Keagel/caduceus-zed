@@ -1,106 +1,13 @@
 //! Execution guardrails — loop detection, circuit breaker, compaction cooldown.
 //!
-//! These are Zed-side safety mechanisms extracted into testable structs.
-//! They model the exact semantics from `agent/src/thread.rs`.
+//! F2: `LoopDetector` / `LoopCheckResult` are re-exported from
+//! `caduceus_core` — the canonical implementation lives there. Prior to F2
+//! both this module and `caduceus_orchestrator` carried independent copies
+//! with subtly different semantics.
 
 use std::time::{Duration, Instant};
 
-// ── Loop Detector ──────────────────────────────────────────────────────────────
-
-/// Detects when the same tool is called too many times consecutively
-/// **with identical inputs**. Different inputs (e.g. parallel `edit_file`
-/// on different files) are treated as legitimate concurrent work.
-///
-/// Semantics: the detector fires when the count reaches `threshold`.
-/// The count starts at 1 on the first call and increments on each
-/// consecutive call of the same `(tool_name, input_hash)`. Any change
-/// to either name or input hash resets the count.
-///
-/// In `thread.rs`, the check happens BEFORE incrementing, so:
-/// - threshold=3 means the 4th identical call is blocked
-///   (count=3 when checked → blocked, then reset)
-#[derive(Debug, Clone)]
-pub struct LoopDetector {
-    current_key: Option<(String, u64)>,
-    consecutive_count: usize,
-    threshold: usize,
-}
-
-/// Result of recording a tool call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LoopCheckResult {
-    /// Tool call is allowed.
-    Ok,
-    /// Loop detected — contains the tool name that looped.
-    LoopDetected(String),
-}
-
-impl LoopDetector {
-    pub fn new(threshold: usize) -> Self {
-        assert!(threshold > 0, "LoopDetector threshold must be > 0");
-        Self {
-            current_key: None,
-            consecutive_count: 0,
-            threshold,
-        }
-    }
-
-    /// Hash the tool input — used to distinguish parallel calls with
-    /// different inputs from genuine retry loops.
-    fn hash_input(input: &str) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        input.hash(&mut h);
-        h.finish()
-    }
-
-    /// Record a tool call by name only (legacy — assumes empty input).
-    /// Prefer `record_call(name, input)` for accurate loop detection.
-    pub fn record_tool(&mut self, tool_name: &str) -> LoopCheckResult {
-        self.record_call(tool_name, "")
-    }
-
-    /// Record a tool call with its serialized input. Returns `LoopDetected`
-    /// only if the same `(tool_name, input)` pair has been seen `threshold`
-    /// times consecutively.
-    pub fn record_call(&mut self, tool_name: &str, input: &str) -> LoopCheckResult {
-        let key = (tool_name.to_string(), Self::hash_input(input));
-
-        let is_loop = match &self.current_key {
-            Some(prev) => *prev == key && self.consecutive_count >= self.threshold,
-            None => false,
-        };
-
-        if is_loop {
-            self.reset();
-            return LoopCheckResult::LoopDetected(tool_name.to_string());
-        }
-
-        match &self.current_key {
-            Some(prev) if *prev == key => {
-                self.consecutive_count += 1;
-            }
-            _ => {
-                self.current_key = Some(key);
-                self.consecutive_count = 1;
-            }
-        }
-
-        LoopCheckResult::Ok
-    }
-
-    /// Reset the detector (called internally after loop detection).
-    fn reset(&mut self) {
-        self.current_key = None;
-        self.consecutive_count = 0;
-    }
-
-    /// Current consecutive count for the active (tool, input) pair.
-    pub fn consecutive_count(&self) -> usize {
-        self.consecutive_count
-    }
-}
+pub use caduceus_core::{LoopCheckResult, LoopDetector};
 
 // ── Circuit Breaker ────────────────────────────────────────────────────────────
 

@@ -982,6 +982,13 @@ impl NativeAgent {
         }
     }
 
+    /// ST-B5 / `catalog-opaque-v1` — see free fns `available_modes_comma` /
+    /// `available_modes_pipe`. Shims kept for `Self::…` ergonomics at
+    /// the `NativeAgent` call sites.
+    fn available_modes_pipe() -> String {
+        available_modes_pipe()
+    }
+
     fn build_available_commands_for_project(
         project_state: Option<&ProjectState>,
         cx: &App,
@@ -991,7 +998,7 @@ impl NativeAgent {
             acp::AvailableCommand::new("compact", "Compress conversation context to free tokens"),
             acp::AvailableCommand::new("mode", "Show or switch Caduceus mode").input(
                 acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
-                    "<plan|act|research|autopilot|architect|debug|review>",
+                    format!("<{}>", Self::available_modes_pipe()),
                 )),
             ),
             acp::AvailableCommand::new("context", "Show context usage and zone status"),
@@ -1399,10 +1406,17 @@ impl NativeAgentConnection {
                         .thread(session_id, cx)
                         .map(|t| t.read(cx).caduceus_mode_name().to_string())
                         .unwrap_or_else(|| "act".to_string());
-                    format!(
-                        "Current mode: **{current}**\nAvailable: plan, act, research, autopilot, architect, debug, review"
-                    )
-                } else if BridgeAgentMode::from_str_loose(mode_name).is_some() {
+                    // ST-B5 / `catalog-opaque-v1` — generate the available
+                    // list from the engine's catalog. No hardcoded mode
+                    // names in the IDE.
+                    let available = caduceus_bridge::orchestrator::list_modes()
+                        .into_iter()
+                        .map(|m| m.name)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("Current mode: **{current}**\nAvailable: {available}")
+                } else if let Some(canonical) = BridgeAgentMode::from_str_loose(mode_name) {
+                    let canonical_name = canonical.name().to_string();
                     let modes = self
                         .0
                         .read(cx)
@@ -1410,17 +1424,21 @@ impl NativeAgentConnection {
                         .get(session_id)
                         .map(|s| s.caduceus_modes.clone());
                     if let Some(modes) = modes {
-                        modes.set_mode(acp::SessionModeId::new(mode_name), cx).detach();
+                        modes
+                            .set_mode(acp::SessionModeId::new(canonical_name.clone()), cx)
+                            .detach();
                     }
                     if let Some(thread) = self.thread(session_id, cx) {
+                        let canonical_for_thread = canonical_name.clone();
                         thread.update(cx, |thread, _cx| {
-                            thread.set_caduceus_mode(Some(mode_name.to_string()));
+                            thread.set_caduceus_mode(Some(canonical_for_thread));
                         });
                     }
-                    format!("✅ Mode switched to **{mode_name}**")
+                    format!("✅ Mode switched to **{canonical_name}**")
                 } else {
                     format!(
-                        "❌ Unknown mode '{mode_name}'. Valid: plan, act, research, autopilot, architect, debug, review"
+                        "❌ Unknown mode '{mode_name}'. Valid: {}",
+                        available_modes_comma()
                     )
                 }
             }
@@ -1691,17 +1709,19 @@ impl NativeAgentConnection {
             "headless" => {
                 let prompt = args.trim();
                 if prompt.is_empty() {
-                    "## Headless Mode\n\
-                     Run Caduceus from the command line without the IDE:\n\n\
-                     ```bash\n\
-                     caduceus run --prompt \"your task here\" --mode act --format json\n\
-                     ```\n\n\
-                     Options:\n\
-                     - `--mode plan|act|research|autopilot|architect|debug|review`\n\
-                     - `--format text|json|compact`\n\
-                     - `--print-only` — suppress streaming, output final result only\n\n\
-                     Use `/headless <prompt>` to generate a ready-to-run command."
-                        .to_string()
+                    format!(
+                        "## Headless Mode\n\
+                         Run Caduceus from the command line without the IDE:\n\n\
+                         ```bash\n\
+                         caduceus run --prompt \"your task here\" --mode act --format json\n\
+                         ```\n\n\
+                         Options:\n\
+                         - `--mode {}`\n\
+                         - `--format text|json|compact`\n\
+                         - `--print-only` — suppress streaming, output final result only\n\n\
+                         Use `/headless <prompt>` to generate a ready-to-run command.",
+                        available_modes_pipe()
+                    )
                 } else {
                     let mode = self.thread(session_id, cx)
                         .map(|t| t.read(cx).caduceus_mode_name().to_string())
@@ -2109,22 +2129,21 @@ impl CaduceusSessionModes {
         }
     }
 
+    /// ST-B5 / `catalog-opaque-v1` — the canonical catalog is the
+    /// engine. Zed holds NO hardcoded mode list. We iterate the
+    /// bridge's [`list_modes`](caduceus_bridge::orchestrator::list_modes)
+    /// and translate each [`BridgeModeDescriptor`] into an
+    /// [`acp::SessionMode`], preserving the descriptor's `name` as the
+    /// opaque id ACP will hand back on `set_mode`. Adding or renaming
+    /// a mode in the engine now reaches the IDE's picker with zero
+    /// code changes here.
     fn all_caduceus_modes() -> Vec<acp::SessionMode> {
-        vec![
-            acp::SessionMode::new("plan", "Plan")
-                .description("Read-only analysis and strategy. No code changes."),
-            acp::SessionMode::new("act", "Act").description("Execute code changes with approval."),
-            acp::SessionMode::new("research", "Research")
-                .description("Read-only exploration. Summarize findings."),
-            acp::SessionMode::new("autopilot", "Autopilot")
-                .description("Fully autonomous — plan, act, test, commit."),
-            acp::SessionMode::new("architect", "Architect")
-                .description("High-level design — architecture and modules."),
-            acp::SessionMode::new("debug", "Debug")
-                .description("Investigate errors, trace bugs, propose fixes."),
-            acp::SessionMode::new("review", "Review")
-                .description("Code review — find issues, suggest improvements."),
-        ]
+        caduceus_bridge::orchestrator::list_modes()
+            .into_iter()
+            .map(|m| {
+                acp::SessionMode::new(m.name.clone(), m.label.clone()).description(m.description)
+            })
+            .collect()
     }
 }
 
@@ -3864,6 +3883,27 @@ mod internal_tests {
     }
 }
 
+// ── ST-B5 / catalog-opaque-v1 — mode-name catalog helpers ─────────────────
+// IDE-facing mode name surfaces. Single source of truth is the engine
+// via `caduceus_bridge::orchestrator::list_modes()`; these helpers just
+// project the catalog into the two formats slash-help/CLI-help need.
+
+fn available_modes_comma() -> String {
+    caduceus_bridge::orchestrator::list_modes()
+        .into_iter()
+        .map(|m| m.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn available_modes_pipe() -> String {
+    caduceus_bridge::orchestrator::list_modes()
+        .into_iter()
+        .map(|m| m.name)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 fn should_index_path(path: &std::path::Path, ignore_patterns: &[String]) -> bool {
     let path_str = path.to_string_lossy();
     for pattern in ignore_patterns {
@@ -3993,6 +4033,93 @@ mod compact_outcome_tests {
             let (l, m) = compact_outcome_message(o);
             assert!(labels.insert(l), "duplicate label: {l}");
             assert!(messages.insert(m), "duplicate message: {m}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod b5_catalog_tests {
+    //! ST-B5 / `catalog-opaque-v1` — Zed holds no hardcoded mode catalog.
+    //! These tests pin that invariant: every mode the IDE renders MUST
+    //! come from the engine (`caduceus_bridge::orchestrator::list_modes`),
+    //! and the slash-help / CLI-help surfaces MUST derive from the same
+    //! source. Adding a mode in the engine appears in the IDE without
+    //! touching any `.rs` file in this crate.
+
+    use super::*;
+
+    #[test]
+    fn all_caduceus_modes_mirrors_engine_catalog_exactly() {
+        // IDE's picker view.
+        let ide_modes = CaduceusSessionModes::all_caduceus_modes();
+        // Engine's authoritative catalog.
+        let engine_modes = caduceus_bridge::orchestrator::list_modes();
+
+        assert_eq!(
+            ide_modes.len(),
+            engine_modes.len(),
+            "IDE mode picker MUST have the same count as the engine catalog — \
+             diverging means a hardcoded list has crept back into the IDE"
+        );
+
+        // Order-preserving pairwise equality on (id, label, description).
+        for (ide, eng) in ide_modes.iter().zip(engine_modes.iter()) {
+            assert_eq!(
+                ide.id.0.as_ref(),
+                eng.name.as_str(),
+                "IDE session-mode id MUST be the engine's canonical name (opaque token)"
+            );
+            assert_eq!(
+                ide.name.as_str(),
+                eng.label.as_str(),
+                "IDE label MUST match engine label"
+            );
+            assert_eq!(
+                ide.description.as_deref().unwrap_or(""),
+                eng.description.as_str(),
+                "IDE description MUST match engine description"
+            );
+        }
+    }
+
+    #[test]
+    fn available_modes_helpers_cover_every_engine_mode() {
+        let engine_names: Vec<String> = caduceus_bridge::orchestrator::list_modes()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        let comma = available_modes_comma();
+        let pipe = available_modes_pipe();
+        for name in &engine_names {
+            assert!(
+                comma.contains(name),
+                "slash-help comma list MUST include engine mode {name}: got {comma:?}"
+            );
+            assert!(
+                pipe.contains(name),
+                "CLI-help pipe list MUST include engine mode {name}: got {pipe:?}"
+            );
+        }
+        // Separator sanity.
+        assert!(comma.contains(", "), "comma helper MUST use ', ' separator");
+        if engine_names.len() > 1 {
+            assert!(pipe.contains('|'), "pipe helper MUST use '|' separator");
+        }
+    }
+
+    #[test]
+    fn available_modes_helpers_have_no_legacy_mode_names() {
+        // Legacy aliases (Architect / Debug / Review) deserialize through
+        // serde rename on the engine side for backward compat, but they
+        // MUST NOT appear in any help-text surface the IDE shows to the
+        // user — the canonical 4 modes are the only thing a new user
+        // should see.
+        let comma = available_modes_comma();
+        for legacy in &["architect", "debug", "review"] {
+            assert!(
+                !comma.contains(legacy),
+                "legacy alias '{legacy}' leaked into slash-help list: {comma:?}"
+            );
         }
     }
 }

@@ -9,7 +9,7 @@ use crate::{
     CaduceusProductTool, CaduceusProgressTool, CaduceusProjectTool, CaduceusProjectWikiTool,
     CaduceusScaffoldTool, CaduceusSecurityScanTool, CaduceusSemanticSearchTool,
     CaduceusStorageTool, CaduceusTaskDecomposeTool, CaduceusTaskTreeTool, CaduceusTelemetryTool,
-    CaduceusTimeTrackingTool, CaduceusTreeSitterTool, CaduceusWikiTool, ContextServerRegistry,
+    CaduceusTimeTrackingTool, CaduceusTreeSitterTool, ContextServerRegistry,
     CopyPathTool, CreateDirectoryTool, DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool,
     EditFileTool, FetchTool, FindPathTool, GrepTool, ListDirectoryTool, MovePathTool, NowTool,
     OpenTool, ProjectSnapshot, ReadFileTool, RestoreFileFromDiskTool, SaveFileTool, SpawnAgentTool,
@@ -1664,10 +1664,17 @@ impl Thread {
             .unwrap_or_else(|| self.profile_id.0.as_ref())
     }
 
+    /// Derive the active ActLens (if any) for prompt rendering. Lens state is
+    /// Zed-local (UI concern), not part of the mode token — kept `None` until
+    /// a lens is exposed through the session UI.
+    fn caduceus_lens_from_profile(&self) -> Option<String> {
+        None
+    }
+
     /// Caduceus: check if a tool is allowed in the current privilege ring.
-    /// Ring 0 (Plan/Research/Architect/Review): read-only + documentation writes
-    /// Ring 1 (Act/Debug): all tools with user approval
-    /// Ring 2 (Autopilot): all tools, no approval
+    /// Modes: Plan / Act / Research / Autopilot (Act carries a Lens — Normal/Debug/Review).
+    /// Legacy aliases `architect`/`debug`/`review` are normalized at the engine layer
+    /// (see `caduceus_orchestrator::modes::ModeSelection::from_str_loose`).
     ///
     /// Plan mode CAN write:
     /// - .md, .json, .yaml, .txt files (plans, specs, wiki, configs)
@@ -1801,9 +1808,7 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> bool {
         use caduceus_bridge::orchestrator::compaction::{MessageGroupKind, build_message_groups};
-        use caduceus_bridge::orchestrator::{
-            CompactMessage, CompactionPipeline, ContextZone, estimate_tokens,
-        };
+        use caduceus_bridge::orchestrator::{CompactMessage, CompactionPipeline, ContextZone};
 
         // Use compaction cooldown guard
         if !self.compaction_cooldown.can_compact() {
@@ -2216,7 +2221,6 @@ impl Thread {
             self.add_tool(CaduceusMemoryWriteTool::new(project_root.clone()));
             self.add_tool(CaduceusStorageTool::new(project_root.clone()));
             self.add_tool(CaduceusCheckpointTool::new(project_root.clone()));
-            self.add_tool(CaduceusWikiTool::new(project_root.clone()));
             self.add_tool(CaduceusProjectTool::new(project_root.clone()));
             self.add_tool(CaduceusProjectWikiTool::new(project_root.clone()));
             self.add_tool(CaduceusCrossGitTool::new(project_root.clone()));
@@ -4062,23 +4066,20 @@ impl Thread {
         .context("failed to build system prompt")
         .expect("Invalid template");
 
-        // Inject Caduceus mode prefix into system prompt
+        // Inject Caduceus mode prefix into system prompt.
+        //
+        // F1: delegate to `mode_prompt_for_profile` — the engine's
+        // `behavior_rules_preamble` + per-mode system prompt prefix. No more
+        // hand-rolled "You are in X mode" text drifting from the engine.
         let system_prompt = {
-            use caduceus_bridge::orchestrator::BridgeAgentMode;
+            use caduceus_bridge::orchestrator::mode_prompt_for_profile;
             let mode_str = self.caduceus_mode_from_profile();
-            let mode_prefix = if let Some(mode) = BridgeAgentMode::from_str_loose(mode_str) {
-                format!(
-                    "You are in {} mode. {}\n\n",
-                    mode.name().to_uppercase(),
-                    mode.description()
-                )
-            } else {
-                String::new()
-            };
-            if mode_prefix.is_empty() {
+            let lens = self.caduceus_lens_from_profile();
+            let mode_prefix = mode_prompt_for_profile(mode_str, lens.as_deref());
+            if mode_prefix.trim().is_empty() {
                 system_prompt
             } else {
-                format!("{mode_prefix}{system_prompt}")
+                format!("{mode_prefix}\n\n{system_prompt}")
             }
         };
 
@@ -4200,8 +4201,8 @@ impl Thread {
                 **Read Code**: caduceus_git_read (git status/log/diff), caduceus_dependency_scan (vulnerabilities)\n\
                 **Plan & Track**: caduceus_prd (parse requirements), caduceus_task_decompose (break into parallel subtasks), \
                 caduceus_task_tree (hierarchical tasks), caduceus_kanban (board with worktree isolation)\n\
-                **Write & Edit**: Use edit_file/save_file for code. caduceus_wiki (project wiki), \
-                caduceus_project_wiki (cross-repo wiki with auto-populate), caduceus_checkpoint (save/restore snapshots)\n\
+                **Write & Edit**: Use edit_file/save_file for code. caduceus_project_wiki \
+                (file-based project wiki with auto-populate + per-page CRUD), caduceus_checkpoint (save/restore snapshots)\n\
                 **Memory**: caduceus_memory_read (recall facts), caduceus_memory_write (store facts). \
                 NOT caduceus_storage (that's for structured task persistence).\n\
                 **Security**: caduceus_security_scan (SAST), caduceus_mcp_security (MCP tool vetting), caduceus_policy (compliance)\n\
@@ -4210,7 +4211,7 @@ impl Thread {
                 **Meta**: caduceus_progress (velocity), \
                 caduceus_telemetry (token usage), caduceus_time_tracking (session time)\n\
                 \n\
-                Rules: PERMISSION DENIED = don't retry, ask user to switch mode. \
+                Rules: PERMISSION DENIED = the envelope preflight blocked this call; surface the error verbatim and try an alternative tool or fall back — do NOT ask the user to switch modes (the engine's behavior_rules preamble already covers this). \
                 LOOP DETECTED = try a different approach. \
                 Use edit_file for code changes, NOT terminal heredocs.\n\
                 **Verify-after-edit**: After making code changes, ALWAYS run `diagnostics` to check for errors. \

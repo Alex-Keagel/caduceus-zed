@@ -76,9 +76,12 @@ impl ToolsBridge {
     // ── Test runner ──────────────────────────────────────────────────────
 
     /// Run a test command in the given workspace directory.
-    pub fn run_tests(workspace: &str, command: &str) -> Result<VerificationResult, String> {
+    pub async fn run_tests(workspace: &str, command: &str) -> Result<VerificationResult, String> {
         let mut verifier = SelfVerifier::new(PathBuf::from(workspace));
-        verifier.run_tests(command).map_err(|e| e.to_string())
+        verifier
+            .run_tests(command)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     // NOTE: scan_diff is already exposed as CaduceusEngine::security_scan_diff.
@@ -207,17 +210,17 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn tools_run_tests_echo() {
+    #[tokio::test]
+    async fn tools_run_tests_echo() {
         let dir = tempfile::tempdir().unwrap();
-        let result = ToolsBridge::run_tests(dir.path().to_str().unwrap(), "echo ok");
+        let result = ToolsBridge::run_tests(dir.path().to_str().unwrap(), "echo ok").await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn tools_run_tests_empty_command() {
+    #[tokio::test]
+    async fn tools_run_tests_empty_command() {
         let dir = tempfile::tempdir().unwrap();
-        let result = ToolsBridge::run_tests(dir.path().to_str().unwrap(), "");
+        let result = ToolsBridge::run_tests(dir.path().to_str().unwrap(), "").await;
         assert!(result.is_err());
     }
 }

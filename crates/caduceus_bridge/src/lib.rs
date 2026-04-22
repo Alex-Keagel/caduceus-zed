@@ -21,7 +21,6 @@ pub mod index_dag;
 pub mod marketplace;
 pub mod memory;
 pub mod orchestrator;
-pub mod providers;
 pub mod runtime;
 pub mod safety;
 pub mod search;

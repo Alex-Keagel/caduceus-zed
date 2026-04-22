@@ -2338,10 +2338,7 @@ fn message_group_system_flag() {
 
 #[test]
 fn safety_guardrails_combined_scenario() {
-    use caduceus_bridge::safety::{
-        CircuitBreaker, CompactionCooldown, LoopCheckResult, LoopDetector,
-    };
-    use std::time::{Duration, Instant};
+    use caduceus_bridge::safety::{CircuitBreaker, LoopCheckResult, LoopDetector};
 
     // Simulates thread.rs tool dispatch order:
     // 1. Check permission → CB.record_permission_denied() if denied

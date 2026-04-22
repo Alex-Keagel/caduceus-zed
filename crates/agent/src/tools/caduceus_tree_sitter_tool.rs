@@ -189,7 +189,6 @@ impl AgentTool for CaduceusTreeSitterTool {
                     })?;
 
                     // Use bridge TreeSitterChunker for real AST parsing
-                    let chunker = caduceus_bridge::tree_sitter::TreeSitterChunker::new();
                     let chunks = caduceus_bridge::tree_sitter::TreeSitterChunker::chunk_file_static(
                         &path, &content,
                     );

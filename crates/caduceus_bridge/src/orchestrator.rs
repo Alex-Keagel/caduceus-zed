@@ -1362,7 +1362,18 @@ impl OrchestratorBridge {
         // Signal drain; ignore send errors (forwarder already observed
         // channel close, which is the preferred path anyway).
         let _ = drain_tx.send(());
-        let _ = forwarder.await;
+        // Bound forwarder wait so a stalled reducer cannot hang the caller.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), forwarder).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                log::warn!("[caduceus_bridge] forwarder task join failed: {e}");
+            }
+            Err(_) => {
+                log::warn!(
+                    "[caduceus_bridge] forwarder task did not complete within 5s; abandoning"
+                );
+            }
+        }
 
         run_result
     }
@@ -3584,12 +3595,18 @@ pub fn list_lenses_for(mode: &str) -> Vec<BridgeLensDescriptor> {
 ///
 /// Lens defaults to `normal` when None or unknown.
 pub fn mode_prompt_for_profile(mode: &str, lens: Option<&str>) -> String {
+    use caduceus_orchestrator::AgentHarness;
     use caduceus_orchestrator::modes::{ActLens, AgentMode};
     let agent_mode = AgentMode::from_str_loose(mode).unwrap_or(AgentMode::Plan);
     let lens = lens
         .and_then(ActLens::from_str_loose)
         .unwrap_or(ActLens::Normal);
-    agent_mode.config_with_lens(lens).system_prompt_prefix
+    // F1: prepend the engine's behavior_rules preamble so the IDE's rendered
+    // prompt matches what the engine's `effective_system_prompt` produces —
+    // no hand-rolled mode text drifting from source of truth.
+    let preamble = AgentHarness::behavior_rules_preamble();
+    let mode_prefix = agent_mode.config_with_lens(lens).system_prompt_prefix;
+    format!("{preamble}\n\n{mode_prefix}")
 }
 
 /// Coarse "does this mode allow writes without interception?" query. IDEs use
