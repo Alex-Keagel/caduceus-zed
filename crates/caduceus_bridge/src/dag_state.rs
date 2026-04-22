@@ -35,7 +35,7 @@ use caduceus_core::{
     AgentEdgeKind, AgentEvent, AssignmentSummaryV1, Critique, EnvelopeSummaryV1, ExecutionId,
     IntrospectionEventV1, ProvenanceEdgeKind, StepId,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 // ── Wire-shape records surfaced by the reducer ────────────────────────────
 
@@ -189,7 +189,9 @@ pub struct SessionStateReducer {
     // Agents-DAG
     agent_nodes: HashMap<ExecutionId, AssignmentSummaryV1>,
     agent_node_order: Vec<ExecutionId>,
-    agent_edges: Vec<AgentEdgeV1>,
+    // ST-C3 / audit P-3: VecDeque so bounded-FIFO pop_front is O(1); previously
+    // `Vec::remove(0)` was O(n) with AGENT_EDGE_CAP=50_000 (≈ pathological overflow).
+    agent_edges: VecDeque<AgentEdgeV1>,
     /// Phase-H H5 — FIFO count of agent edges dropped once
     /// `agent_edges.len() == AGENT_EDGE_CAP`.
     agent_edges_dropped: u64,
@@ -202,7 +204,8 @@ pub struct SessionStateReducer {
     envelope: Option<EnvelopeSummaryV1>,
     awaiting_approval: Option<AwaitingApprovalV1>,
     pending_scope_expansion: Option<PendingScopeExpansionV1>,
-    provenance: Vec<ProvenanceEdgeV1>,
+    // ST-C3 / audit P-3: VecDeque for O(1) FIFO eviction (see agent_edges).
+    provenance: VecDeque<ProvenanceEdgeV1>,
     /// Phase-H H5 — same semantics as `agent_edges_dropped`.
     provenance_dropped: u64,
 
@@ -403,20 +406,20 @@ impl SessionStateReducer {
     /// cap is hit and bumps `agent_edges_dropped`.
     fn push_agent_edge(&mut self, edge: AgentEdgeV1) {
         if self.agent_edges.len() >= Self::AGENT_EDGE_CAP {
-            self.agent_edges.remove(0);
+            self.agent_edges.pop_front();
             self.agent_edges_dropped = self.agent_edges_dropped.saturating_add(1);
         }
-        self.agent_edges.push(edge);
+        self.agent_edges.push_back(edge);
     }
 
     /// Phase-H H5 — bounded push. Same semantics as
     /// [`Self::push_agent_edge`] but for [`ProvenanceEdgeV1`].
     fn push_provenance(&mut self, edge: ProvenanceEdgeV1) {
         if self.provenance.len() >= Self::PROVENANCE_CAP {
-            self.provenance.remove(0);
+            self.provenance.pop_front();
             self.provenance_dropped = self.provenance_dropped.saturating_add(1);
         }
-        self.provenance.push(edge);
+        self.provenance.push_back(edge);
     }
 
     // ── Query projections ─────────────────────────────────────────────────
@@ -469,7 +472,7 @@ impl SessionStateReducer {
 
         AgentsDagV1 {
             nodes,
-            edges: self.agent_edges.clone(),
+            edges: self.agent_edges.iter().cloned().collect(),
             last_event_id: self.last_event_id,
             active_fanouts,
             revision: self.agents_revision,
@@ -491,7 +494,7 @@ impl SessionStateReducer {
             envelope,
             awaiting_approval: self.awaiting_approval.clone(),
             pending_scope_expansion: self.pending_scope_expansion.clone(),
-            provenance: self.provenance.clone(),
+            provenance: self.provenance.iter().cloned().collect(),
             last_event_id: self.last_event_id,
             provenance_dropped: self.provenance_dropped,
         }
