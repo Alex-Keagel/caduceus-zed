@@ -699,6 +699,44 @@ pub enum ThreadEvent {
     SubagentSpawned(acp::SessionId),
     Retry(acp_thread::RetryStatus),
     Stop(acp::StopReason),
+    /// G1b: non-fatal engine notice surfaced to the UI (e.g. "context
+    /// compacted", "permission upgraded", "pin evicted"). Consumers
+    /// that don't care should no-op; UI consumers render as a dim
+    /// status line under the turn separator.
+    ContextNotice(ContextNotice),
+    /// G1b: engine-side diagnostic event — tool dispatch error,
+    /// reducer failure, envelope violation. Carries a severity level
+    /// so the UI can decide whether to surface a banner.
+    EngineDiagnostic(EngineDiagnostic),
+}
+
+/// Payload for [`ThreadEvent::ContextNotice`]. Informational; the turn
+/// keeps running. Kept deliberately narrow so translator → UI coupling
+/// stays one-way.
+#[derive(Debug, Clone)]
+pub struct ContextNotice {
+    /// Short stable identifier (e.g. `"context.compacted"`, `"pin.evicted"`).
+    pub kind: String,
+    /// Human-readable message for the UI.
+    pub message: String,
+}
+
+/// Payload for [`ThreadEvent::EngineDiagnostic`]. Non-fatal by default;
+/// the consumer decides whether to escalate.
+#[derive(Debug, Clone)]
+pub struct EngineDiagnostic {
+    /// Short stable identifier (e.g. `"dispatch.timeout"`, `"envelope.violation"`).
+    pub kind: String,
+    /// Human-readable detail.
+    pub detail: String,
+    pub severity: EngineDiagnosticSeverity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineDiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
 }
 
 /// Synthetic guardrail prefixes the agent emits in place of a real tool

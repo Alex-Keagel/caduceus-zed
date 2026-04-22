@@ -1,3 +1,4 @@
+mod caduceus_native_state;
 mod db;
 mod edit_agent;
 mod legacy_thread;
@@ -5,7 +6,6 @@ mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
 mod templates;
-mod caduceus_native_state;
 #[cfg(test)]
 mod tests;
 mod thread;
@@ -1959,6 +1959,27 @@ impl NativeAgentConnection {
                             ThreadEvent::Stop(stop_reason) => {
                                 log::debug!("Assistant message complete: {:?}", stop_reason);
                                 return Ok(acp::PromptResponse::new(stop_reason));
+                            }
+                            // G1b: native-loop-only variants. In legacy
+                            // (non-caduceus) sessions these are never
+                            // produced; in native sessions a richer
+                            // consumer surfaces them. Here we log-and-
+                            // drop to stay compatible with existing
+                            // ACP behavior.
+                            ThreadEvent::ContextNotice(notice) => {
+                                log::debug!(
+                                    "ContextNotice (not surfaced in ACP path): {} {}",
+                                    notice.kind,
+                                    notice.message
+                                );
+                            }
+                            ThreadEvent::EngineDiagnostic(diag) => {
+                                log::warn!(
+                                    "EngineDiagnostic [{:?}] {}: {}",
+                                    diag.severity,
+                                    diag.kind,
+                                    diag.detail
+                                );
                             }
                         }
                     }
