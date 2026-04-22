@@ -484,10 +484,36 @@ impl ReducerHandle {
         Self::default()
     }
 
+    /// Acquire the reducer lock, recovering transparently from poison.
+    ///
+    /// **Phase-H F1**: previously we used `.expect("reducer mutex
+    /// poisoned")` which turned any panic inside a reducer method into
+    /// forwarder death + a 5 s timeout abandonment in the caller. We now
+    /// emit a structured `log::error!` and unwrap the poison (the
+    /// reducer's invariants tolerate partial state after a handled
+    /// panic — worst case a DAG projection reflects truncated data for
+    /// one tick). Call sites see the same `MutexGuard<SessionStateReducer>`
+    /// regardless of poison state.
+    fn lock_inner(
+        &self,
+        site: &'static str,
+    ) -> std::sync::MutexGuard<'_, SessionStateReducer> {
+        match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                log::error!(
+                    target: "caduceus_bridge.reducer",
+                    "reducer mutex was poisoned at call-site {site}; recovering with potentially truncated state"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Fold a single [`AgentEvent`] into state. The lock is held only for
     /// the duration of the `ingest` call — cheap map/vec pushes.
     pub fn ingest_event(&self, event: &AgentEvent) -> u64 {
-        let mut g = self.inner.lock().expect("reducer mutex poisoned");
+        let mut g = self.lock_inner("ingest_event");
         g.ingest(event)
     }
 
@@ -495,7 +521,7 @@ impl ReducerHandle {
     /// Events are ingested in slice order under a single lock acquisition
     /// so no concurrent producer can interleave and split the replay.
     pub fn ingest_many(&self, events: &[AgentEvent]) -> u64 {
-        let mut g = self.inner.lock().expect("reducer mutex poisoned");
+        let mut g = self.lock_inner("ingest_many");
         let mut last = g.last_event_id();
         for ev in events {
             last = g.ingest(ev);
@@ -505,10 +531,7 @@ impl ReducerHandle {
 
     /// Current reducer-local event id.
     pub fn last_event_id(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("reducer mutex poisoned")
-            .last_event_id()
+        self.lock_inner("last_event_id").last_event_id()
     }
 
     /// Features-DAG view. `include_sensitive` is reserved for future
@@ -516,25 +539,19 @@ impl ReducerHandle {
     /// no sensitive fields but the signature is kept uniform with the
     /// other two projections.
     pub fn active_features_dag(&self, include_sensitive: bool) -> FeaturesDagV1 {
-        self.inner
-            .lock()
-            .expect("reducer mutex poisoned")
+        self.lock_inner("active_features_dag")
             .active_features_dag(include_sensitive)
     }
 
     /// Agents-DAG view with redaction controlled by `include_sensitive`.
     pub fn active_agents_dag(&self, include_sensitive: bool) -> AgentsDagV1 {
-        self.inner
-            .lock()
-            .expect("reducer mutex poisoned")
+        self.lock_inner("active_agents_dag")
             .active_agents_dag(include_sensitive)
     }
 
     /// Session snapshot with redaction controlled by `include_sensitive`.
     pub fn active_session_snapshot(&self, include_sensitive: bool) -> SessionSnapshotV1 {
-        self.inner
-            .lock()
-            .expect("reducer mutex poisoned")
+        self.lock_inner("active_session_snapshot")
             .active_session_snapshot(include_sensitive)
     }
 
@@ -1008,5 +1025,38 @@ mod tests {
         }
         assert_eq!(h.last_event_id(), 32);
         assert_eq!(h.active_session_snapshot(false).provenance.len(), 32);
+    }
+
+    /// Phase-H F1: a poisoned reducer mutex must not bring down the
+    /// forwarder. After another thread panics while holding the lock, the
+    /// handle MUST keep serving reads/writes (possibly with the data the
+    /// panic left behind) rather than propagating the poison upward.
+    #[test]
+    fn poisoned_reducer_recovers_and_keeps_serving() {
+        let h = ReducerHandle::new();
+        h.ingest_event(&plan_step(0, 100, "web_fetch", vec![]));
+        assert_eq!(h.last_event_id(), 1);
+
+        // Poison the mutex by panicking inside a scoped thread that held
+        // the inner lock.
+        let inner = h.inner.clone();
+        let t = std::thread::spawn(move || {
+            let _g = inner.lock().unwrap();
+            panic!("deliberate panic to poison reducer mutex");
+        });
+        let join = t.join();
+        assert!(join.is_err(), "poison thread must have panicked");
+
+        // All query APIs must still work — they recover from poison
+        // transparently and return the post-panic state (which is the
+        // pre-panic state since the thread did nothing before panicking).
+        assert_eq!(h.last_event_id(), 1, "last_event_id must survive poison");
+        let _snap = h.active_session_snapshot(false);
+        let _agents = h.active_agents_dag(false);
+        let _features = h.active_features_dag(false);
+
+        // Writes must also keep working.
+        h.ingest_event(&plan_step(1, 101, "read_file", vec![StepId(100).0]));
+        assert_eq!(h.last_event_id(), 2, "writes after poison must advance event id");
     }
 }

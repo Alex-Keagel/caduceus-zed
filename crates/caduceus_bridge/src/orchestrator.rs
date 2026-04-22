@@ -1395,6 +1395,96 @@ impl OrchestratorBridge {
         run_result
     }
 
+    /// G1b — variant of [`Self::run_caduceus_loop`] that additionally
+    /// forwards every `AgentEvent` through [`event_translator::translate`]
+    /// into `translated_tx` alongside the reducer pipeline.
+    ///
+    /// **Why a separate method:** thread.rs (and any IDE consumer) needs
+    /// a stream of UI-shaped events (`TranslatedThreadEvent`) to drive
+    /// the ThreadEventStream. Emitting them from the same forwarder that
+    /// feeds the reducer keeps both consumers in lock-step — neither
+    /// sees an event the other missed, and the two streams share
+    /// ordering. `Swallow` outputs are forwarded too (consumers may log
+    /// or drop them) so the stream length is always `translate(ev).len()`
+    /// per engine event.
+    ///
+    /// Contract parity with `run_caduceus_loop`:
+    /// * Native-loop flag must be on.
+    /// * Forwarder drain is bounded (5s) and honours both channel-close
+    ///   and an explicit drain signal.
+    /// * The caller owns the `translated_tx` / `translated_rx` split;
+    ///   dropping the receiver early causes `try_send` to fail silently
+    ///   (translated events are best-effort — the reducer pipeline is
+    ///   authoritative).
+    pub async fn run_caduceus_loop_translated(
+        &self,
+        harness: &AgentHarness,
+        state: &mut SessionState,
+        history: &mut ConversationHistory,
+        user_input: &str,
+        reducer: crate::dag_state::ReducerHandle,
+        mut event_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+        translated_tx: tokio::sync::mpsc::UnboundedSender<
+            crate::event_translator::TranslatedThreadEvent,
+        >,
+    ) -> Result<String, String> {
+        if !self.native_loop_enabled() {
+            return Err(
+                "caduceus native loop is disabled; enable via set_native_loop_enabled(true) \
+                 (flag: caduceus.native_loop)"
+                    .into(),
+            );
+        }
+
+        let reducer_fwd = reducer.clone();
+        let (drain_tx, mut drain_rx) = tokio::sync::oneshot::channel::<()>();
+        let forwarder = tokio::spawn(async move {
+            let forward_one = |ev: &AgentEvent,
+                               reducer: &crate::dag_state::ReducerHandle,
+                               tx: &tokio::sync::mpsc::UnboundedSender<
+                crate::event_translator::TranslatedThreadEvent,
+            >| {
+                let _ = reducer.ingest_event(ev);
+                for out in crate::event_translator::translate(ev) {
+                    // Best-effort: drop silently if the receiver is gone.
+                    let _ = tx.send(out);
+                }
+            };
+            loop {
+                tokio::select! {
+                    maybe_ev = event_rx.recv() => {
+                        match maybe_ev {
+                            Some(ev) => forward_one(&ev, &reducer_fwd, &translated_tx),
+                            None => break,
+                        }
+                    }
+                    _ = &mut drain_rx => {
+                        while let Ok(ev) = event_rx.try_recv() {
+                            forward_one(&ev, &reducer_fwd, &translated_tx);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        let run_result = harness
+            .run(state, history, user_input)
+            .await
+            .map_err(|e| e.to_string());
+
+        let _ = drain_tx.send(());
+        match tokio::time::timeout(std::time::Duration::from_secs(5), forwarder).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("[caduceus_bridge] translated forwarder join failed: {e}"),
+            Err(_) => log::warn!(
+                "[caduceus_bridge] translated forwarder did not complete within 5s; abandoning"
+            ),
+        }
+
+        run_result
+    }
+
     /// Run a single agent turn (non-streaming).
     pub async fn run_turn(
         harness: &AgentHarness,

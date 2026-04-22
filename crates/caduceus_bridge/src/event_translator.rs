@@ -52,17 +52,9 @@ pub enum TranslatedThreadEvent {
     /// Context-usage warning from the engine (~70% / ~85% / ~95%).
     /// Level is the raw string (`"warning_70"` etc.) — UI may map to
     /// an icon / color.
-    ContextWarning {
-        level: String,
-        used: u32,
-        max: u32,
-    },
+    ContextWarning { level: String, used: u32, max: u32 },
     /// Context auto-compaction happened. Delta is `before - after` tokens.
-    ContextCompacted {
-        freed: u32,
-        before: u32,
-        after: u32,
-    },
+    ContextCompacted { freed: u32, before: u32, after: u32 },
     /// Message groups evicted from active window. `total_tokens` is a
     /// pre-summed convenience; UI may render per-group detail from the
     /// engine event via a separate subscription if needed.
@@ -74,10 +66,7 @@ pub enum TranslatedThreadEvent {
     /// Retry was triggered — loop detector, circuit breaker, or
     /// tool-timeout. UI renders this as a transient retry banner; the
     /// engine keeps running.
-    Retry {
-        kind: RetryKind,
-        message: String,
-    },
+    Retry { kind: RetryKind, message: String },
     /// A new plan step was recorded in Plan mode, awaiting execution.
     PlanStep {
         step: usize,
@@ -213,9 +202,7 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
             consecutive_count,
         } => vec![T::Retry {
             kind: RetryKind::Loop,
-            message: format!(
-                "Loop detected on '{tool_name}' ({consecutive_count} consecutive)"
-            ),
+            message: format!("Loop detected on '{tool_name}' ({consecutive_count} consecutive)"),
         }],
         AgentEvent::CircuitBreakerTriggered {
             consecutive_failures,
@@ -232,7 +219,9 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
             elapsed_ms,
         } => vec![T::Retry {
             kind: RetryKind::ToolTimeout,
-            message: format!("Tool '{tool}' timed out after {elapsed_ms}ms (budget {timeout_secs}s)"),
+            message: format!(
+                "Tool '{tool}' timed out after {elapsed_ms}ms (budget {timeout_secs}s)"
+            ),
         }],
         AgentEvent::ToolCancelled { tool, elapsed_ms } => vec![T::Retry {
             kind: RetryKind::ToolCancelled,
@@ -425,7 +414,9 @@ mod tests {
             id: id.clone(),
             name: "bash".into(),
         });
-        assert!(matches!(start, TranslatedThreadEvent::ToolCallStart { ref name, .. } if name == "bash"));
+        assert!(
+            matches!(start, TranslatedThreadEvent::ToolCallStart { ref name, .. } if name == "bash")
+        );
 
         let delta = one(&AgentEvent::ToolCallInput {
             id: id.clone(),
@@ -437,7 +428,10 @@ mod tests {
         ));
 
         let end = one(&AgentEvent::ToolCallEnd { id: id.clone() });
-        assert!(matches!(end, TranslatedThreadEvent::ToolCallInputEnd { .. }));
+        assert!(matches!(
+            end,
+            TranslatedThreadEvent::ToolCallInputEnd { .. }
+        ));
 
         let result = one(&AgentEvent::ToolResultEnd {
             id,
@@ -591,10 +585,7 @@ mod tests {
             reason: "ok".into(),
             plan_revision: 7,
         });
-        assert_eq!(
-            a,
-            TranslatedThreadEvent::PlanAmended { plan_revision: 7 }
-        );
+        assert_eq!(a, TranslatedThreadEvent::PlanAmended { plan_revision: 7 });
     }
 
     #[test]
@@ -728,9 +719,7 @@ mod tests {
         // output (even if it's a Swallow). Callers rely on this to
         // avoid silent drops without a logged reason.
         for ev in [
-            AgentEvent::TextDelta {
-                text: "x".into(),
-            },
+            AgentEvent::TextDelta { text: "x".into() },
             AgentEvent::StepStarted { step_id: 1 },
             AgentEvent::Unknown,
         ] {

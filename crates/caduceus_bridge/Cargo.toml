@@ -12,7 +12,6 @@ caduceus-providers = { workspace = true }
 caduceus-omniscience = { workspace = true }
 caduceus-git = { workspace = true }
 caduceus-telemetry = { workspace = true }
-caduceus-scanner = { workspace = true }
 caduceus-storage = { workspace = true }
 caduceus-permissions = { workspace = true }
 caduceus-crdt = { workspace = true }

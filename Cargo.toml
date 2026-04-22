@@ -263,7 +263,6 @@ caduceus-tools = { path = "../caduceus/crates/caduceus-tools" }
 caduceus-git = { path = "../caduceus/crates/caduceus-git" }
 caduceus-omniscience = { path = "../caduceus/crates/caduceus-omniscience" }
 caduceus-telemetry = { path = "../caduceus/crates/caduceus-telemetry" }
-caduceus-scanner = { path = "../caduceus/crates/caduceus-scanner" }
 caduceus-storage = { path = "../caduceus/crates/caduceus-storage" }
 caduceus-permissions = { path = "../caduceus/crates/caduceus-permissions" }
 caduceus-crdt = { path = "../caduceus/crates/caduceus-crdt" }

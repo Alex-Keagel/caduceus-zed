@@ -2493,7 +2493,6 @@ dependencies = [
  "caduceus-core",
  "caduceus-permissions",
  "caduceus-providers",
- "caduceus-scanner",
  "caduceus-storage",
  "caduceus-telemetry",
  "caduceus-tools",
@@ -2570,22 +2569,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "caduceus-scanner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "caduceus-core",
- "ignore",
- "serde",
- "serde_json",
- "thiserror 2.0.17",
- "tokio",
- "tracing",
- "walkdir",
-]
-
-[[package]]
 name = "caduceus-storage"
 version = "0.1.0"
 dependencies = [
@@ -2658,7 +2641,6 @@ dependencies = [
  "caduceus-permissions",
  "caduceus-providers",
  "caduceus-runtime",
- "caduceus-scanner",
  "caduceus-storage",
  "caduceus-telemetry",
  "caduceus-tools",
