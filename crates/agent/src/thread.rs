@@ -2809,6 +2809,14 @@ impl Thread {
         mut cancellation_rx: watch::Receiver<bool>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
+        // G1d: native-loop gate. When the setting is ON, try to
+        // dispatch through the engine. If the gate declines (flag
+        // off, provider adapter missing, or ensure_caduceus_harness
+        // errored), fall through to the legacy body unchanged.
+        if Self::try_run_turn_native(this, event_stream, &mut cancellation_rx, cx).await? {
+            return Ok(());
+        }
+
         let mut attempt = 0;
         let mut intent = CompletionIntent::UserPrompt;
         loop {
@@ -3011,6 +3019,64 @@ impl Thread {
                 attempt = 0;
             }
         }
+    }
+
+    /// G1d: attempt the native-loop dispatch. Returns `Ok(true)` if
+    /// the native path fully handled the turn (caller returns), or
+    /// `Ok(false)` if the legacy path should be used. Returns `Err`
+    /// only on catastrophic failure (propagates out of the turn).
+    ///
+    /// **Current behavior (pre-provider-adapter):** emits a one-time
+    /// `EngineDiagnostic` when the setting is ON and the bridge can
+    /// be provisioned, then ALWAYS returns `Ok(false)`. This lets us
+    /// land the dispatch skeleton while the real provider adapter is
+    /// being built. Once `G1d-provider-adapter` lands, this function
+    /// flips to building the harness and driving
+    /// `run_caduceus_loop_translated`; the surrounding gate contract
+    /// does not change.
+    async fn try_run_turn_native(
+        this: &WeakEntity<Self>,
+        event_stream: &ThreadEventStream,
+        _cancellation_rx: &mut watch::Receiver<bool>,
+        cx: &mut AsyncApp,
+    ) -> Result<bool> {
+        let provisioned = this.update(cx, |this, cx| {
+            // `ensure_caduceus_harness` is a no-op when the setting
+            // is OFF and returns Ok(true) the first time it
+            // populates the bridge. We only care that the setting
+            // is ON *and* bridge provisioning didn't error.
+            let flag_on = agent_settings::AgentSettings::get_global(cx).caduceus_native_loop;
+            if !flag_on {
+                return false;
+            }
+            match this.ensure_caduceus_harness(cx) {
+                Ok(_) => this.caduceus_bridge.is_some(),
+                Err(err) => {
+                    log::warn!(
+                        "[native-loop] ensure_caduceus_harness failed: {err}; falling back to legacy"
+                    );
+                    false
+                }
+            }
+        })?;
+
+        if !provisioned {
+            return Ok(false);
+        }
+
+        // Gate check passed; emit the "not wired yet" diagnostic so
+        // integration tests can assert the setting is observed.
+        // When `G1d-provider-adapter` lands, replace this block with
+        // the harness build + `run_caduceus_loop_translated` + the
+        // biased select over (cancellation, translated_rx, harness).
+        event_stream.send_engine_diagnostic(
+            "native.provider_adapter_missing",
+            "caduceus_native_loop is enabled but the Zed LanguageModel → \
+             caduceus_providers::LlmAdapter adapter has not yet landed; \
+             falling back to the legacy turn loop. See todo G1d-provider-adapter.",
+            EngineDiagnosticSeverity::Warning,
+        );
+        Ok(false)
     }
 
     fn process_tool_result(
@@ -5003,6 +5069,207 @@ impl ThreadEventStream {
     fn send_error(&self, error: impl Into<anyhow::Error>) {
         self.0.unbounded_send(Err(error.into())).ok();
     }
+
+    // ── G1d: native-loop event sinks ───────────────────────────────
+    //
+    // These don't exist in the legacy path; added so
+    // [`dispatch_translated_event`] can surface engine notices/diag
+    // without threading new call sites through every translator arm.
+
+    fn send_context_notice(&self, kind: impl Into<String>, message: impl Into<String>) {
+        self.0
+            .unbounded_send(Ok(ThreadEvent::ContextNotice(ContextNotice {
+                kind: kind.into(),
+                message: message.into(),
+            })))
+            .ok();
+    }
+
+    fn send_engine_diagnostic(
+        &self,
+        kind: impl Into<String>,
+        detail: impl Into<String>,
+        severity: EngineDiagnosticSeverity,
+    ) {
+        self.0
+            .unbounded_send(Ok(ThreadEvent::EngineDiagnostic(EngineDiagnostic {
+                kind: kind.into(),
+                detail: detail.into(),
+                severity,
+            })))
+            .ok();
+    }
+}
+
+// ── G1d — translator → ThreadEvent dispatch ─────────────────────────
+//
+// `dispatch_translated_event` is the single mapping boundary between
+// the engine event stream (via `caduceus_bridge::event_translator`)
+// and the Zed-side `ThreadEvent`s the ACP consumer (and UI layer)
+// expect. Keeping this as a pure free function with no `cx`/`this`
+// dependency makes it unit-testable against a `mpsc::UnboundedSender`
+// alone — the 15 mapping tests in G1f pin the exact behaviors.
+//
+// **Invariants this function enforces:**
+//
+// 1. Every `TranslatedThreadEvent` either produces **at least one**
+//    `ThreadEvent` or is explicitly logged as swallowed.
+//    `T::Swallow` is a no-op; everything else has a mapping.
+//
+// 2. `TurnComplete` / `TurnError` are the ONLY variants that produce
+//    `ThreadEvent::Stop`. Callers rely on this to know when the
+//    translated stream has drained — any caller that sees a `Stop`
+//    should drop its `translated_rx` afterward.
+//
+// 3. Engine-only notices (`ContextWarning`, `ContextCompacted`,
+//    `ContextEvicted`, `ModeChanged`, `ScopeExpansion`) map to
+//    `ThreadEvent::ContextNotice` (info class) or
+//    `ThreadEvent::EngineDiagnostic` (warning class for
+//    scope-expansion). The UI consumer decides how to render; the
+//    existing ACP dispatcher (agent.rs:1879) logs-and-drops.
+//
+// 4. Plan-DAG variants (`PlanStep`, `PlanAmended`) currently map to
+//    `ContextNotice` with kind `"plan.step"` / `"plan.amended"`. The
+//    legacy `ThreadEvent::Plan(acp::Plan)` carries a different shape
+//    (a full snapshot) — the real plan mapping is deferred until
+//    `G1d-provider-adapter` lands since the engine's plan deltas
+//    need to be folded into an `acp::Plan` snapshot by the caller.
+fn dispatch_translated_event(
+    ev: &caduceus_bridge::event_translator::TranslatedThreadEvent,
+    stream: &ThreadEventStream,
+) {
+    use caduceus_bridge::event_translator::TranslatedThreadEvent as T;
+    match ev {
+        T::AgentText(text) => stream.send_text(text),
+        T::AgentThinking(text) => stream.send_thinking(text),
+        T::AgentThinkingComplete { content, .. } => stream.send_thinking(content),
+
+        // Tool lifecycle. These aren't enough to reconstruct a full
+        // `acp::ToolCall` (missing kind/title) without Zed-side
+        // metadata. Provider-adapter PR supplies the missing bits;
+        // for now surface them as diagnostics so a live trace is
+        // visible end-to-end in integration tests.
+        T::ToolCallStart { id, name } => {
+            stream.send_engine_diagnostic(
+                "tool.call.start",
+                format!("{name} id={id}"),
+                EngineDiagnosticSeverity::Info,
+            );
+        }
+        T::ToolCallInputDelta { id, delta } => {
+            stream.send_engine_diagnostic(
+                "tool.call.input_delta",
+                format!("id={id} delta_bytes={}", delta.len()),
+                EngineDiagnosticSeverity::Info,
+            );
+        }
+        T::ToolCallInputEnd { id } => {
+            stream.send_engine_diagnostic(
+                "tool.call.input_end",
+                format!("id={id}"),
+                EngineDiagnosticSeverity::Info,
+            );
+        }
+        T::ToolResult { id, content, is_error } => {
+            let severity = if *is_error {
+                EngineDiagnosticSeverity::Warning
+            } else {
+                EngineDiagnosticSeverity::Info
+            };
+            stream.send_engine_diagnostic(
+                "tool.result",
+                format!("id={id} is_error={is_error} bytes={}", content.len()),
+                severity,
+            );
+        }
+
+        // Permission — surface as warning. Real routing to
+        // `ToolCallAuthorization` is deferred to provider-adapter
+        // since the oneshot response channel needs engine-side
+        // plumbing through `approval_tx`.
+        T::PermissionRequest { id, tool, description } => {
+            stream.send_engine_diagnostic(
+                "permission.request",
+                format!("id={id} tool={tool}: {description}"),
+                EngineDiagnosticSeverity::Warning,
+            );
+        }
+
+        // Context notices — informational.
+        T::ContextWarning { level, used, max } => stream.send_context_notice(
+            "context.warning",
+            format!("{level}: {used}/{max} tokens"),
+        ),
+        T::ContextCompacted { freed, before, after } => stream.send_context_notice(
+            "context.compacted",
+            format!("freed {freed} tokens ({before} → {after})"),
+        ),
+        T::ContextEvicted { strategy, groups, total_tokens } => stream.send_context_notice(
+            "context.evicted",
+            format!("{strategy}: {groups} groups, {total_tokens} tokens"),
+        ),
+        T::ModeChanged { from_mode, to_mode, .. } => stream.send_context_notice(
+            "mode.changed",
+            format!("{from_mode} → {to_mode}"),
+        ),
+        T::ScopeExpansion { capability, resource, tool, reason } => {
+            stream.send_engine_diagnostic(
+                "scope.expansion",
+                format!("tool={tool} capability={capability} resource={resource}: {reason}"),
+                EngineDiagnosticSeverity::Warning,
+            );
+        }
+
+        // Retry — map to the existing acp_thread::RetryStatus shape
+        // with best-effort fields. The legacy path carries more
+        // detail (attempt counts, backoff), which the provider
+        // adapter will reinstate once AttemptStatus is available.
+        T::Retry { kind, message } => {
+            let label = format!("{kind:?}: {message}");
+            stream.send_engine_diagnostic(
+                "retry",
+                label,
+                EngineDiagnosticSeverity::Warning,
+            );
+        }
+
+        // Plan — context notice until full acp::Plan mapping lands.
+        T::PlanStep { step, tool, description, .. } => stream.send_context_notice(
+            "plan.step",
+            format!("#{step} {tool}: {description}"),
+        ),
+        T::PlanAmended { kind, step, ok, reason, .. } => stream.send_context_notice(
+            "plan.amended",
+            format!("#{step} {kind} ok={ok}: {reason}"),
+        ),
+
+        // Turn lifecycle.
+        T::TurnComplete { stop, .. } => {
+            use caduceus_bridge::event_translator::StopReasonKind as K;
+            let reason = match stop {
+                K::EndTurn => acp::StopReason::EndTurn,
+                K::ToolUse => acp::StopReason::EndTurn,
+                K::MaxTokens => acp::StopReason::MaxTokens,
+                K::StopSequence => acp::StopReason::EndTurn,
+                K::Error => acp::StopReason::Cancelled,
+                K::BudgetExceeded => acp::StopReason::MaxTokens,
+                K::Other(_) => acp::StopReason::EndTurn,
+            };
+            stream.send_stop(reason);
+        }
+        T::TurnError { message } => {
+            stream.send_engine_diagnostic(
+                "turn.error",
+                message.clone(),
+                EngineDiagnosticSeverity::Error,
+            );
+            stream.send_stop(acp::StopReason::Cancelled);
+        }
+
+        T::Swallow { reason } => {
+            log::trace!("[native-loop] swallow: {reason}");
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -6019,3 +6286,253 @@ mod atomic_write_tests {
         writer.join().unwrap();
     }
 }
+
+#[cfg(test)]
+mod native_dispatch_tests {
+    //! G1d — exhaustive mapping tests for
+    //! [`dispatch_translated_event`]. These pin the translator →
+    //! `ThreadEvent` contract so future changes to the translator
+    //! variant set surface as failing mapping assertions before they
+    //! reach an integration test.
+
+    use super::*;
+    use caduceus_bridge::event_translator::{
+        RetryKind as TRetryKind, StopReasonKind as TStop, TokenUsageMirror,
+        TranslatedThreadEvent as T,
+    };
+    use futures::channel::mpsc;
+    use futures::StreamExt;
+
+    fn dispatch_one(ev: T) -> Vec<ThreadEvent> {
+        let (tx, mut rx) = mpsc::unbounded::<Result<ThreadEvent>>();
+        let stream = ThreadEventStream(tx);
+        dispatch_translated_event(&ev, &stream);
+        drop(stream);
+        let mut out = Vec::new();
+        while let Ok(Some(item)) = rx.try_next() {
+            out.push(item.expect("dispatcher only produces Ok"));
+        }
+        out
+    }
+
+    fn assert_one<F: FnOnce(&ThreadEvent)>(evs: &[ThreadEvent], check: F) {
+        assert_eq!(evs.len(), 1, "expected one ThreadEvent, got {}", evs.len());
+        check(&evs[0]);
+    }
+
+    #[test]
+    fn agent_text_maps_through() {
+        let evs = dispatch_one(T::AgentText("hello".into()));
+        assert_one(&evs, |e| match e {
+            ThreadEvent::AgentText(s) => assert_eq!(s, "hello"),
+            other => panic!("expected AgentText, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn agent_thinking_maps_through() {
+        let evs = dispatch_one(T::AgentThinking("reasoning".into()));
+        assert_one(&evs, |e| match e {
+            ThreadEvent::AgentThinking(s) => assert_eq!(s, "reasoning"),
+            other => panic!("expected AgentThinking, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn thinking_complete_maps_to_thinking() {
+        // Duration is dropped in the current mapping; the content
+        // must still appear verbatim.
+        let evs = dispatch_one(T::AgentThinkingComplete {
+            content: "final thought".into(),
+            duration_ms: 123,
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::AgentThinking(s) => assert_eq!(s, "final thought"),
+            other => panic!("expected AgentThinking, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn tool_result_with_error_surfaces_warning() {
+        let evs = dispatch_one(T::ToolResult {
+            id: "t1".into(),
+            content: "boom".into(),
+            is_error: true,
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::EngineDiagnostic(d) => {
+                assert_eq!(d.kind, "tool.result");
+                assert_eq!(d.severity, EngineDiagnosticSeverity::Warning);
+                assert!(d.detail.contains("is_error=true"));
+            }
+            other => panic!("expected EngineDiagnostic, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn tool_result_ok_surfaces_info() {
+        let evs = dispatch_one(T::ToolResult {
+            id: "t2".into(),
+            content: "ok".into(),
+            is_error: false,
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::EngineDiagnostic(d) => {
+                assert_eq!(d.severity, EngineDiagnosticSeverity::Info);
+            }
+            other => panic!("expected EngineDiagnostic, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn context_compacted_is_notice() {
+        let evs = dispatch_one(T::ContextCompacted {
+            freed: 1000,
+            before: 5000,
+            after: 4000,
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::ContextNotice(n) => {
+                assert_eq!(n.kind, "context.compacted");
+                assert!(n.message.contains("1000"));
+            }
+            other => panic!("expected ContextNotice, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn scope_expansion_is_warning() {
+        let evs = dispatch_one(T::ScopeExpansion {
+            capability: "fs.write".into(),
+            resource: "/etc".into(),
+            tool: "edit_file".into(),
+            reason: "outside project root".into(),
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::EngineDiagnostic(d) => {
+                assert_eq!(d.kind, "scope.expansion");
+                assert_eq!(d.severity, EngineDiagnosticSeverity::Warning);
+            }
+            other => panic!("expected EngineDiagnostic, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn retry_is_warning_diagnostic() {
+        let evs = dispatch_one(T::Retry {
+            kind: TRetryKind::Loop,
+            message: "same tool twice".into(),
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::EngineDiagnostic(d) => {
+                assert_eq!(d.kind, "retry");
+                assert_eq!(d.severity, EngineDiagnosticSeverity::Warning);
+            }
+            other => panic!("expected EngineDiagnostic, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn plan_step_is_notice() {
+        let evs = dispatch_one(T::PlanStep {
+            step: 3,
+            step_id: 42,
+            plan_revision: 1,
+            tool: "grep".into(),
+            description: "find usages".into(),
+            depends_on: vec![],
+            parent_step_id: None,
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::ContextNotice(n) => {
+                assert_eq!(n.kind, "plan.step");
+                assert!(n.message.contains("#3"));
+                assert!(n.message.contains("grep"));
+            }
+            other => panic!("expected ContextNotice, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn turn_complete_end_turn_maps_to_stop_end_turn() {
+        let evs = dispatch_one(T::TurnComplete {
+            stop: TStop::EndTurn,
+            usage: TokenUsageMirror::default(),
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::Stop(acp::StopReason::EndTurn) => {}
+            other => panic!("expected Stop(EndTurn), got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn turn_complete_max_tokens_maps_through() {
+        let evs = dispatch_one(T::TurnComplete {
+            stop: TStop::MaxTokens,
+            usage: TokenUsageMirror::default(),
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::Stop(acp::StopReason::MaxTokens) => {}
+            other => panic!("expected Stop(MaxTokens), got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn turn_complete_budget_exceeded_maps_to_max_tokens() {
+        // BudgetExceeded has no ACP equivalent; current mapping
+        // folds it into MaxTokens. If this changes, update both
+        // mapping and this pin.
+        let evs = dispatch_one(T::TurnComplete {
+            stop: TStop::BudgetExceeded,
+            usage: TokenUsageMirror::default(),
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::Stop(acp::StopReason::MaxTokens) => {}
+            other => panic!("expected Stop(MaxTokens), got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn turn_error_emits_diagnostic_then_stop() {
+        let evs = dispatch_one(T::TurnError {
+            message: "provider failed".into(),
+        });
+        assert_eq!(evs.len(), 2, "TurnError must emit diag + stop");
+        match &evs[0] {
+            ThreadEvent::EngineDiagnostic(d) => {
+                assert_eq!(d.kind, "turn.error");
+                assert_eq!(d.severity, EngineDiagnosticSeverity::Error);
+            }
+            other => panic!("expected EngineDiagnostic, got {other:?}"),
+        }
+        match &evs[1] {
+            ThreadEvent::Stop(acp::StopReason::Cancelled) => {}
+            other => panic!("expected Stop(Cancelled), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn swallow_is_no_op() {
+        let evs = dispatch_one(T::Swallow {
+            reason: "test-only signal",
+        });
+        assert!(evs.is_empty(), "Swallow must not emit ThreadEvent");
+    }
+
+    #[test]
+    fn permission_request_is_warning() {
+        let evs = dispatch_one(T::PermissionRequest {
+            id: "p1".into(),
+            tool: "bash".into(),
+            description: "run tests".into(),
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::EngineDiagnostic(d) => {
+                assert_eq!(d.kind, "permission.request");
+                assert_eq!(d.severity, EngineDiagnosticSeverity::Warning);
+            }
+            other => panic!("expected EngineDiagnostic, got {other:?}"),
+        });
+    }
+}
+

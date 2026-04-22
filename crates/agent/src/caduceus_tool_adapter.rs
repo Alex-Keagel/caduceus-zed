@@ -42,7 +42,7 @@ use caduceus_core::{ToolKind, ToolResult, ToolSpec};
 use caduceus_tools::Tool;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 /// Outgoing-request channel cap (from dispatcher's perspective).
 /// Design §3-G1b chose 64: high enough that the harness's parallel tool
@@ -239,7 +239,7 @@ mod tests {
     use super::*;
     use futures::FutureExt as _;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     fn make_spec(name: &str) -> ToolSpec {
         ToolSpec {
@@ -259,9 +259,8 @@ mod tests {
     #[tokio::test]
     async fn happy_path_round_trip() {
         let (tx, rx) = mpsc::channel(REQUEST_CHANNEL_CAP);
-        let exec: ExecFn = Arc::new(|name, _input| {
-            async move { Ok(ok_result(&format!("ran {name}"))) }.boxed()
-        });
+        let exec: ExecFn =
+            Arc::new(|name, _input| async move { Ok(ok_result(&format!("ran {name}"))) }.boxed());
         tokio::spawn(drive(rx, exec, DEFAULT_MAX_CONCURRENCY, |fut| {
             tokio::spawn(fut)
         }));
