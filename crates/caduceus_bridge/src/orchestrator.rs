@@ -1236,6 +1236,43 @@ impl OrchestratorBridge {
         (harness, approval_tx, replay_handle, event_rx)
     }
 
+    /// G1h / `native-loop-wire-v1` — the full Phase-G IDE surface.
+    /// Combines the introspection sink (for the live reducer / Agents-
+    /// DAG projection) with an `AgentEventEmitter` channel (for
+    /// translator → ACP consumption) and HITL approval on the default
+    /// tool set. This is the exact harness shape that
+    /// [`Self::run_caduceus_loop_translated`] expects: the caller owns
+    /// the `event_rx` (must pass it in) AND the `reducer_handle`
+    /// (passed in by clone). Without this builder the IDE would have
+    /// to reach into `AgentHarness` internals to attach both.
+    ///
+    /// Returns `(harness, approval_tx, reducer_handle, event_rx)`.
+    pub fn build_harness_with_sink_and_emitter(
+        &self,
+        provider: Arc<dyn LlmAdapter>,
+        tools: ToolRegistry,
+        system_prompt: &str,
+    ) -> (
+        AgentHarness,
+        tokio::sync::mpsc::Sender<(String, bool)>,
+        crate::dag_state::ReducerHandle,
+        tokio::sync::mpsc::Receiver<AgentEvent>,
+    ) {
+        let reducer_handle = self.new_reducer_handle();
+        let sink: Arc<dyn caduceus_orchestrator::IntrospectionSink> =
+            Arc::new(reducer_handle.clone());
+        let (emitter, event_rx) = AgentEventEmitter::channel(Self::DEFAULT_EVENT_CHANNEL_BUFFER);
+        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
+            .with_tool_timeout(std::time::Duration::from_secs(120))
+            .with_instructions(&self.project_root)
+            .with_introspection_sink(sink)
+            .with_emitter(emitter);
+        let base = self.attach_p12(base);
+        let (harness, approval_tx) =
+            base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()));
+        (harness, approval_tx, reducer_handle, event_rx)
+    }
+
     /// Snapshot the retention ring on a given replay handle. This is the
     /// IPC entry point the Zed agent panel calls when it (re)mounts so it
     /// can rebuild the timeline without losing events that were emitted

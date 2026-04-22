@@ -93,7 +93,10 @@ impl LlmAdapter for ZedLlmAdapter {
     async fn chat(&self, request: ChatRequest) -> caduceus_core::Result<ChatResponse> {
         let (tx, rx) = oneshot::channel();
         self.dispatcher
-            .send(DispatchRequest::Chat { request, respond: tx })
+            .send(DispatchRequest::Chat {
+                request,
+                respond: tx,
+            })
             .await?;
         rx.await
             .map_err(|_| CaduceusError::Provider("provider dispatcher closed".into()))?
@@ -102,7 +105,10 @@ impl LlmAdapter for ZedLlmAdapter {
     async fn stream(&self, request: ChatRequest) -> caduceus_core::Result<StreamResult> {
         let (tx, rx) = oneshot::channel();
         self.dispatcher
-            .send(DispatchRequest::Stream { request, respond: tx })
+            .send(DispatchRequest::Stream {
+                request,
+                respond: tx,
+            })
             .await?;
         rx.await
             .map_err(|_| CaduceusError::Provider("provider dispatcher closed".into()))?
@@ -132,7 +138,57 @@ impl DispatcherHandle {
     }
 }
 
-enum DispatchRequest {
+/// Construct a `(DispatcherHandle, Receiver)` pair so production
+/// callers can spawn the dispatcher on their own GPUI executor
+/// (`cx.spawn`) — whose spawned future is not `Send`. For test /
+/// tokio-style contexts, use [`spawn_dispatcher`].
+pub fn dispatcher_channel() -> (DispatcherHandle, mpsc::Receiver<DispatchRequest>) {
+    let (tx, rx) = mpsc::channel::<DispatchRequest>(DISPATCH_CHANNEL_BOUND);
+    (DispatcherHandle { tx }, rx)
+}
+
+/// Drain a dispatcher-receiver, servicing each request by invoking
+/// `call_stream` and forwarding the translated outcome. Intended for
+/// production use in `cx.spawn(async move |cx| { drive_dispatcher(rx,
+/// call_stream).await })`: the future does NOT need to be `Send`, so
+/// `call_stream` may capture an `AsyncApp` clone.
+pub async fn drive_dispatcher_fn<F, Fut>(
+    mut rx: mpsc::Receiver<DispatchRequest>,
+    call_stream: F,
+) where
+    F: Fn(
+        LanguageModelRequest,
+    ) -> Fut,
+    Fut: Future<
+        Output = Result<
+            BoxStream<'static, Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>,
+            LanguageModelCompletionError,
+        >,
+    >,
+{
+    while let Some(req) = rx.next().await {
+        match req {
+            DispatchRequest::Chat { request, respond } => {
+                let lm_req = translate_chat_request(&request);
+                let result = match call_stream(lm_req).await {
+                    Ok(events) => aggregate_stream(events).await,
+                    Err(e) => Err(classify_error(&e)),
+                };
+                let _ = respond.send(result);
+            }
+            DispatchRequest::Stream { request, respond } => {
+                let lm_req = translate_chat_request(&request);
+                let result: caduceus_core::Result<StreamResult> = match call_stream(lm_req).await {
+                    Ok(events) => Ok(Box::pin(stream_to_chunks(events)) as StreamResult),
+                    Err(e) => Err(classify_error(&e)),
+                };
+                let _ = respond.send(result);
+            }
+        }
+    }
+}
+
+pub enum DispatchRequest {
     Chat {
         request: ChatRequest,
         respond: oneshot::Sender<caduceus_core::Result<ChatResponse>>,
@@ -185,8 +241,7 @@ where
 {
     let (tx, rx) = mpsc::channel::<DispatchRequest>(DISPATCH_CHANNEL_BOUND);
     let call_stream = Arc::new(call_stream);
-    let fut: Pin<Box<dyn Future<Output = ()> + Send>> =
-        Box::pin(drive_dispatcher(rx, call_stream));
+    let fut: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(drive_dispatcher(rx, call_stream));
     let _handle = spawn_fn(fut);
     DispatcherHandle { tx }
 }
@@ -540,11 +595,8 @@ impl Stream for ChunkStream {
                         self.output_tokens = Some(u.output_tokens.try_into().unwrap_or(u32::MAX));
                         self.cache_read_tokens =
                             Some(u.cache_read_input_tokens.try_into().unwrap_or(u32::MAX));
-                        self.cache_creation_tokens = Some(
-                            u.cache_creation_input_tokens
-                                .try_into()
-                                .unwrap_or(u32::MAX),
-                        );
+                        self.cache_creation_tokens =
+                            Some(u.cache_creation_input_tokens.try_into().unwrap_or(u32::MAX));
                         // Don't emit a chunk — just update cached
                         // state, wait for next content event.
                     }
@@ -693,9 +745,7 @@ mod tests {
 
     #[test]
     fn prompt_too_large_maps_to_context_overflow() {
-        let e = LanguageModelCompletionError::PromptTooLarge {
-            tokens: Some(9999),
-        };
+        let e = LanguageModelCompletionError::PromptTooLarge { tokens: Some(9999) };
         match classify_error(&e) {
             CaduceusError::ContextOverflow { used, .. } => {
                 assert_eq!(used, 9999);
@@ -764,16 +814,15 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_stream_rejects_malformed_tool_json() {
-        let events: BoxStream<'static, _> =
-            stream::iter(vec![Ok(
-                LanguageModelCompletionEvent::ToolUseJsonParseError {
-                    id: "t1".into(),
-                    tool_name: Arc::from("grep"),
-                    raw_input: Arc::from("not json"),
-                    json_parse_error: "expected `{`".into(),
-                },
-            )])
-            .boxed();
+        let events: BoxStream<'static, _> = stream::iter(vec![Ok(
+            LanguageModelCompletionEvent::ToolUseJsonParseError {
+                id: "t1".into(),
+                tool_name: Arc::from("grep"),
+                raw_input: Arc::from("not json"),
+                json_parse_error: "expected `{`".into(),
+            },
+        )])
+        .boxed();
         let err = aggregate_stream(events).await.expect_err("must fail");
         assert!(matches!(err, CaduceusError::Provider(ref s) if s.contains("grep")));
     }
@@ -811,10 +860,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_to_chunks_synthesizes_final_on_stream_end_without_stop() {
-        let events: BoxStream<'static, _> = stream::iter(vec![Ok(
-            LanguageModelCompletionEvent::Text("only".into()),
-        )])
-        .boxed();
+        let events: BoxStream<'static, _> =
+            stream::iter(vec![Ok(LanguageModelCompletionEvent::Text("only".into()))]).boxed();
         let mut s = Box::pin(stream_to_chunks(events));
         let first = s.next().await.expect("chunk").expect("ok");
         assert_eq!(first.delta, "only");
@@ -861,10 +908,7 @@ mod tests {
                 >
         };
 
-        let handle = spawn_dispatcher(
-            |fut| tokio::spawn(fut),
-            call_stream,
-        );
+        let handle = spawn_dispatcher(|fut| tokio::spawn(fut), call_stream);
         let adapter = ZedLlmAdapter::new(ProviderId("test".into()), handle);
 
         let req = mk_req(vec![mk_user_msg("hi")]);
@@ -877,9 +921,7 @@ mod tests {
     #[tokio::test]
     async fn adapter_reports_dispatcher_error_when_call_stream_fails() {
         let call_stream = |_req: LanguageModelRequest| {
-            Box::pin(async move {
-                Err(LanguageModelCompletionError::Other(anyhow!("boom")))
-            })
+            Box::pin(async move { Err(LanguageModelCompletionError::Other(anyhow!("boom"))) })
                 as Pin<
                     Box<
                         dyn Future<
@@ -897,10 +939,7 @@ mod tests {
                     >,
                 >
         };
-        let handle = spawn_dispatcher(
-            |fut| tokio::spawn(fut),
-            call_stream,
-        );
+        let handle = spawn_dispatcher(|fut| tokio::spawn(fut), call_stream);
         let adapter = ZedLlmAdapter::new(ProviderId("t".into()), handle);
         let err = adapter
             .chat(mk_req(vec![mk_user_msg("go")]))
@@ -914,9 +953,8 @@ mod tests {
         let handle = spawn_dispatcher(
             |fut| tokio::spawn(fut),
             |_req: LanguageModelRequest| {
-                Box::pin(async {
-                    Ok::<_, LanguageModelCompletionError>(stream::empty().boxed())
-                }) as Pin<Box<dyn Future<Output = _> + Send>>
+                Box::pin(async { Ok::<_, LanguageModelCompletionError>(stream::empty().boxed()) })
+                    as Pin<Box<dyn Future<Output = _> + Send>>
             },
         );
         let adapter = ZedLlmAdapter::new(ProviderId("t".into()), handle);
