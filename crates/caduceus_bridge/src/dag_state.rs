@@ -1117,4 +1117,52 @@ mod tests {
         h.ingest_event(&plan_step(1, 101, "read_file", vec![StepId(100).0]));
         assert_eq!(h.last_event_id(), 2, "writes after poison must advance event id");
     }
+
+    /// Phase-H H5: the reducer's agent-edge and provenance vecs are
+    /// bounded. Once the cap is hit, the oldest element is evicted
+    /// (FIFO) and the corresponding `*_dropped` counter bumps. The
+    /// counters surface on the DAG / snapshot projections so the UI
+    /// can render a "graph truncated" marker.
+    #[test]
+    fn bounded_agent_edges_evict_fifo_and_bump_drop_counter() {
+        use caduceus_core::AgentEdgeKind;
+        let mut r = SessionStateReducer::new();
+        // Seed one node so edges reference something real; not required
+        // for the bound, but keeps the shape realistic.
+        r.insert_agent_node(assignment(1, 1, "p"));
+
+        // Push CAP + 3 edges so we know the last 3 survive and the
+        // drop counter reflects the overflow.
+        let overflow = 3;
+        for i in 0..(SessionStateReducer::AGENT_EDGE_CAP + overflow) {
+            r.push_agent_edge(AgentEdgeV1 {
+                kind: AgentEdgeKind::Spawn,
+                from: ExecutionId(1),
+                to: ExecutionId((i as u64) + 2),
+            });
+        }
+        let dag = r.active_agents_dag(false);
+        assert_eq!(dag.edges.len(), SessionStateReducer::AGENT_EDGE_CAP);
+        assert_eq!(dag.edges_dropped, overflow as u64);
+        // FIFO: the oldest `overflow` edges were dropped, so the first
+        // retained edge's `to` is the (overflow+1)-th pushed value.
+        assert_eq!(dag.edges.first().unwrap().to, ExecutionId(overflow as u64 + 2));
+    }
+
+    #[test]
+    fn bounded_provenance_evicts_fifo_and_bump_drop_counter() {
+        use caduceus_core::ProvenanceEdgeKind;
+        let mut r = SessionStateReducer::new();
+        let overflow = 2;
+        for i in 0..(SessionStateReducer::PROVENANCE_CAP + overflow) {
+            r.push_provenance(ProvenanceEdgeV1 {
+                kind: ProvenanceEdgeKind::ExecutesStep,
+                execution_id: ExecutionId((i as u64) + 1),
+                target_step_id: None,
+            });
+        }
+        let snap = r.active_session_snapshot(false);
+        assert_eq!(snap.provenance.len(), SessionStateReducer::PROVENANCE_CAP);
+        assert_eq!(snap.provenance_dropped, overflow as u64);
+    }
 }
