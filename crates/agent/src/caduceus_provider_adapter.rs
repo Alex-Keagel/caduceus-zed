@@ -152,13 +152,9 @@ pub fn dispatcher_channel() -> (DispatcherHandle, mpsc::Receiver<DispatchRequest
 /// production use in `cx.spawn(async move |cx| { drive_dispatcher(rx,
 /// call_stream).await })`: the future does NOT need to be `Send`, so
 /// `call_stream` may capture an `AsyncApp` clone.
-pub async fn drive_dispatcher_fn<F, Fut>(
-    mut rx: mpsc::Receiver<DispatchRequest>,
-    call_stream: F,
-) where
-    F: Fn(
-        LanguageModelRequest,
-    ) -> Fut,
+pub async fn drive_dispatcher_fn<F, Fut>(mut rx: mpsc::Receiver<DispatchRequest>, call_stream: F)
+where
+    F: Fn(LanguageModelRequest) -> Fut,
     Fut: Future<
         Output = Result<
             BoxStream<'static, Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>,

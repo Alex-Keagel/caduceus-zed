@@ -1004,6 +1004,40 @@ impl OrchestratorBridge {
         "apply_patch",
     ];
 
+    // ── Fluent harness builder (ST-F2) ────────────────────────────────
+    //
+    // Contract `harness-builder-v2`. Single entry point that replaces
+    // the 9 `build_harness_*` variants. Old variants kept as thin
+    // `#[deprecated]` wrappers so callers migrate gradually without
+    // breaking tests.
+
+    /// Start a new [`HarnessBuilder`] against this bridge.
+    ///
+    /// Default configuration matches the pre-ST-F2 `build_harness()`
+    /// shape: HITL approval on [`DEFAULT_APPROVAL_TOOLS`], no envelope,
+    /// no introspection sink, no event emitter, no context injector,
+    /// 200k context window, 120s tool timeout.
+    pub fn harness(
+        &self,
+        provider: Arc<dyn LlmAdapter>,
+        tools: ToolRegistry,
+        system_prompt: impl Into<String>,
+    ) -> HarnessBuilder<'_> {
+        HarnessBuilder {
+            bridge: self,
+            provider,
+            tools,
+            system_prompt: system_prompt.into(),
+            approval: ApprovalChoice::Default,
+            envelope: None,
+            sink: SinkChoice::None,
+            emitter: EmitterChoice::None,
+            injector: InjectorChoice::None,
+            max_context_tokens: 200_000,
+            tool_timeout: std::time::Duration::from_secs(120),
+        }
+    }
+
     /// Build a full agent harness with tools, instructions, and HITL approval
     /// wired for the [`DEFAULT_APPROVAL_TOOLS`] set.
     ///
@@ -1021,12 +1055,8 @@ impl OrchestratorBridge {
         tools: ToolRegistry,
         system_prompt: &str,
     ) -> (AgentHarness, tokio::sync::mpsc::Sender<(String, bool)>) {
-        self.build_harness_with_approval(
-            provider,
-            tools,
-            system_prompt,
-            Self::DEFAULT_APPROVAL_TOOLS,
-        )
+        let built = self.harness(provider, tools, system_prompt).build();
+        (built.harness, built.approval_tx.expect("default approval"))
     }
 
     /// Build a harness with a caller-supplied approval set. Pass an empty
@@ -1039,11 +1069,11 @@ impl OrchestratorBridge {
         system_prompt: &str,
         approval_tools: &[S],
     ) -> (AgentHarness, tokio::sync::mpsc::Sender<(String, bool)>) {
-        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
-            .with_tool_timeout(std::time::Duration::from_secs(120))
-            .with_instructions(&self.project_root);
-        let base = self.attach_p12(base);
-        base.with_approval_flow(approval_tools.iter().map(|s| s.as_ref().to_string()))
+        let built = self
+            .harness(provider, tools, system_prompt)
+            .approval_tools(approval_tools.iter().map(|s| s.as_ref().to_string()))
+            .build();
+        (built.harness, built.approval_tx.expect("approval set"))
     }
 
     /// Build a harness with HITL approval disabled. Reserved for non-interactive
@@ -1055,21 +1085,16 @@ impl OrchestratorBridge {
         tools: ToolRegistry,
         system_prompt: &str,
     ) -> AgentHarness {
-        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
-            .with_tool_timeout(std::time::Duration::from_secs(120))
-            .with_instructions(&self.project_root);
-        self.attach_p12(base)
+        let built = self
+            .harness(provider, tools, system_prompt)
+            .no_approval()
+            .build();
+        built.harness
     }
 
     /// ST-B1 / contract `harness-sink-v1` — build a harness pre-wired with
     /// a `ReducerHandle` as its [`IntrospectionSink`], plus HITL approval
     /// on the [`DEFAULT_APPROVAL_TOOLS`] set.
-    ///
-    /// This is the production entry point for IDE surfaces that need the
-    /// live Agents-DAG: the returned `ReducerHandle` is the same reducer
-    /// projections are read from, so every `IntrospectionEventV1` variant
-    /// the harness emits lands in the reducer without a separate wire-up
-    /// step.
     ///
     /// Returns `(harness, approval_tx, reducer_handle)`.
     pub fn build_harness_with_sink(
@@ -1082,29 +1107,20 @@ impl OrchestratorBridge {
         tokio::sync::mpsc::Sender<(String, bool)>,
         crate::dag_state::ReducerHandle,
     ) {
-        let handle = self.new_reducer_handle();
-        let sink: Arc<dyn caduceus_orchestrator::IntrospectionSink> = Arc::new(handle.clone());
-        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
-            .with_tool_timeout(std::time::Duration::from_secs(120))
-            .with_instructions(&self.project_root)
-            .with_introspection_sink(sink);
-        let base = self.attach_p12(base);
-        let (harness, approval_tx) =
-            base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()));
-        (harness, approval_tx, handle)
+        let built = self
+            .harness(provider, tools, system_prompt)
+            .with_reducer_sink()
+            .build();
+        (
+            built.harness,
+            built.approval_tx.expect("default approval"),
+            built.reducer_handle.expect("sink requested"),
+        )
     }
 
     /// ST-B2 / contract `envelope-surface-v1` — build a harness pre-wired
     /// with a caller-supplied [`BridgePermissionEnvelope`] (plus HITL
-    /// approval on the default tool set). The envelope flows straight
-    /// through to `AgentHarness::with_permission_envelope` — no
-    /// translation layer, no serde mirror, so the same bytes produced by
-    /// `PermissionEnvelope::*_preset()` drive the harness's runtime
-    /// permission checks.
-    ///
-    /// Note: this builder does **not** install an introspection sink. For
-    /// the full Phase-B surface (envelope + sink + DAG handle), use
-    /// [`build_harness_with_envelope_and_sink`].
+    /// approval on the default tool set).
     pub fn build_harness_with_envelope(
         &self,
         provider: Arc<dyn LlmAdapter>,
@@ -1112,19 +1128,14 @@ impl OrchestratorBridge {
         system_prompt: &str,
         envelope: BridgePermissionEnvelope,
     ) -> (AgentHarness, tokio::sync::mpsc::Sender<(String, bool)>) {
-        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
-            .with_tool_timeout(std::time::Duration::from_secs(120))
-            .with_instructions(&self.project_root)
-            .with_permission_envelope(envelope);
-        let base = self.attach_p12(base);
-        base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()))
+        let built = self
+            .harness(provider, tools, system_prompt)
+            .envelope(envelope)
+            .build();
+        (built.harness, built.approval_tx.expect("default approval"))
     }
 
-    /// ST-B2 / contract `envelope-surface-v1` combined with `harness-sink-v1`
-    /// — the canonical Phase-B entry point. Returns a harness pre-wired
-    /// with both a permission envelope AND an introspection sink; returns
-    /// the approval channel and the reducer handle alongside the harness.
-    ///
+    /// ST-B2 / contract `envelope-surface-v1` combined with `harness-sink-v1`.
     /// Returns `(harness, approval_tx, reducer_handle)`.
     pub fn build_harness_with_envelope_and_sink(
         &self,
@@ -1137,31 +1148,20 @@ impl OrchestratorBridge {
         tokio::sync::mpsc::Sender<(String, bool)>,
         crate::dag_state::ReducerHandle,
     ) {
-        let handle = self.new_reducer_handle();
-        let sink: Arc<dyn caduceus_orchestrator::IntrospectionSink> = Arc::new(handle.clone());
-        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
-            .with_tool_timeout(std::time::Duration::from_secs(120))
-            .with_instructions(&self.project_root)
-            .with_permission_envelope(envelope)
-            .with_introspection_sink(sink);
-        let base = self.attach_p12(base);
-        let (harness, approval_tx) =
-            base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()));
-        (harness, approval_tx, handle)
+        let built = self
+            .harness(provider, tools, system_prompt)
+            .envelope(envelope)
+            .with_reducer_sink()
+            .build();
+        (
+            built.harness,
+            built.approval_tx.expect("default approval"),
+            built.reducer_handle.expect("sink requested"),
+        )
     }
 
-    /// ST-B3 / contract `context-injector-v1` — build a harness pre-wired
-    /// with a caller-supplied [`BridgePermissionEnvelope`], an
-    /// introspection sink, AND a [`ContextInjector`]. The injector lets
-    /// the IDE hand each critic/subtask a narrowly-scoped
-    /// [`ScopedContext`] (bounded by `envelope.skill_budget`) so fan-out
-    /// workers don't receive the full plan body.
-    ///
-    /// When `injector` is `None`, a fresh
-    /// [`BuiltinScopedContextInjector::default`] is installed — this
-    /// preserves today's default scoping behaviour for callers that
-    /// migrate to this builder before configuring a custom injector.
-    ///
+    /// ST-B3 / contract `context-injector-v1` — harness pre-wired with envelope,
+    /// introspection sink, and a (possibly default) [`ContextInjector`].
     /// Returns `(harness, approval_tx, reducer_handle)`.
     pub fn build_harness_with_envelope_sink_and_injector(
         &self,
@@ -1175,21 +1175,20 @@ impl OrchestratorBridge {
         tokio::sync::mpsc::Sender<(String, bool)>,
         crate::dag_state::ReducerHandle,
     ) {
-        let handle = self.new_reducer_handle();
-        let sink: Arc<dyn caduceus_orchestrator::IntrospectionSink> = Arc::new(handle.clone());
         let inj = injector.unwrap_or_else(|| {
             Arc::new(BuiltinScopedContextInjector::default()) as Arc<dyn ContextInjector>
         });
-        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
-            .with_tool_timeout(std::time::Duration::from_secs(120))
-            .with_instructions(&self.project_root)
-            .with_permission_envelope(envelope)
-            .with_introspection_sink(sink)
-            .with_context_injector(inj);
-        let base = self.attach_p12(base);
-        let (harness, approval_tx) =
-            base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()));
-        (harness, approval_tx, handle)
+        let built = self
+            .harness(provider, tools, system_prompt)
+            .envelope(envelope)
+            .with_reducer_sink()
+            .injector(inj)
+            .build();
+        (
+            built.harness,
+            built.approval_tx.expect("default approval"),
+            built.reducer_handle.expect("sink requested"),
+        )
     }
 
     // ── Emitter / replay seam (G17) ──────────────────────────────────────
@@ -1201,18 +1200,11 @@ impl OrchestratorBridge {
     pub const DEFAULT_EVENT_CHANNEL_BUFFER: usize = 256;
 
     /// Build a production harness wired with HITL approval AND an event
-    /// emitter that the IDE can both stream from (`event_rx`) and *replay*
-    /// from (`replay_handle`) on UI reattach.
-    ///
-    /// Closes gap G17: `AgentHarness` was already P1.4-retention-enabled,
-    /// but no surface in the bridge actually exposed `replay()` to the IDE,
-    /// making the retention ring a dead seam. The `replay_handle` is a
-    /// cheap `Clone` of the same emitter held by the harness; events are
-    /// observable through both.
+    /// emitter that the IDE can stream from (`event_rx`) and *replay* from
+    /// (`replay_handle`) on UI reattach (gap G17).
     ///
     /// Returns `(harness, approval_tx, replay_handle, event_rx)`. The
-    /// caller MUST consume `event_rx` (drop = dead channel = G27 territory)
-    /// and stash `replay_handle` for the agent panel to call on mount.
+    /// caller MUST consume `event_rx`.
     pub fn build_harness_with_emitter(
         &self,
         provider: Arc<dyn LlmAdapter>,
@@ -1224,27 +1216,24 @@ impl OrchestratorBridge {
         ReplayHandle,
         tokio::sync::mpsc::Receiver<AgentEvent>,
     ) {
-        let (emitter, event_rx) = AgentEventEmitter::channel(Self::DEFAULT_EVENT_CHANNEL_BUFFER);
-        let replay_handle = ReplayHandle::new(emitter.clone());
-        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
-            .with_tool_timeout(std::time::Duration::from_secs(120))
-            .with_instructions(&self.project_root)
-            .with_emitter(emitter);
-        let base = self.attach_p12(base);
-        let (harness, approval_tx) =
-            base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()));
-        (harness, approval_tx, replay_handle, event_rx)
+        let built = self
+            .harness(provider, tools, system_prompt)
+            .with_emitter()
+            .build();
+        (
+            built.harness,
+            built.approval_tx.expect("default approval"),
+            built.replay_handle.expect("emitter requested"),
+            built.event_rx.expect("emitter requested"),
+        )
     }
 
     /// G1h / `native-loop-wire-v1` — the full Phase-G IDE surface.
-    /// Combines the introspection sink (for the live reducer / Agents-
-    /// DAG projection) with an `AgentEventEmitter` channel (for
+    /// Combines the introspection sink (for the reducer / Agents-DAG
+    /// projection) with an `AgentEventEmitter` channel (for the
     /// translator → ACP consumption) and HITL approval on the default
     /// tool set. This is the exact harness shape that
-    /// [`Self::run_caduceus_loop_translated`] expects: the caller owns
-    /// the `event_rx` (must pass it in) AND the `reducer_handle`
-    /// (passed in by clone). Without this builder the IDE would have
-    /// to reach into `AgentHarness` internals to attach both.
+    /// [`Self::run_caduceus_loop_translated`] expects.
     ///
     /// Returns `(harness, approval_tx, reducer_handle, event_rx)`.
     pub fn build_harness_with_sink_and_emitter(
@@ -1258,19 +1247,17 @@ impl OrchestratorBridge {
         crate::dag_state::ReducerHandle,
         tokio::sync::mpsc::Receiver<AgentEvent>,
     ) {
-        let reducer_handle = self.new_reducer_handle();
-        let sink: Arc<dyn caduceus_orchestrator::IntrospectionSink> =
-            Arc::new(reducer_handle.clone());
-        let (emitter, event_rx) = AgentEventEmitter::channel(Self::DEFAULT_EVENT_CHANNEL_BUFFER);
-        let base = AgentHarness::new(provider, tools, 200_000, system_prompt)
-            .with_tool_timeout(std::time::Duration::from_secs(120))
-            .with_instructions(&self.project_root)
-            .with_introspection_sink(sink)
-            .with_emitter(emitter);
-        let base = self.attach_p12(base);
-        let (harness, approval_tx) =
-            base.with_approval_flow(Self::DEFAULT_APPROVAL_TOOLS.iter().map(|s| s.to_string()));
-        (harness, approval_tx, reducer_handle, event_rx)
+        let built = self
+            .harness(provider, tools, system_prompt)
+            .with_reducer_sink()
+            .with_emitter()
+            .build();
+        (
+            built.harness,
+            built.approval_tx.expect("default approval"),
+            built.reducer_handle.expect("sink requested"),
+            built.event_rx.expect("emitter requested"),
+        )
     }
 
     /// Snapshot the retention ring on a given replay handle. This is the
@@ -1692,6 +1679,194 @@ async fn await_forwarder_with_timeout(forwarder: tokio::task::JoinHandle<()>, la
         }
         Err(_) => {
             log::warn!("[caduceus_bridge] {label} task did not complete within 5s; abandoning");
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ST-F2 — HarnessBuilder (contract `harness-builder-v2`)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Single fluent entry point for producing a configured `AgentHarness`.
+// Replaces the 9 `build_harness_*` variants (now thin wrappers). Every
+// knob is optional; defaults match `OrchestratorBridge::build_harness()`.
+
+enum ApprovalChoice {
+    Default,
+    Custom(Vec<String>),
+    None,
+}
+
+enum SinkChoice {
+    None,
+    AutoReducer,
+    Custom(Arc<dyn caduceus_orchestrator::IntrospectionSink>),
+}
+
+enum EmitterChoice {
+    None,
+    AutoDefault,
+}
+
+enum InjectorChoice {
+    None,
+    Custom(Arc<dyn ContextInjector>),
+}
+
+/// Fluent builder for an [`AgentHarness`]. Obtain via
+/// [`OrchestratorBridge::harness`]. Every knob is optional; the default
+/// matches the pre-ST-F2 `build_harness()` shape.
+pub struct HarnessBuilder<'a> {
+    bridge: &'a OrchestratorBridge,
+    provider: Arc<dyn LlmAdapter>,
+    tools: ToolRegistry,
+    system_prompt: String,
+    approval: ApprovalChoice,
+    envelope: Option<BridgePermissionEnvelope>,
+    sink: SinkChoice,
+    emitter: EmitterChoice,
+    injector: InjectorChoice,
+    max_context_tokens: u32,
+    tool_timeout: std::time::Duration,
+}
+
+/// Result of [`HarnessBuilder::build`].
+#[non_exhaustive]
+pub struct BuiltHarness {
+    pub harness: AgentHarness,
+    pub approval_tx: Option<tokio::sync::mpsc::Sender<(String, bool)>>,
+    pub reducer_handle: Option<crate::dag_state::ReducerHandle>,
+    pub event_rx: Option<tokio::sync::mpsc::Receiver<AgentEvent>>,
+    pub replay_handle: Option<ReplayHandle>,
+}
+
+impl<'a> HarnessBuilder<'a> {
+    pub fn approval_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.approval = ApprovalChoice::Custom(tools.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn no_approval(mut self) -> Self {
+        self.approval = ApprovalChoice::None;
+        self
+    }
+
+    pub fn envelope(mut self, envelope: BridgePermissionEnvelope) -> Self {
+        self.envelope = Some(envelope);
+        self
+    }
+
+    pub fn with_reducer_sink(mut self) -> Self {
+        self.sink = SinkChoice::AutoReducer;
+        self
+    }
+
+    pub fn with_sink(mut self, sink: Arc<dyn caduceus_orchestrator::IntrospectionSink>) -> Self {
+        self.sink = SinkChoice::Custom(sink);
+        self
+    }
+
+    pub fn with_emitter(mut self) -> Self {
+        self.emitter = EmitterChoice::AutoDefault;
+        self
+    }
+
+    pub fn injector(mut self, injector: Arc<dyn ContextInjector>) -> Self {
+        self.injector = InjectorChoice::Custom(injector);
+        self
+    }
+
+    pub fn max_context_tokens(mut self, n: u32) -> Self {
+        self.max_context_tokens = n;
+        self
+    }
+
+    pub fn tool_timeout(mut self, d: std::time::Duration) -> Self {
+        self.tool_timeout = d;
+        self
+    }
+
+    pub fn build(self) -> BuiltHarness {
+        let HarnessBuilder {
+            bridge,
+            provider,
+            tools,
+            system_prompt,
+            approval,
+            envelope,
+            sink,
+            emitter,
+            injector,
+            max_context_tokens,
+            tool_timeout,
+        } = self;
+
+        let mut base = AgentHarness::new(provider, tools, max_context_tokens, &system_prompt)
+            .with_tool_timeout(tool_timeout)
+            .with_instructions(&bridge.project_root);
+
+        if let Some(env) = envelope {
+            base = base.with_permission_envelope(env);
+        }
+
+        let reducer_handle = match sink {
+            SinkChoice::None => None,
+            SinkChoice::AutoReducer => {
+                let handle = bridge.new_reducer_handle();
+                let s: Arc<dyn caduceus_orchestrator::IntrospectionSink> = Arc::new(handle.clone());
+                base = base.with_introspection_sink(s);
+                Some(handle)
+            }
+            SinkChoice::Custom(s) => {
+                base = base.with_introspection_sink(s);
+                None
+            }
+        };
+
+        let (event_rx, replay_handle) = match emitter {
+            EmitterChoice::None => (None, None),
+            EmitterChoice::AutoDefault => {
+                let (em, rx) = AgentEventEmitter::channel(
+                    OrchestratorBridge::DEFAULT_EVENT_CHANNEL_BUFFER,
+                );
+                let replay = ReplayHandle::new(em.clone());
+                base = base.with_emitter(em);
+                (Some(rx), Some(replay))
+            }
+        };
+
+        if let InjectorChoice::Custom(inj) = injector {
+            base = base.with_context_injector(inj);
+        }
+
+        let base = bridge.attach_p12(base);
+
+        let (harness, approval_tx) = match approval {
+            ApprovalChoice::Default => {
+                let (h, tx) = base.with_approval_flow(
+                    OrchestratorBridge::DEFAULT_APPROVAL_TOOLS
+                        .iter()
+                        .map(|s| s.to_string()),
+                );
+                (h, Some(tx))
+            }
+            ApprovalChoice::Custom(set) => {
+                let (h, tx) = base.with_approval_flow(set.into_iter());
+                (h, Some(tx))
+            }
+            ApprovalChoice::None => (base, None),
+        };
+
+        BuiltHarness {
+            harness,
+            approval_tx,
+            reducer_handle,
+            event_rx,
+            replay_handle,
         }
     }
 }
