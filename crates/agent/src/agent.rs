@@ -1,4 +1,5 @@
 mod caduceus_native_state;
+mod caduceus_tool_adapter;
 mod db;
 mod edit_agent;
 mod legacy_thread;
