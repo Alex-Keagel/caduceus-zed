@@ -1225,6 +1225,13 @@
     //
     // Default: true
     "show_merge_conflict_indicator": true,
+    // When true, the agent drives its turn loop through the Caduceus engine's
+    // native run_caduceus_loop (behaviour-rule preambles, envelope preflight,
+    // critique fan-out, introspection). Off by default; flipping mid-session
+    // rebuilds the per-thread harness on the next turn.
+    //
+    // Default: false
+    "caduceus_native_loop": false,
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,

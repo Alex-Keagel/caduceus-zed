@@ -33,6 +33,7 @@ dirs.workspace = true
 ignore.workspace = true
 caduceus-core.workspace = true
 caduceus-marketplace.workspace = true
+caduceus-orchestrator.workspace = true
 caduceus-permissions.workspace = true
 collections.workspace = true
 context_server.workspace = true
@@ -74,6 +75,7 @@ task.workspace = true
 telemetry.workspace = true
 text.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", features = ["sync"] }
 ui.workspace = true
 url.workspace = true
 util.workspace = true

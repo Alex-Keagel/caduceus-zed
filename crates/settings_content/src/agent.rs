@@ -231,6 +231,15 @@ pub struct AgentSettingsContent {
     /// `always_confirm`) match against the tool's text input (command, path,
     /// URL, etc.).
     pub tool_permissions: Option<ToolPermissionsContent>,
+    /// When true, the agent drives its turn loop through the Caduceus engine's
+    /// native `run_caduceus_loop` (enabling behaviour-rule preambles, envelope
+    /// preflight, critique fan-out, and introspection). When false (default),
+    /// the legacy hand-rolled streaming loop in `run_turn_internal` is used.
+    /// Flipping mid-session invalidates the per-thread harness and the next
+    /// turn rebuilds with the new path.
+    ///
+    /// Default: false
+    pub caduceus_native_loop: Option<bool>,
 }
 
 impl AgentSettingsContent {

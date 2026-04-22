@@ -1094,6 +1094,24 @@ pub struct Thread {
     context_pins: caduceus_bridge::orchestrator::ContextManager,
     /// Task DAG for multi-agent decomposition (per-thread, not global)
     task_dag: std::sync::Arc<std::sync::Mutex<caduceus_bridge::orchestrator::TaskDAG>>,
+    /// G1: shared OrchestratorBridge handle, lazily built on first turn.
+    /// When `caduceus_native_loop` setting is ON the bridge's
+    /// `native_loop_enabled` atomic is set; `run_turn_internal` dispatches
+    /// to the native loop via this handle.
+    caduceus_bridge: Option<std::sync::Arc<caduceus_bridge::orchestrator::OrchestratorBridge>>,
+    /// G1: engine harness for the native loop. Lazily built on first native
+    /// turn; invalidated on cancel/model-change so the next turn rebuilds
+    /// with fresh state.
+    caduceus_harness: Option<std::sync::Arc<caduceus_orchestrator::AgentHarness>>,
+    /// G1: per-thread mutable engine state held behind an async mutex so
+    /// the turn task can `lock()` for the full duration of a harness call.
+    /// Panic-safe via mutex poison; invalidated together with the harness.
+    caduceus_native_state:
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::caduceus_native_state::NativeLoopState>>>,
+    /// G1: cancellation token given to the harness at build time. Zed →
+    /// engine cancel flips this; the harness cooperates via its internal
+    /// `select!`.
+    caduceus_cancel_token: Option<caduceus_core::CancellationToken>,
     /// Cached total token estimate (invalidated on message changes).
     /// `Cell` allows population from `&self` callers — the cached value is
     /// observation-only state and never affects logical equality of Thread.
@@ -1243,6 +1261,10 @@ impl Thread {
             task_dag: std::sync::Arc::new(std::sync::Mutex::new(
                 caduceus_bridge::orchestrator::TaskDAG::new(),
             )),
+            caduceus_bridge: None,
+            caduceus_harness: None,
+            caduceus_native_state: None,
+            caduceus_cancel_token: None,
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
@@ -1494,6 +1516,10 @@ impl Thread {
             task_dag: std::sync::Arc::new(std::sync::Mutex::new(
                 caduceus_bridge::orchestrator::TaskDAG::new(),
             )),
+            caduceus_bridge: None,
+            caduceus_harness: None,
+            caduceus_native_state: None,
+            caduceus_cancel_token: None,
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
@@ -1631,6 +1657,98 @@ impl Thread {
     /// Context fill percentage (0-100, capped)
     pub fn context_fill_pct(&self) -> f64 {
         self.context_zone_and_pct().1
+    }
+
+    // ── G1a — native-loop harness lifecycle ─────────────────────────
+    //
+    // `caduceus_bridge`, `caduceus_harness`, `caduceus_native_state`,
+    // and `caduceus_cancel_token` are the four sibling fields managed
+    // as a unit: either all `Some` (after `ensure_caduceus_harness`)
+    // or all `None` (pre-init or post-invalidation). `ensure` is
+    // idempotent and a no-op while the `caduceus_native_loop` setting
+    // is OFF. `invalidate` is called on `set_model`, cancel (optional),
+    // and a flag OFF→ON or ON→OFF transition.
+
+    /// Returns `true` when the native loop is enabled in settings AND
+    /// the harness has been provisioned for this thread. Callers that
+    /// want to dispatch on the setting alone (not provisioning) should
+    /// read `AgentSettings::get_global(cx).caduceus_native_loop`
+    /// instead.
+    pub fn caduceus_native_loop_ready(&self) -> bool {
+        self.caduceus_harness.is_some()
+            && self.caduceus_native_state.is_some()
+            && self.caduceus_bridge.is_some()
+    }
+
+    /// Drops the harness, state, cancel token, and bridge handle so
+    /// the next `ensure_caduceus_harness` rebuilds them. Cheap:
+    /// dropping an Arc is O(1); the async mutex's inner drop is Send.
+    /// Safe to call from `&mut self` contexts; never blocks.
+    pub fn invalidate_caduceus_harness(&mut self) {
+        self.caduceus_harness = None;
+        self.caduceus_native_state = None;
+        self.caduceus_cancel_token = None;
+        // Intentionally keep `caduceus_bridge` — the bridge itself
+        // (ContextManager config, native_loop flag) outlives the
+        // harness. If the flag was the reason for invalidation the
+        // caller is expected to update the flag separately.
+    }
+
+    /// Idempotent lazy constructor. Populates the four native-loop
+    /// fields iff the `caduceus_native_loop` setting is ON. Returns
+    /// `true` if provisioning happened in this call, `false` if
+    /// already provisioned (no-op) or the flag is OFF.
+    ///
+    /// Failure modes (return `Err`): no worktree, bridge build
+    /// failure. On any error the fields stay `None` and the legacy
+    /// path keeps running.
+    pub fn ensure_caduceus_harness(&mut self, cx: &mut Context<Self>) -> Result<bool> {
+        // Already provisioned?
+        if self.caduceus_native_loop_ready() {
+            return Ok(false);
+        }
+        // Flag check — avoid any allocation when native loop is OFF.
+        let enabled = agent_settings::AgentSettings::get_global(cx).caduceus_native_loop;
+        if !enabled {
+            return Ok(false);
+        }
+
+        let worktree = self
+            .project
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("caduceus native loop requires a worktree"))?;
+        let root = worktree.read(cx).abs_path().to_path_buf();
+
+        let bridge = std::sync::Arc::new(
+            caduceus_bridge::orchestrator::OrchestratorBridge::new(&root)
+                .with_native_loop_enabled(true),
+        );
+        let cancel_token = caduceus_core::CancellationToken::new();
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::caduceus_native_state::NativeLoopState::new(root.clone()),
+        ));
+
+        // Harness build is deferred to G1b-tool-adapter / G1d — at
+        // that point we know the Zed tool registry and can wire the
+        // ZedToolAdapter. For G1a we only set up the bridge + state;
+        // `caduceus_harness` stays `None` until the first native
+        // turn actually constructs it. `caduceus_native_loop_ready()`
+        // therefore still returns `false` here, which is correct:
+        // dispatch should fall through to the legacy path until the
+        // G1d sub-task lands.
+        let _ = cancel_token;
+        let _ = state;
+
+        self.caduceus_bridge = Some(bridge);
+        // Re-assert: until G1b/G1d, harness + state + token stay
+        // None so `caduceus_native_loop_ready()` reports false and
+        // `run_turn_internal` keeps using the legacy body. Landing
+        // G1a-settings + G1a-harness-field alone is a no-op at the
+        // UI layer; the observable change is the bridge field
+        // existing.
+        Ok(true)
     }
 
     /// Current Caduceus mode name
@@ -2067,6 +2185,10 @@ impl Thread {
                 .update(cx, |thread, cx| thread.set_model(model.clone(), cx))
                 .ok();
         }
+
+        // G1a: model change invalidates the native-loop harness so the
+        // next turn rebuilds with the new system prompt / model binding.
+        self.invalidate_caduceus_harness();
 
         cx.notify()
     }

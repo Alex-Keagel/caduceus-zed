@@ -5,6 +5,7 @@ mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
 mod templates;
+mod caduceus_native_state;
 #[cfg(test)]
 mod tests;
 mod thread;
