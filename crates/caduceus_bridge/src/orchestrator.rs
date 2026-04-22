@@ -1830,9 +1830,8 @@ impl<'a> HarnessBuilder<'a> {
         let (event_rx, replay_handle) = match emitter {
             EmitterChoice::None => (None, None),
             EmitterChoice::AutoDefault => {
-                let (em, rx) = AgentEventEmitter::channel(
-                    OrchestratorBridge::DEFAULT_EVENT_CHANNEL_BUFFER,
-                );
+                let (em, rx) =
+                    AgentEventEmitter::channel(OrchestratorBridge::DEFAULT_EVENT_CHANNEL_BUFFER);
                 let replay = ReplayHandle::new(em.clone());
                 base = base.with_emitter(em);
                 (Some(rx), Some(replay))
