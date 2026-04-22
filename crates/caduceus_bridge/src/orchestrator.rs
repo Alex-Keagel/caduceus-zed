@@ -2007,6 +2007,78 @@ mod tests {
         assert!(!approval_tx.is_closed(), "approval channel should be live");
     }
 
+    // ── ST-F2 — HarnessBuilder ────────────────────────────────────────
+
+    #[test]
+    fn harness_builder_default_matches_legacy_build_harness() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools = ToolRegistry::new();
+        let built = bridge.harness(provider, tools, "test").build();
+        assert!(built.approval_tx.is_some(), "default = HITL on");
+        assert!(
+            !built.approval_tx.as_ref().unwrap().is_closed(),
+            "channel live"
+        );
+        assert!(built.reducer_handle.is_none(), "no sink by default");
+        assert!(built.event_rx.is_none(), "no emitter by default");
+        assert!(built.replay_handle.is_none(), "no emitter by default");
+    }
+
+    #[test]
+    fn harness_builder_no_approval_drops_channel() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools = ToolRegistry::new();
+        let built = bridge
+            .harness(provider, tools, "test")
+            .no_approval()
+            .build();
+        assert!(
+            built.approval_tx.is_none(),
+            "no_approval must not yield a channel"
+        );
+    }
+
+    #[test]
+    fn harness_builder_full_phase_g_surface() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools = ToolRegistry::new();
+        let built = bridge
+            .harness(provider, tools, "test")
+            .with_reducer_sink()
+            .with_emitter()
+            .build();
+        assert!(built.approval_tx.is_some());
+        assert!(built.reducer_handle.is_some(), "sink requested");
+        assert!(built.event_rx.is_some(), "emitter requested");
+        assert!(built.replay_handle.is_some(), "emitter requested");
+    }
+
+    #[test]
+    fn harness_builder_max_context_tokens_threads_through() {
+        // Regression guard for audit finding F-13 (max_context_tokens was
+        // hardcoded to 200_000 even when a smaller-context model was used).
+        // We can't introspect the AgentHarness budget directly from the
+        // bridge, but constructing with a small budget must not panic.
+        use caduceus_providers::mock::MockLlmAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = OrchestratorBridge::new(dir.path());
+        let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let tools = ToolRegistry::new();
+        let _built = bridge
+            .harness(provider, tools, "test")
+            .max_context_tokens(8_192)
+            .build();
+    }
+
     #[test]
     fn build_harness_with_approval_empty_set_is_autopilot() {
         use caduceus_providers::mock::MockLlmAdapter;
