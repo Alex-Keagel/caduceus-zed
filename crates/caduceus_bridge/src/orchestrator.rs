@@ -1331,7 +1331,7 @@ impl OrchestratorBridge {
         history: &mut ConversationHistory,
         user_input: &str,
         reducer: crate::dag_state::ReducerHandle,
-        mut event_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+        event_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     ) -> Result<String, String> {
         if !self.native_loop_enabled() {
             return Err(
@@ -1348,27 +1348,8 @@ impl OrchestratorBridge {
         // having to drop `harness` first — the harness is borrowed, so
         // the caller may want to keep it alive for the next turn.
         let reducer_fwd = reducer.clone();
-        let (drain_tx, mut drain_rx) = tokio::sync::oneshot::channel::<()>();
-        let forwarder = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    maybe_ev = event_rx.recv() => {
-                        match maybe_ev {
-                            Some(ev) => { let _ = reducer_fwd.ingest_event(&ev); }
-                            None => break,
-                        }
-                    }
-                    _ = &mut drain_rx => {
-                        // Drain already-buffered events before exiting so
-                        // post-`run()` tail events (e.g. `TurnComplete`)
-                        // don't get dropped.
-                        while let Ok(ev) = event_rx.try_recv() {
-                            let _ = reducer_fwd.ingest_event(&ev);
-                        }
-                        break;
-                    }
-                }
-            }
+        let (forwarder, drain_tx) = spawn_forwarder(event_rx, move |ev| {
+            reducer_fwd.ingest_event(ev);
         });
 
         let run_result = harness
@@ -1379,18 +1360,7 @@ impl OrchestratorBridge {
         // Signal drain; ignore send errors (forwarder already observed
         // channel close, which is the preferred path anyway).
         let _ = drain_tx.send(());
-        // Bound forwarder wait so a stalled reducer cannot hang the caller.
-        match tokio::time::timeout(std::time::Duration::from_secs(5), forwarder).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                log::warn!("[caduceus_bridge] forwarder task join failed: {e}");
-            }
-            Err(_) => {
-                log::warn!(
-                    "[caduceus_bridge] forwarder task did not complete within 5s; abandoning"
-                );
-            }
-        }
+        await_forwarder_with_timeout(forwarder, "forwarder").await;
 
         run_result
     }
@@ -1423,7 +1393,7 @@ impl OrchestratorBridge {
         history: &mut ConversationHistory,
         user_input: &str,
         reducer: crate::dag_state::ReducerHandle,
-        mut event_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+        event_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
         translated_tx: tokio::sync::mpsc::UnboundedSender<
             crate::event_translator::TranslatedThreadEvent,
         >,
@@ -1437,34 +1407,11 @@ impl OrchestratorBridge {
         }
 
         let reducer_fwd = reducer.clone();
-        let (drain_tx, mut drain_rx) = tokio::sync::oneshot::channel::<()>();
-        let forwarder = tokio::spawn(async move {
-            let forward_one = |ev: &AgentEvent,
-                               reducer: &crate::dag_state::ReducerHandle,
-                               tx: &tokio::sync::mpsc::UnboundedSender<
-                crate::event_translator::TranslatedThreadEvent,
-            >| {
-                let _ = reducer.ingest_event(ev);
-                for out in crate::event_translator::translate(ev) {
-                    // Best-effort: drop silently if the receiver is gone.
-                    let _ = tx.send(out);
-                }
-            };
-            loop {
-                tokio::select! {
-                    maybe_ev = event_rx.recv() => {
-                        match maybe_ev {
-                            Some(ev) => forward_one(&ev, &reducer_fwd, &translated_tx),
-                            None => break,
-                        }
-                    }
-                    _ = &mut drain_rx => {
-                        while let Ok(ev) = event_rx.try_recv() {
-                            forward_one(&ev, &reducer_fwd, &translated_tx);
-                        }
-                        break;
-                    }
-                }
+        let (forwarder, drain_tx) = spawn_forwarder(event_rx, move |ev| {
+            reducer_fwd.ingest_event(ev);
+            for out in crate::event_translator::translate(ev) {
+                // Best-effort: drop silently if the receiver is gone.
+                let _ = translated_tx.send(out);
             }
         });
 
@@ -1474,13 +1421,7 @@ impl OrchestratorBridge {
             .map_err(|e| e.to_string());
 
         let _ = drain_tx.send(());
-        match tokio::time::timeout(std::time::Duration::from_secs(5), forwarder).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => log::warn!("[caduceus_bridge] translated forwarder join failed: {e}"),
-            Err(_) => log::warn!(
-                "[caduceus_bridge] translated forwarder did not complete within 5s; abandoning"
-            ),
-        }
+        await_forwarder_with_timeout(forwarder, "translated forwarder").await;
 
         run_result
     }
@@ -1654,6 +1595,72 @@ impl OrchestratorBridge {
     /// Render the entire task tree as an indented string.
     pub fn to_tree_string(tree: &TaskTree) -> String {
         tree.to_tree_string()
+    }
+}
+
+/// Phase-H H3 — shared forwarder primitive used by
+/// [`OrchestratorBridge::run_caduceus_loop`] and
+/// [`OrchestratorBridge::run_caduceus_loop_translated`].
+///
+/// Spawns a tokio task that pumps every [`AgentEvent`] from `event_rx`
+/// into `on_event` until *either* the channel closes *or* the returned
+/// drain signal is sent (at which point already-buffered events are
+/// drained via `try_recv` before exit so tail events like `TurnComplete`
+/// are not dropped).
+///
+/// Returns `(JoinHandle, drain_tx)`. The caller:
+/// * awaits `harness.run()`,
+/// * sends on `drain_tx` to request an orderly exit, then
+/// * passes the `JoinHandle` to [`await_forwarder_with_timeout`].
+fn spawn_forwarder<F>(
+    mut event_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+    mut on_event: F,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Sender<()>,
+)
+where
+    F: FnMut(&AgentEvent) + Send + 'static,
+{
+    let (drain_tx, mut drain_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                maybe_ev = event_rx.recv() => {
+                    match maybe_ev {
+                        Some(ev) => on_event(&ev),
+                        None => break,
+                    }
+                }
+                _ = &mut drain_rx => {
+                    while let Ok(ev) = event_rx.try_recv() {
+                        on_event(&ev);
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    (handle, drain_tx)
+}
+
+/// Phase-H H3 — 5s-bounded wait on a forwarder task. Logs (never
+/// panics) on join failure or timeout. `label` is used in the log
+/// message to distinguish `forwarder` from `translated forwarder`.
+async fn await_forwarder_with_timeout(
+    forwarder: tokio::task::JoinHandle<()>,
+    label: &'static str,
+) {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), forwarder).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            log::warn!("[caduceus_bridge] {label} task join failed: {e}");
+        }
+        Err(_) => {
+            log::warn!(
+                "[caduceus_bridge] {label} task did not complete within 5s; abandoning"
+            );
+        }
     }
 }
 
