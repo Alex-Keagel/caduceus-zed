@@ -14,8 +14,7 @@ use caduceus_core::{
 };
 use caduceus_orchestrator::IntrospectionSink;
 use caduceus_orchestrator::critique_fanout::{
-    CritiqueRunner, FanoutIntrospectionCtx,
-    spawn_critique_fanout_with_introspection,
+    CritiqueRunner, FanoutIntrospectionCtx, spawn_critique_fanout_with_introspection,
 };
 use caduceus_orchestrator::modes::PersonaRegistry;
 use caduceus_permissions::envelope::{FanoutPolicy, PermissionEnvelope};

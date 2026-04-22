@@ -78,10 +78,7 @@ impl ToolsBridge {
     /// Run a test command in the given workspace directory.
     pub async fn run_tests(workspace: &str, command: &str) -> Result<VerificationResult, String> {
         let mut verifier = SelfVerifier::new(PathBuf::from(workspace));
-        verifier
-            .run_tests(command)
-            .await
-            .map_err(|e| e.to_string())
+        verifier.run_tests(command).await.map_err(|e| e.to_string())
     }
 
     // NOTE: scan_diff is already exposed as CaduceusEngine::security_scan_diff.

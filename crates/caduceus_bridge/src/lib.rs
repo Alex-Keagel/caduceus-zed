@@ -16,6 +16,7 @@ pub mod context_events;
 pub mod crdt;
 pub mod dag_state;
 pub mod engine;
+pub mod event_translator;
 pub mod git;
 pub mod index_dag;
 pub mod marketplace;

@@ -274,7 +274,9 @@ fn validate_checkpoint_id(checkpoint_id: &str) -> Result<(), String> {
         match c {
             std::path::Component::Normal(_) => components += 1,
             _ => {
-                return Err("Checkpoint id must be a single non-traversing path segment".to_string());
+                return Err(
+                    "Checkpoint id must be a single non-traversing path segment".to_string()
+                );
             }
         }
     }

@@ -673,6 +673,26 @@ pub fn parse_versioned_event_json(s: &str) -> Result<(AgentEvent, bool), String>
     Ok((envelope.event, from_newer))
 }
 
+// ── F4 / G1c — Envelope preflight exposed to thread-side code ────────────
+pub use caduceus_orchestrator::{PreflightOutcome, preflight_envelope_of};
+
+/// Thread-side envelope preflight. Thin wrapper around
+/// [`preflight_envelope_of`] so Zed's tool-dispatch path can block or
+/// intercept tool calls BEFORE invoking the harness (legacy path) and
+/// without duplicating the capability-classification logic that lives
+/// in the orchestrator. Returns [`PreflightOutcome::Allow`] when no
+/// envelope is attached — callers then proceed to normal dispatch.
+pub fn check_tool_envelope(
+    envelope: Option<&BridgePermissionEnvelope>,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> PreflightOutcome {
+    match envelope {
+        None => PreflightOutcome::Allow,
+        Some(env) => preflight_envelope_of(env, tool_name, input),
+    }
+}
+
 impl OrchestratorBridge {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -768,10 +788,7 @@ impl OrchestratorBridge {
     /// Set the default Tree-of-Thoughts planner config used for any
     /// future `plan_with_tot` calls on harnesses produced by this
     /// bridge.
-    pub fn with_tot_config(
-        mut self,
-        cfg: caduceus_orchestrator::PlannerConfig,
-    ) -> Self {
+    pub fn with_tot_config(mut self, cfg: caduceus_orchestrator::PlannerConfig) -> Self {
         self.tot_config = Some(cfg);
         self
     }
@@ -1561,6 +1578,53 @@ mod tests {
         assert!(history.is_empty());
     }
 
+    // ── F4 / G1c — check_tool_envelope ─────────────────────────────────
+    #[test]
+    fn check_tool_envelope_none_allows() {
+        let out = check_tool_envelope(None, "bash", &serde_json::json!({"command": "ls"}));
+        assert!(matches!(out, PreflightOutcome::Allow));
+    }
+
+    #[test]
+    fn check_tool_envelope_plan_intercepts_writes() {
+        let env = caduceus_permissions::envelope::PermissionEnvelope::plan_preset();
+        let out = check_tool_envelope(
+            Some(&env),
+            "edit_file",
+            &serde_json::json!({"path": "src/main.rs"}),
+        );
+        assert!(
+            matches!(out, PreflightOutcome::Intercept(_)),
+            "plan preset must intercept writes, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn check_tool_envelope_plan_allows_reads() {
+        let env = caduceus_permissions::envelope::PermissionEnvelope::plan_preset();
+        let out = check_tool_envelope(
+            Some(&env),
+            "read_file",
+            &serde_json::json!({"path": "src/main.rs"}),
+        );
+        assert!(matches!(out, PreflightOutcome::Allow));
+    }
+
+    #[test]
+    fn check_tool_envelope_act_denies_exec_when_disabled() {
+        // Act preset with empty write lists; default exec is disabled.
+        let env = caduceus_permissions::envelope::PermissionEnvelope::act_preset(vec![], vec![]);
+        let out = check_tool_envelope(
+            Some(&env),
+            "bash",
+            &serde_json::json!({"command": "rm -rf /"}),
+        );
+        assert!(
+            matches!(out, PreflightOutcome::Deny { .. }),
+            "act preset with exec disabled must deny bash, got {out:?}"
+        );
+    }
+
     #[test]
     fn orchestrator_new_session() {
         let bridge = OrchestratorBridge::new(".");
@@ -1735,7 +1799,6 @@ mod tests {
         assert_eq!(got_bytes, expected_bytes);
     }
 
-
     /// ST-B2 combined with ST-B1: `build_harness_with_envelope_and_sink`
     /// must thread BOTH the envelope AND the reducer-backed sink, and
     /// the returned reducer handle must be the one the sink feeds.
@@ -1756,12 +1819,8 @@ mod tests {
             e.fanout_policy = FanoutPolicy::MultiPersona;
             e
         };
-        let (harness, _tx, handle) = bridge.build_harness_with_envelope_and_sink(
-            provider,
-            tools,
-            "test",
-            env.clone(),
-        );
+        let (harness, _tx, handle) =
+            bridge.build_harness_with_envelope_and_sink(provider, tools, "test", env.clone());
 
         // Envelope threaded.
         let got_env = harness.permission_envelope().expect("envelope");
@@ -1823,8 +1882,7 @@ mod tests {
         }
         impl ContextInjector for CountingInjector {
             fn scope_for(&self, req: ScopeRequest<'_>) -> ScopedContext {
-                self.count
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.personas.lock().unwrap().push(req.persona.to_string());
                 caduceus_orchestrator::PassthroughContextInjector.scope_for(req)
             }
@@ -1891,13 +1949,8 @@ mod tests {
         let bridge2 = OrchestratorBridge::new(dir2.path());
         let provider2: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
         let tools2 = ToolRegistry::new();
-        let (harness2, _tx2, _h2) = bridge2.build_harness_with_envelope_sink_and_injector(
-            provider2,
-            tools2,
-            "test",
-            env,
-            None,
-        );
+        let (harness2, _tx2, _h2) = bridge2
+            .build_harness_with_envelope_sink_and_injector(provider2, tools2, "test", env, None);
         assert!(
             harness2.context_injector().is_some(),
             "None must fall back to BuiltinScopedContextInjector::default()"
@@ -1972,14 +2025,9 @@ mod tests {
             }
         }
 
-        let got = spawn_critique_fanout_via_harness(
-            &harness,
-            "plan body",
-            &["cloud", "qa"],
-            &reg,
-            &R,
-        )
-        .await;
+        let got =
+            spawn_critique_fanout_via_harness(&harness, "plan body", &["cloud", "qa"], &reg, &R)
+                .await;
         assert_eq!(got.len(), 3, "rubber-duck + cloud + qa");
 
         // The reducer handle returned by `build_harness_with_sink` MUST be
@@ -3396,8 +3444,7 @@ mod tests {
         // emits none for a plain reply, so projections are empty).
         let bridge_a = OrchestratorBridge::new(dir.path());
         let provider_a: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![reply("pong")]));
-        let harness_a =
-            AgentHarness::new(provider_a, ToolRegistry::new(), 4096, "system prompt A");
+        let harness_a = AgentHarness::new(provider_a, ToolRegistry::new(), 4096, "system prompt A");
         let mut state_a = bridge_a.new_session("mock", "mock-model");
         let mut history_a = OrchestratorBridge::new_history();
         let out_a = harness_a
