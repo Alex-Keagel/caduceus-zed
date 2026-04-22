@@ -99,7 +99,8 @@ async fn native_loop_translated_emits_ui_events_for_simple_turn() {
         matches!(
             e,
             TranslatedThreadEvent::TurnComplete {
-                stop: StopReasonKind::EndTurn
+                stop: StopReasonKind::EndTurn,
+                ..
             }
         )
     });

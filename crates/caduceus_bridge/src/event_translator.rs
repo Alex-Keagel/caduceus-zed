@@ -28,6 +28,10 @@ pub enum TranslatedThreadEvent {
     AgentText(String),
     /// Reasoning / thinking delta.
     AgentThinking(String),
+    /// Terminal reasoning chunk with duration telemetry (H2 — previously
+    /// `ReasoningComplete.duration_ms` was dropped). UI may render a
+    /// "thought for Xms" collapsed marker.
+    AgentThinkingComplete { content: String, duration_ms: u64 },
     /// New tool call starting. `id` is the engine-assigned tool_use_id.
     ToolCallStart { id: String, name: String },
     /// Streaming tool-input delta (for UIs that render arg streaming).
@@ -68,14 +72,30 @@ pub enum TranslatedThreadEvent {
     /// engine keeps running.
     Retry { kind: RetryKind, message: String },
     /// A new plan step was recorded in Plan mode, awaiting execution.
+    /// H2 — `step_id`, `depends_on`, `parent_step_id`, `plan_revision`
+    /// preserved so the UI can render the P13 Features DAG (edges
+    /// require stable ids; the positional `step` number shifts on
+    /// amendment and MUST NOT be used for cross-step references).
     PlanStep {
         step: usize,
+        step_id: u64,
+        plan_revision: u64,
         tool: String,
         description: String,
+        depends_on: Vec<u64>,
+        parent_step_id: Option<u64>,
     },
-    /// An existing plan was amended. Thread.rs should re-query the full
-    /// plan rather than try to apply the delta from this event alone.
-    PlanAmended { plan_revision: u64 },
+    /// An existing plan was amended. H2 — `kind`/`step`/`ok`/`reason`
+    /// preserved so the UI can render "plan changed because <reason>"
+    /// and distinguish `ok=false` (rejected) from applied amendments
+    /// without re-querying the plan.
+    PlanAmended {
+        plan_revision: u64,
+        kind: String,
+        step: usize,
+        ok: bool,
+        reason: String,
+    },
     /// Scope expansion (envelope trip) — always re-prompts the user
     /// regardless of approval cadence. UI should prominently surface.
     ScopeExpansion {
@@ -85,12 +105,21 @@ pub enum TranslatedThreadEvent {
         reason: String,
     },
     /// Mode or lens changed mid-session. UI updates mode badge.
+    /// H2 — `from_*` preserved so the UI can render transition
+    /// animations / diff badges.
     ModeChanged {
+        from_mode: String,
         to_mode: String,
+        from_lens: Option<String>,
         to_lens: Option<String>,
     },
     /// Turn finished. UI emits its `Stop` event with the mapped reason.
-    TurnComplete { stop: StopReasonKind },
+    /// H2 — token usage preserved so the UI can update the per-turn
+    /// token meter without round-tripping to the reducer.
+    TurnComplete {
+        stop: StopReasonKind,
+        usage: TokenUsageMirror,
+    },
     /// Engine-level error during the turn. Thread.rs emits `Stop(Error)`
     /// after flushing pending messages.
     TurnError { message: String },
@@ -117,10 +146,35 @@ pub enum StopReasonKind {
     EndTurn,
     ToolUse,
     MaxTokens,
+    /// H2 — dedicated variant (was previously aliased to `EndTurn`,
+    /// losing the provider signal that a custom stop sequence matched).
+    StopSequence,
     Error,
     BudgetExceeded,
     /// Fallback for forward-compat variants.
     Other(String),
+}
+
+/// Bridge-local mirror of [`caduceus_core::TokenUsage`] — kept here so
+/// the translator output enum has no dependency on engine-only types
+/// beyond `AgentEvent` (which is already the translator's input).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsageMirror {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_write_tokens: u32,
+}
+
+impl From<&caduceus_core::TokenUsage> for TokenUsageMirror {
+    fn from(u: &caduceus_core::TokenUsage) -> Self {
+        Self {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_read_tokens: u.cache_read_tokens,
+            cache_write_tokens: u.cache_write_tokens,
+        }
+    }
 }
 
 /// Translate a single engine event into zero-or-more UI events.
@@ -135,13 +189,13 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
         // ── Streaming text ─────────────────────────────────────────────
         AgentEvent::TextDelta { text } => vec![T::AgentText(text.clone())],
         AgentEvent::ReasoningDelta { content } => vec![T::AgentThinking(content.clone())],
-        AgentEvent::ReasoningComplete { content, .. } => {
-            // Emit the final reasoning content so UIs that buffer
-            // deltas can reconcile with the canonical string. Duplicate
-            // display is an accepted minor cost for correctness across
-            // providers that only send a terminal chunk.
-            vec![T::AgentThinking(content.clone())]
-        }
+        AgentEvent::ReasoningComplete {
+            content,
+            duration_ms,
+        } => vec![T::AgentThinkingComplete {
+            content: content.clone(),
+            duration_ms: *duration_ms,
+        }],
         AgentEvent::ThinkingStarted { .. } => vec![T::Swallow {
             reason: "thinking-started is a reducer signal; UI renders on first delta",
         }],
@@ -260,16 +314,34 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
         // ── Plan mode ─────────────────────────────────────────────────
         AgentEvent::PlanStepPending {
             step,
+            step_id,
+            plan_revision,
             tool_name,
             description,
+            depends_on,
+            parent_step_id,
             ..
         } => vec![T::PlanStep {
             step: *step,
+            step_id: step_id.0,
+            plan_revision: *plan_revision,
             tool: tool_name.clone(),
             description: description.clone(),
+            depends_on: depends_on.iter().map(|s| s.0).collect(),
+            parent_step_id: parent_step_id.as_ref().map(|s| s.0),
         }],
-        AgentEvent::PlanAmended { plan_revision, .. } => vec![T::PlanAmended {
+        AgentEvent::PlanAmended {
+            kind,
+            step,
+            ok,
+            reason,
+            plan_revision,
+        } => vec![T::PlanAmended {
             plan_revision: *plan_revision,
+            kind: kind.clone(),
+            step: *step,
+            ok: *ok,
+            reason: reason.clone(),
         }],
         AgentEvent::AwaitingApproval { .. } => vec![T::Swallow {
             reason: "awaiting-approval — reducer owns the plan-panel render path",
@@ -277,15 +349,21 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
 
         // ── Mode / lens ───────────────────────────────────────────────
         AgentEvent::ModeChanged {
-            to_mode, to_lens, ..
+            from_mode,
+            to_mode,
+            from_lens,
+            to_lens,
         } => vec![T::ModeChanged {
+            from_mode: from_mode.clone(),
             to_mode: to_mode.clone(),
+            from_lens: from_lens.clone(),
             to_lens: to_lens.clone(),
         }],
 
         // ── Turn lifecycle ────────────────────────────────────────────
-        AgentEvent::TurnComplete { stop_reason, .. } => vec![T::TurnComplete {
+        AgentEvent::TurnComplete { stop_reason, usage } => vec![T::TurnComplete {
             stop: map_stop_reason(stop_reason),
+            usage: usage.into(),
         }],
         AgentEvent::Error { message } => vec![T::TurnError {
             message: message.clone(),
@@ -369,7 +447,7 @@ fn map_stop_reason(sr: &caduceus_core::StopReason) -> StopReasonKind {
         S::EndTurn => StopReasonKind::EndTurn,
         S::ToolUse => StopReasonKind::ToolUse,
         S::MaxTokens => StopReasonKind::MaxTokens,
-        S::StopSequence => StopReasonKind::EndTurn,
+        S::StopSequence => StopReasonKind::StopSequence,
         S::Error => StopReasonKind::Error,
         S::BudgetExceeded => StopReasonKind::BudgetExceeded,
     }
@@ -402,9 +480,15 @@ mod tests {
         assert_eq!(d, TranslatedThreadEvent::AgentThinking("a".into()));
         let c = one(&AgentEvent::ReasoningComplete {
             content: "done".into(),
-            duration_ms: 1,
+            duration_ms: 1234,
         });
-        assert_eq!(c, TranslatedThreadEvent::AgentThinking("done".into()));
+        assert_eq!(
+            c,
+            TranslatedThreadEvent::AgentThinkingComplete {
+                content: "done".into(),
+                duration_ms: 1234,
+            }
+        );
     }
 
     #[test]
@@ -573,19 +657,39 @@ mod tests {
             plan_revision: 1,
             tool_name: "bash".into(),
             description: "run tests".into(),
-            depends_on: vec![],
-            parent_step_id: None,
+            depends_on: vec![caduceus_core::StepId(41)],
+            parent_step_id: Some(caduceus_core::StepId(40)),
         });
-        assert!(matches!(s, TranslatedThreadEvent::PlanStep { step: 1, .. }));
+        assert_eq!(
+            s,
+            TranslatedThreadEvent::PlanStep {
+                step: 1,
+                step_id: 42,
+                plan_revision: 1,
+                tool: "bash".into(),
+                description: "run tests".into(),
+                depends_on: vec![41],
+                parent_step_id: Some(40),
+            }
+        );
 
         let a = one(&AgentEvent::PlanAmended {
             kind: "replace".into(),
-            step: 1,
-            ok: true,
-            reason: "ok".into(),
+            step: 2,
+            ok: false,
+            reason: "invalid step ref".into(),
             plan_revision: 7,
         });
-        assert_eq!(a, TranslatedThreadEvent::PlanAmended { plan_revision: 7 });
+        assert_eq!(
+            a,
+            TranslatedThreadEvent::PlanAmended {
+                plan_revision: 7,
+                kind: "replace".into(),
+                step: 2,
+                ok: false,
+                reason: "invalid step ref".into(),
+            }
+        );
     }
 
     #[test]
@@ -608,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_changed_translates() {
+    fn mode_changed_preserves_from_and_to() {
         let got = one(&AgentEvent::ModeChanged {
             from_mode: "plan".into(),
             to_mode: "act".into(),
@@ -618,20 +722,29 @@ mod tests {
         assert_eq!(
             got,
             TranslatedThreadEvent::ModeChanged {
+                from_mode: "plan".into(),
                 to_mode: "act".into(),
-                to_lens: Some("fast".into())
+                from_lens: None,
+                to_lens: Some("fast".into()),
             }
         );
     }
 
     #[test]
-    fn turn_complete_maps_stop_reasons() {
-        let usage = TokenUsage::default();
+    fn turn_complete_maps_stop_reasons_and_preserves_usage() {
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 30,
+            cache_write_tokens: 5,
+        };
         let cases = [
             (StopReason::EndTurn, StopReasonKind::EndTurn),
             (StopReason::ToolUse, StopReasonKind::ToolUse),
             (StopReason::MaxTokens, StopReasonKind::MaxTokens),
-            (StopReason::StopSequence, StopReasonKind::EndTurn),
+            // H2: StopSequence now has its own variant (was previously
+            // aliased to EndTurn, losing the provider signal).
+            (StopReason::StopSequence, StopReasonKind::StopSequence),
             (StopReason::Error, StopReasonKind::Error),
             (StopReason::BudgetExceeded, StopReasonKind::BudgetExceeded),
         ];
@@ -640,7 +753,18 @@ mod tests {
                 stop_reason: sr,
                 usage: usage.clone(),
             });
-            assert_eq!(got, TranslatedThreadEvent::TurnComplete { stop: expected });
+            assert_eq!(
+                got,
+                TranslatedThreadEvent::TurnComplete {
+                    stop: expected,
+                    usage: TokenUsageMirror {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        cache_read_tokens: 30,
+                        cache_write_tokens: 5,
+                    }
+                }
+            );
         }
     }
 
