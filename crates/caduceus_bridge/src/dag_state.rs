@@ -552,10 +552,7 @@ impl ReducerHandle {
     /// panic — worst case a DAG projection reflects truncated data for
     /// one tick). Call sites see the same `MutexGuard<SessionStateReducer>`
     /// regardless of poison state.
-    fn lock_inner(
-        &self,
-        site: &'static str,
-    ) -> std::sync::MutexGuard<'_, SessionStateReducer> {
+    fn lock_inner(&self, site: &'static str) -> std::sync::MutexGuard<'_, SessionStateReducer> {
         match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -1115,7 +1112,11 @@ mod tests {
 
         // Writes must also keep working.
         h.ingest_event(&plan_step(1, 101, "read_file", vec![StepId(100).0]));
-        assert_eq!(h.last_event_id(), 2, "writes after poison must advance event id");
+        assert_eq!(
+            h.last_event_id(),
+            2,
+            "writes after poison must advance event id"
+        );
     }
 
     /// Phase-H H5: the reducer's agent-edge and provenance vecs are
@@ -1146,7 +1147,10 @@ mod tests {
         assert_eq!(dag.edges_dropped, overflow as u64);
         // FIFO: the oldest `overflow` edges were dropped, so the first
         // retained edge's `to` is the (overflow+1)-th pushed value.
-        assert_eq!(dag.edges.first().unwrap().to, ExecutionId(overflow as u64 + 2));
+        assert_eq!(
+            dag.edges.first().unwrap().to,
+            ExecutionId(overflow as u64 + 2)
+        );
     }
 
     #[test]

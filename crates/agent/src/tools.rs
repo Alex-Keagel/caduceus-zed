@@ -155,18 +155,6 @@ pub(crate) fn is_sensitive_file(path: &str) -> bool {
     false
 }
 
-/// Redact sensitive content from a snippet before sending to LLM
-pub(crate) fn redact_if_sensitive(path: &str, content: &str) -> String {
-    if is_sensitive_file(path) {
-        format!(
-            "[REDACTED — {} is a sensitive file and was not sent to the model]",
-            path
-        )
-    } else {
-        content.to_string()
-    }
-}
-
 pub use caduceus_api_registry_tool::*;
 pub use caduceus_architect_tool::*;
 pub use caduceus_automations_tool::*;
@@ -351,7 +339,7 @@ tools! {
 
 #[cfg(test)]
 mod sensitive_file_tests {
-    use super::{is_sensitive_file, redact_if_sensitive};
+    use super::is_sensitive_file;
 
     /// Bug C10a covers `is_sensitive_file` being bypassed in tree_sitter
     /// (and several other tools) — every variant below MUST be flagged so
@@ -428,21 +416,5 @@ mod sensitive_file_tests {
         ] {
             assert!(!is_sensitive_file(p), "{p} should NOT be sensitive");
         }
-    }
-
-    /// C8 / C10a sibling: redact_if_sensitive is the user-facing layer
-    /// that routes through is_sensitive_file. Verify the redaction string
-    /// itself doesn't leak the original bytes.
-    #[test]
-    fn redact_replaces_sensitive_content() {
-        let r = redact_if_sensitive(".env", "API_KEY=topsecret123");
-        assert!(!r.contains("topsecret123"));
-        assert!(r.contains("REDACTED"));
-    }
-
-    #[test]
-    fn redact_passes_through_normal_content() {
-        let original = "fn main() {}";
-        assert_eq!(redact_if_sensitive("main.rs", original), original);
     }
 }

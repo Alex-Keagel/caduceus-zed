@@ -1647,19 +1647,14 @@ where
 /// Phase-H H3 — 5s-bounded wait on a forwarder task. Logs (never
 /// panics) on join failure or timeout. `label` is used in the log
 /// message to distinguish `forwarder` from `translated forwarder`.
-async fn await_forwarder_with_timeout(
-    forwarder: tokio::task::JoinHandle<()>,
-    label: &'static str,
-) {
+async fn await_forwarder_with_timeout(forwarder: tokio::task::JoinHandle<()>, label: &'static str) {
     match tokio::time::timeout(std::time::Duration::from_secs(5), forwarder).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             log::warn!("[caduceus_bridge] {label} task join failed: {e}");
         }
         Err(_) => {
-            log::warn!(
-                "[caduceus_bridge] {label} task did not complete within 5s; abandoning"
-            );
+            log::warn!("[caduceus_bridge] {label} task did not complete within 5s; abandoning");
         }
     }
 }
