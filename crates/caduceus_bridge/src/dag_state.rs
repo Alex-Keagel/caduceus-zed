@@ -100,6 +100,13 @@ pub struct AgentsDagV1 {
     /// Useful for rendering "3 critics running..." without scanning events.
     pub active_fanouts: Vec<ActiveFanoutV1>,
     pub revision: u64,
+    /// Phase-H H5 — count of `AgentEdgeV1`s dropped by the reducer's
+    /// FIFO bound (see [`SessionStateReducer::AGENT_EDGE_CAP`]). Stays
+    /// `0` on ordinary sessions; non-zero tells the UI to render a
+    /// "graph truncated" marker. Defaults to `0` over the wire for
+    /// back-compat with pre-H5 clients.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub edges_dropped: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -128,6 +135,11 @@ pub struct SessionSnapshotV1 {
     /// Cross-graph edges: which execution caused which plan mutation.
     pub provenance: Vec<ProvenanceEdgeV1>,
     pub last_event_id: u64,
+    /// Phase-H H5 — count of `ProvenanceEdgeV1`s dropped by the reducer's
+    /// FIFO bound (see [`SessionStateReducer::PROVENANCE_CAP`]). Same
+    /// semantics as [`AgentsDagV1::edges_dropped`].
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub provenance_dropped: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -151,6 +163,13 @@ pub struct ProvenanceEdgeV1 {
     pub target_step_id: Option<StepId>,
 }
 
+/// Phase-H H5 — skip-serializing helper for the `*_dropped` counters so
+/// the common case (no truncation) costs zero wire bytes.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
 // ── The reducer ────────────────────────────────────────────────────────────
 
 /// Per-session live state materializer.
@@ -171,6 +190,9 @@ pub struct SessionStateReducer {
     agent_nodes: HashMap<ExecutionId, AssignmentSummaryV1>,
     agent_node_order: Vec<ExecutionId>,
     agent_edges: Vec<AgentEdgeV1>,
+    /// Phase-H H5 — FIFO count of agent edges dropped once
+    /// `agent_edges.len() == AGENT_EDGE_CAP`.
+    agent_edges_dropped: u64,
     active_fanouts: HashMap<(StepId, ExecutionId), ActiveFanoutV1>,
     agents_revision: u64,
 
@@ -181,11 +203,25 @@ pub struct SessionStateReducer {
     awaiting_approval: Option<AwaitingApprovalV1>,
     pending_scope_expansion: Option<PendingScopeExpansionV1>,
     provenance: Vec<ProvenanceEdgeV1>,
+    /// Phase-H H5 — same semantics as `agent_edges_dropped`.
+    provenance_dropped: u64,
 
     last_event_id: u64,
 }
 
 impl SessionStateReducer {
+    /// Phase-H H5 — hard cap on the number of `AgentEdgeV1`s retained
+    /// in the rolling window. Generous (50k edges ≈ hours of a
+    /// multi-agent session) but bounded so a pathological runaway
+    /// cannot OOM the IDE. When full, the oldest edge is evicted and
+    /// `agent_edges_dropped` bumps by one.
+    pub const AGENT_EDGE_CAP: usize = 50_000;
+
+    /// Phase-H H5 — hard cap on provenance edges. Same semantics as
+    /// [`Self::AGENT_EDGE_CAP`]. Provenance is denser than agent edges
+    /// (every tool call can emit one) so a slightly larger cap.
+    pub const PROVENANCE_CAP: usize = 100_000;
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -291,7 +327,7 @@ impl SessionStateReducer {
                 ..
             } => {
                 self.insert_agent_node(assignment.clone());
-                self.agent_edges.push(AgentEdgeV1 {
+                self.push_agent_edge(AgentEdgeV1 {
                     kind: AgentEdgeKind::Spawn,
                     from: *parent_execution_id,
                     to: assignment.execution_id,
@@ -303,7 +339,7 @@ impl SessionStateReducer {
                 from_execution_id,
                 to_execution_id,
             } => {
-                self.agent_edges.push(AgentEdgeV1 {
+                self.push_agent_edge(AgentEdgeV1 {
                     kind: *edge,
                     from: *from_execution_id,
                     to: *to_execution_id,
@@ -319,7 +355,7 @@ impl SessionStateReducer {
                 execution_id,
                 target_step_id,
             } => {
-                self.provenance.push(ProvenanceEdgeV1 {
+                self.push_provenance(ProvenanceEdgeV1 {
                     kind: *edge,
                     execution_id: *execution_id,
                     target_step_id: *target_step_id,
@@ -361,6 +397,26 @@ impl SessionStateReducer {
         }
         self.agent_nodes.insert(eid, a);
         self.agents_revision += 1;
+    }
+
+    /// Phase-H H5 — bounded push. Drops the oldest edge (FIFO) once the
+    /// cap is hit and bumps `agent_edges_dropped`.
+    fn push_agent_edge(&mut self, edge: AgentEdgeV1) {
+        if self.agent_edges.len() >= Self::AGENT_EDGE_CAP {
+            self.agent_edges.remove(0);
+            self.agent_edges_dropped = self.agent_edges_dropped.saturating_add(1);
+        }
+        self.agent_edges.push(edge);
+    }
+
+    /// Phase-H H5 — bounded push. Same semantics as
+    /// [`Self::push_agent_edge`] but for [`ProvenanceEdgeV1`].
+    fn push_provenance(&mut self, edge: ProvenanceEdgeV1) {
+        if self.provenance.len() >= Self::PROVENANCE_CAP {
+            self.provenance.remove(0);
+            self.provenance_dropped = self.provenance_dropped.saturating_add(1);
+        }
+        self.provenance.push(edge);
     }
 
     // ── Query projections ─────────────────────────────────────────────────
@@ -417,6 +473,7 @@ impl SessionStateReducer {
             last_event_id: self.last_event_id,
             active_fanouts,
             revision: self.agents_revision,
+            edges_dropped: self.agent_edges_dropped,
         }
     }
 
@@ -436,6 +493,7 @@ impl SessionStateReducer {
             pending_scope_expansion: self.pending_scope_expansion.clone(),
             provenance: self.provenance.clone(),
             last_event_id: self.last_event_id,
+            provenance_dropped: self.provenance_dropped,
         }
     }
 }
