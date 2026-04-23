@@ -2613,7 +2613,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "caduceus-core",
- "caduceus-permissions",
  "caduceus-runtime",
  "futures 0.3.32",
  "glob",

@@ -1132,43 +1132,13 @@ pub struct Thread {
     context_pins: caduceus_bridge::orchestrator::ContextManager,
     /// Task DAG for multi-agent decomposition (per-thread, not global)
     task_dag: std::sync::Arc<std::sync::Mutex<caduceus_bridge::orchestrator::TaskDAG>>,
-    /// G1: shared OrchestratorBridge handle, lazily built on first turn.
-    /// When `caduceus_native_loop` setting is ON the bridge's
-    /// `native_loop_enabled` atomic is set; `run_turn_internal` dispatches
-    /// to the native loop via this handle.
-    caduceus_bridge: Option<std::sync::Arc<caduceus_bridge::orchestrator::OrchestratorBridge>>,
-    /// G1: engine harness for the native loop. Lazily built on first native
-    /// turn; invalidated on cancel/model-change so the next turn rebuilds
-    /// with fresh state.
-    caduceus_harness: Option<std::sync::Arc<caduceus_orchestrator::AgentHarness>>,
-    /// G1: per-thread mutable engine state held behind an async mutex so
-    /// the turn task can `lock()` for the full duration of a harness call.
-    /// Panic-safe via mutex poison; invalidated together with the harness.
-    caduceus_native_state:
-        Option<std::sync::Arc<tokio::sync::Mutex<crate::caduceus_native_state::NativeLoopState>>>,
-    /// G1: cancellation token given to the harness at build time. Zed →
-    /// engine cancel flips this; the harness cooperates via its internal
-    /// `select!`.
-    caduceus_cancel_token: Option<caduceus_core::CancellationToken>,
-    /// ST-A2d: long-lived emitter clone from the per-session harness.
-    /// Per-turn code calls `.subscribe()` to get a fresh broadcast
-    /// receiver that delivers events for the current generation only.
-    /// Populated together with `caduceus_harness`; invalidated with it.
-    caduceus_emitter: Option<caduceus_orchestrator::AgentEventEmitter>,
-    /// ST-A3: cached provider dispatcher for this session. Spawned once
-    /// against the currently-selected language model; invalidated on
-    /// model change (via `invalidate_caduceus_harness`) so the next
-    /// turn re-spawns against the new model. Cloning the handle is
-    /// cheap (just an `mpsc::Sender` clone).
-    caduceus_dispatcher: Option<crate::caduceus_provider_adapter::DispatcherHandle>,
-    /// NW-3: engine approval channel for the native loop.
-    /// `Some` when the native harness was built with the default HITL
-    /// approval set; `None` for legacy path (which handles permission
-    /// UI inline in tool adapters). Sender is the engine's
-    /// `approval_tx`; keys are `format!("perm_{tool_use_id}")` and the
-    /// bool is the user's decision (`true` = allow, `false` = deny).
-    /// Invalidated in lock-step with `caduceus_harness`.
-    caduceus_approval_tx: Option<tokio::sync::mpsc::Sender<(String, bool)>>,
+    /// ST-B3: grouped native-loop state. Fields inside this struct were
+    /// previously eight separate `caduceus_*` fields on Thread; they are
+    /// now owned together because they share a single lifecycle (built
+    /// lazily in `ensure_caduceus_harness`, invalidated as a set in
+    /// `invalidate_caduceus_harness`, and referenced in lock-step by
+    /// the native turn path). See `CaduceusState` for per-field docs.
+    caduceus: CaduceusState,
     /// Cached total token estimate (invalidated on message changes).
     /// `Cell` allows population from `&self` callers — the cached value is
     /// observation-only state and never affects logical equality of Thread.
@@ -1184,6 +1154,53 @@ pub struct Thread {
     /// out if the counter has advanced — preventing stale callbacks from
     /// the previous turn from clobbering state in a fresh turn.
     turn_generation: u64,
+}
+
+/// Grouped per-thread native-loop state (ST-B3). These seven fields share
+/// one lifecycle: populated together in [`Thread::ensure_caduceus_harness`]
+/// and cleared as a set in [`Thread::invalidate_caduceus_harness`].
+/// `Default` returns the empty state used in both `Thread::new` call sites.
+#[derive(Default)]
+pub(crate) struct CaduceusState {
+    /// G1: shared OrchestratorBridge handle, lazily built on first turn.
+    /// When `caduceus_native_loop` setting is ON the bridge's
+    /// `native_loop_enabled` atomic is set; `run_turn_internal` dispatches
+    /// to the native loop via this handle.
+    pub(crate) bridge:
+        Option<std::sync::Arc<caduceus_bridge::orchestrator::OrchestratorBridge>>,
+    /// G1: engine harness for the native loop. Lazily built on first native
+    /// turn; invalidated on cancel/model-change so the next turn rebuilds
+    /// with fresh state.
+    pub(crate) harness: Option<std::sync::Arc<caduceus_orchestrator::AgentHarness>>,
+    /// G1: per-thread mutable engine state held behind an async mutex so
+    /// the turn task can `lock()` for the full duration of a harness call.
+    /// Panic-safe via mutex poison; invalidated together with the harness.
+    pub(crate) native_state: Option<
+        std::sync::Arc<tokio::sync::Mutex<crate::caduceus_native_state::NativeLoopState>>,
+    >,
+    /// G1: cancellation token given to the harness at build time. Zed →
+    /// engine cancel flips this; the harness cooperates via its internal
+    /// `select!`.
+    pub(crate) cancel_token: Option<caduceus_core::CancellationToken>,
+    /// ST-A2d: long-lived emitter clone from the per-session harness.
+    /// Per-turn code calls `.subscribe()` to get a fresh broadcast
+    /// receiver that delivers events for the current generation only.
+    /// Populated together with `harness`; invalidated with it.
+    pub(crate) emitter: Option<caduceus_orchestrator::AgentEventEmitter>,
+    /// ST-A3: cached provider dispatcher for this session. Spawned once
+    /// against the currently-selected language model; invalidated on
+    /// model change (via `invalidate_caduceus_harness`) so the next
+    /// turn re-spawns against the new model. Cloning the handle is
+    /// cheap (just an `mpsc::Sender` clone).
+    pub(crate) dispatcher: Option<crate::caduceus_provider_adapter::DispatcherHandle>,
+    /// NW-3: engine approval channel for the native loop.
+    /// `Some` when the native harness was built with the default HITL
+    /// approval set; `None` for legacy path (which handles permission
+    /// UI inline in tool adapters). Sender is the engine's
+    /// `approval_tx`; keys are `format!("perm_{tool_use_id}")` and the
+    /// bool is the user's decision (`true` = allow, `false` = deny).
+    /// Invalidated in lock-step with `harness`.
+    pub(crate) approval_tx: Option<tokio::sync::mpsc::Sender<(String, bool)>>,
 }
 
 impl Thread {
@@ -1318,13 +1335,7 @@ impl Thread {
             task_dag: std::sync::Arc::new(std::sync::Mutex::new(
                 caduceus_bridge::orchestrator::TaskDAG::new(),
             )),
-            caduceus_bridge: None,
-            caduceus_harness: None,
-            caduceus_native_state: None,
-            caduceus_cancel_token: None,
-            caduceus_emitter: None,
-            caduceus_dispatcher: None,
-            caduceus_approval_tx: None,
+            caduceus: CaduceusState::default(),
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
@@ -1576,13 +1587,7 @@ impl Thread {
             task_dag: std::sync::Arc::new(std::sync::Mutex::new(
                 caduceus_bridge::orchestrator::TaskDAG::new(),
             )),
-            caduceus_bridge: None,
-            caduceus_harness: None,
-            caduceus_native_state: None,
-            caduceus_cancel_token: None,
-            caduceus_emitter: None,
-            caduceus_dispatcher: None,
-            caduceus_approval_tx: None,
+            caduceus: CaduceusState::default(),
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
@@ -1738,9 +1743,9 @@ impl Thread {
     /// read `AgentSettings::get_global(cx).caduceus_native_loop`
     /// instead.
     pub fn caduceus_native_loop_ready(&self) -> bool {
-        self.caduceus_harness.is_some()
-            && self.caduceus_native_state.is_some()
-            && self.caduceus_bridge.is_some()
+        self.caduceus.harness.is_some()
+            && self.caduceus.native_state.is_some()
+            && self.caduceus.bridge.is_some()
     }
 
     /// Drops the harness, state, cancel token, emitter, and bridge
@@ -1748,12 +1753,12 @@ impl Thread {
     /// Cheap: dropping an Arc is O(1); the async mutex's inner drop is
     /// Send. Safe to call from `&mut self` contexts; never blocks.
     pub fn invalidate_caduceus_harness(&mut self) {
-        self.caduceus_harness = None;
-        self.caduceus_native_state = None;
-        self.caduceus_cancel_token = None;
-        self.caduceus_emitter = None;
-        self.caduceus_dispatcher = None;
-        self.caduceus_approval_tx = None;
+        self.caduceus.harness = None;
+        self.caduceus.native_state = None;
+        self.caduceus.cancel_token = None;
+        self.caduceus.emitter = None;
+        self.caduceus.dispatcher = None;
+        self.caduceus.approval_tx = None;
         // Intentionally keep `caduceus_bridge` — the bridge itself
         // (ContextManager config, native_loop flag) outlives the
         // harness. If the flag was the reason for invalidation the
@@ -1813,9 +1818,9 @@ impl Thread {
         // + emitter population, which is the correct invariant for
         // `run_turn_internal` dispatch (legacy path remains until
         // harness is fully built).
-        self.caduceus_bridge = Some(bridge);
-        self.caduceus_cancel_token = Some(cancel_token);
-        self.caduceus_native_state = Some(state);
+        self.caduceus.bridge = Some(bridge);
+        self.caduceus.cancel_token = Some(cancel_token);
+        self.caduceus.native_state = Some(state);
         Ok(true)
     }
 
@@ -3130,9 +3135,9 @@ impl Thread {
                 log::warn!("[native-loop] ensure_caduceus_harness failed: {err}");
                 return None;
             }
-            let bridge = this.caduceus_bridge.clone()?;
-            let native_state = this.caduceus_native_state.clone()?;
-            let cancel_token = this.caduceus_cancel_token.clone()?;
+            let bridge = this.caduceus.bridge.clone()?;
+            let native_state = this.caduceus.native_state.clone()?;
+            let cancel_token = this.caduceus.cancel_token.clone()?;
             let model = this.model.clone()?;
             let user_input = this
                 .messages
@@ -3166,10 +3171,10 @@ impl Thread {
                 user_input,
                 native_state,
                 cancel_token,
-                harness: this.caduceus_harness.clone(),
-                emitter: this.caduceus_emitter.clone(),
-                dispatcher: this.caduceus_dispatcher.clone(),
-                approval_tx: this.caduceus_approval_tx.clone(),
+                harness: this.caduceus.harness.clone(),
+                emitter: this.caduceus.emitter.clone(),
+                dispatcher: this.caduceus.dispatcher.clone(),
+                approval_tx: this.caduceus.approval_tx.clone(),
                 enabled_tools,
                 system_prompt,
                 caduceus_mode,
@@ -3335,10 +3340,10 @@ impl Thread {
                 .expect("with_emitter() on HarnessBuilder guarantees Some");
 
             this.update(cx, |this, _| {
-                this.caduceus_harness = Some(harness_arc.clone());
-                this.caduceus_emitter = Some(emitter.clone());
-                this.caduceus_dispatcher = Some(disp_handle.clone());
-                this.caduceus_approval_tx = Some(approval_tx.clone());
+                this.caduceus.harness = Some(harness_arc.clone());
+                this.caduceus.emitter = Some(emitter.clone());
+                this.caduceus.dispatcher = Some(disp_handle.clone());
+                this.caduceus.approval_tx = Some(approval_tx.clone());
             })?;
 
             setup.harness = Some(harness_arc);
@@ -6849,10 +6854,10 @@ mod caduceus_native_loop_tests {
                 "ensure_caduceus_harness must be a no-op when caduceus_native_loop=false"
             );
             let t = thread.read(cx);
-            assert!(t.caduceus_bridge.is_none(), "bridge must stay None");
-            assert!(t.caduceus_native_state.is_none(), "native_state must stay None");
-            assert!(t.caduceus_cancel_token.is_none(), "cancel_token must stay None");
-            assert!(t.caduceus_harness.is_none(), "harness must stay None");
+            assert!(t.caduceus.bridge.is_none(), "bridge must stay None");
+            assert!(t.caduceus.native_state.is_none(), "native_state must stay None");
+            assert!(t.caduceus.cancel_token.is_none(), "cancel_token must stay None");
+            assert!(t.caduceus.harness.is_none(), "harness must stay None");
         });
     }
 
@@ -6871,19 +6876,19 @@ mod caduceus_native_loop_tests {
                  caduceus_native_loop=true and a worktree exists"
             );
             let t = thread.read(cx);
-            assert!(t.caduceus_bridge.is_some(), "bridge must be Some");
+            assert!(t.caduceus.bridge.is_some(), "bridge must be Some");
             assert!(
-                t.caduceus_native_state.is_some(),
+                t.caduceus.native_state.is_some(),
                 "native_state must be Some"
             );
             assert!(
-                t.caduceus_cancel_token.is_some(),
+                t.caduceus.cancel_token.is_some(),
                 "cancel_token must be Some"
             );
             // Harness itself is built lazily inside try_run_turn_native
             // (ST-A2 phase 2) — NOT by ensure_caduceus_harness.
             assert!(
-                t.caduceus_harness.is_none(),
+                t.caduceus.harness.is_none(),
                 "harness must still be None (built on first native turn)"
             );
             assert!(
@@ -6953,7 +6958,7 @@ mod caduceus_native_loop_tests {
             );
             let t = thread.read(cx);
             assert!(
-                t.caduceus_bridge.is_none(),
+                t.caduceus.bridge.is_none(),
                 "bridge must stay None after error (legacy path fallback contract)"
             );
         });
