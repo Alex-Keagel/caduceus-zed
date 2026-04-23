@@ -3419,99 +3419,41 @@ impl Thread {
             let mut input_buffers: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             while let Some(ev) = trans_rx.recv().await {
-                match &ev {
-                    T::PermissionRequest {
-                        id,
-                        tool,
-                        description,
-                        raw_input,
-                    } => {
-                        if let Some(ref approval_tx) = approval_tx_for_consumer {
-                            route_native_permission_request(
-                                id,
-                                tool,
-                                description,
-                                raw_input.as_ref(),
-                                &stream_for_consumer,
-                                approval_tx.clone(),
-                                cx_cons,
-                            );
-                            continue;
-                        }
-                    }
-                    T::ToolCallStart { id, name } => {
-                        let tool_name: SharedString = name.clone().into();
-                        tool_names.insert(id.clone(), tool_name.clone());
-                        // Resolve `kind` at start from the enabled-tools
-                        // registry. `initial_title` needs parsed JSON
-                        // input, which we don't have yet — fall back to
-                        // the tool name until InputEnd assembles it.
-                        let kind = enabled_tools_for_consumer
-                            .get(&tool_name)
-                            .map(|t| t.kind())
-                            .unwrap_or(acp::ToolKind::Other);
-                        stream_for_consumer
-                            .0
-                            .unbounded_send(Ok(ThreadEvent::ToolCall(
-                                acp::ToolCall::new(id.to_string(), name.to_string())
-                                    .kind(kind)
-                                    .status(acp::ToolCallStatus::Pending)
-                                    .meta(acp_thread::meta_with_tool_name(name)),
-                            )))
-                            .ok();
+                // Permission requests route through their own helper
+                // (NW-3 / A2). Everything else funnels through the
+                // stateful tool-lifecycle helper, then falls through to
+                // the stateless dispatcher for anything it didn't
+                // handle end-to-end.
+                if let T::PermissionRequest {
+                    id,
+                    tool,
+                    description,
+                    raw_input,
+                } = &ev
+                {
+                    if let Some(ref approval_tx) = approval_tx_for_consumer {
+                        route_native_permission_request(
+                            id,
+                            tool,
+                            description,
+                            raw_input.as_ref(),
+                            &stream_for_consumer,
+                            approval_tx.clone(),
+                            cx_cons,
+                        );
                         continue;
                     }
-                    T::ToolCallInputDelta { id, delta } => {
-                        input_buffers.entry(id.clone()).or_default().push_str(delta);
-                        continue;
-                    }
-                    T::ToolCallInputEnd { id } => {
-                        let buffered = input_buffers.remove(id).unwrap_or_default();
-                        let parsed: Option<serde_json::Value> =
-                            serde_json::from_str(&buffered).ok();
-                        let tool_name = tool_names.get(id).cloned();
-                        // If we have both a parsed input and a resolved
-                        // tool, ask the tool for its rich initial_title
-                        // and emit it alongside the InProgress status +
-                        // raw_input. Otherwise fall back to the status
-                        // flip only.
-                        let rich_title: Option<SharedString> = match (&parsed, tool_name.as_ref()) {
-                            (Some(input), Some(name)) => {
-                                let input = input.clone();
-                                let name = name.clone();
-                                let tools = enabled_tools_for_consumer.clone();
-                                cx_cons.update(|cx| {
-                                    tools.get(&name).map(|t| t.initial_title(input, cx))
-                                })
-                            }
-                            _ => None,
-                        };
-                        let mut fields = acp::ToolCallUpdateFields::new()
-                            .status(acp::ToolCallStatus::InProgress);
-                        if let Some(t) = rich_title {
-                            let title_str: String = t.to_string();
-                            fields = fields.title(title_str);
-                        }
-                        if let Some(raw) = parsed {
-                            fields = fields.raw_input(raw);
-                        }
-                        stream_for_consumer
-                            .0
-                            .unbounded_send(Ok(ThreadEvent::ToolCallUpdate(
-                                acp::ToolCallUpdate::new(id.to_string(), fields).into(),
-                            )))
-                            .ok();
-                        continue;
-                    }
-                    T::ToolResult { id, .. } => {
-                        // Fall through to the stateless dispatcher — it
-                        // already handles status + content + raw_output.
-                        // Clean up per-id state first so the maps don't
-                        // grow unbounded across a long turn.
-                        tool_names.remove(id);
-                        input_buffers.remove(id);
-                    }
-                    _ => {}
+                }
+                let handled_fully = handle_native_tool_lifecycle(
+                    &ev,
+                    &mut tool_names,
+                    &mut input_buffers,
+                    &enabled_tools_for_consumer,
+                    &stream_for_consumer,
+                    cx_cons,
+                );
+                if handled_fully {
+                    continue;
                 }
                 dispatch_translated_event(&ev, &stream_for_consumer);
             }
@@ -5777,6 +5719,97 @@ fn extract_match_inputs(raw: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// Phase-6 consumer helper — stateful tool-lifecycle handling for the
+/// native-loop translated event stream. Extracted from the consumer
+/// closure so it can be unit-tested against a scripted
+/// `ToolCallStart → InputDelta×N → InputEnd → ToolResult` sequence
+/// without standing up the full `run_caduceus_loop_translated` pipeline.
+///
+/// Returns `true` when the event was fully emitted as UI events here
+/// (caller must NOT fall through to `dispatch_translated_event`), and
+/// `false` when the caller should fall through (e.g. `ToolResult`,
+/// which we only use to clean up local state — the stateless
+/// dispatcher owns the actual status/content/raw_output emission).
+///
+/// The stateful-consumer's exclusive responsibility is:
+/// 1. Resolving `kind` and `initial_title` from the enabled-tools
+///    registry (`AnyAgentTool`) at the right lifecycle phases.
+/// 2. Aggregating streaming `ToolCallInputDelta` frames into a single
+///    parsed `raw_input` value.
+/// 3. Emitting exactly one `ToolCall` at start and exactly one
+///    `ToolCallUpdate` at input-end (no emit during delta frames).
+fn handle_native_tool_lifecycle(
+    ev: &caduceus_bridge::event_translator::TranslatedThreadEvent,
+    tool_names: &mut std::collections::HashMap<String, SharedString>,
+    input_buffers: &mut std::collections::HashMap<String, String>,
+    enabled_tools: &std::collections::BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>>,
+    stream: &ThreadEventStream,
+    cx: &mut AsyncApp,
+) -> bool {
+    use caduceus_bridge::event_translator::TranslatedThreadEvent as T;
+    match ev {
+        T::ToolCallStart { id, name } => {
+            let tool_name: SharedString = name.clone().into();
+            tool_names.insert(id.clone(), tool_name.clone());
+            let kind = enabled_tools
+                .get(&tool_name)
+                .map(|t| t.kind())
+                .unwrap_or(acp::ToolKind::Other);
+            stream
+                .0
+                .unbounded_send(Ok(ThreadEvent::ToolCall(
+                    acp::ToolCall::new(id.to_string(), name.to_string())
+                        .kind(kind)
+                        .status(acp::ToolCallStatus::Pending)
+                        .meta(acp_thread::meta_with_tool_name(name)),
+                )))
+                .ok();
+            true
+        }
+        T::ToolCallInputDelta { id, delta } => {
+            input_buffers.entry(id.clone()).or_default().push_str(delta);
+            true
+        }
+        T::ToolCallInputEnd { id } => {
+            let buffered = input_buffers.remove(id).unwrap_or_default();
+            let parsed: Option<serde_json::Value> = serde_json::from_str(&buffered).ok();
+            let tool_name = tool_names.get(id).cloned();
+            let rich_title: Option<SharedString> = match (&parsed, tool_name.as_ref()) {
+                (Some(input), Some(name)) => {
+                    let input = input.clone();
+                    let name = name.clone();
+                    cx.update(|cx| enabled_tools.get(&name).map(|t| t.initial_title(input, cx)))
+                }
+                _ => None,
+            };
+            let mut fields =
+                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress);
+            if let Some(t) = rich_title {
+                fields = fields.title(t.to_string());
+            }
+            if let Some(raw) = parsed {
+                fields = fields.raw_input(raw);
+            }
+            stream
+                .0
+                .unbounded_send(Ok(ThreadEvent::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(id.to_string(), fields).into(),
+                )))
+                .ok();
+            true
+        }
+        T::ToolResult { id, .. } => {
+            // Clean up per-id state so the maps don't grow unbounded,
+            // then fall through to the stateless dispatcher which
+            // already emits status + content + raw_output.
+            tool_names.remove(id);
+            input_buffers.remove(id);
+            false
+        }
+        _ => false,
+    }
+}
+
 // ── G1d — translator → ThreadEvent dispatch ─────────────────────────
 //
 // `dispatch_translated_event` is the single mapping boundary between
@@ -7728,5 +7761,281 @@ mod route_native_permission_tests {
                 .any(|e| matches!(e, ThreadEvent::ToolCallAuthorization { .. })),
             "expected ToolCallAuthorization on fall-through, got {events:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod native_tool_lifecycle_tests {
+    //! C2 — tool-lifecycle consumer state-machine tests.
+    //!
+    //! Exercises [`handle_native_tool_lifecycle`] directly with a
+    //! scripted `ToolCallStart → ToolCallInputDelta×N → ToolCallInputEnd
+    //! → ToolResult` sequence and asserts:
+    //!   * Exactly one `ToolCall` emitted at Start.
+    //!   * No stream emission during `ToolCallInputDelta` (bytes
+    //!     aggregate silently into `input_buffers`).
+    //!   * Exactly one `ToolCallUpdate` emitted at InputEnd, carrying
+    //!     status=InProgress and raw_input populated from the
+    //!     aggregated JSON.
+    //!   * `ToolResult` returns `false` (fall through to dispatcher)
+    //!     and cleans up per-id state so maps do not grow unbounded.
+    //!   * Unknown variants (AgentText etc.) return `false` unchanged.
+
+    use super::*;
+    use caduceus_bridge::event_translator::TranslatedThreadEvent as T;
+    use futures::StreamExt;
+    use futures::channel::mpsc as fmpsc;
+    use gpui::TestAppContext;
+    use std::collections::{BTreeMap, HashMap};
+
+    fn make_stream() -> (ThreadEventStream, fmpsc::UnboundedReceiver<Result<ThreadEvent>>) {
+        let (tx, rx) = fmpsc::unbounded::<Result<ThreadEvent>>();
+        (ThreadEventStream(tx), rx)
+    }
+
+    fn drain(rx: &mut fmpsc::UnboundedReceiver<Result<ThreadEvent>>) -> Vec<ThreadEvent> {
+        let mut out = Vec::new();
+        while let Ok(Some(item)) = rx.try_next() {
+            out.push(item.expect("stream only carries Ok"));
+        }
+        out
+    }
+
+    #[gpui::test]
+    async fn full_lifecycle_emits_one_start_and_one_end_update(cx: &mut TestAppContext) {
+        let (stream, mut rx) = make_stream();
+        let mut tool_names: HashMap<String, SharedString> = HashMap::new();
+        let mut input_buffers: HashMap<String, String> = HashMap::new();
+        let enabled_tools: BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>> =
+            BTreeMap::new();
+
+        cx.spawn(async move |mut cx_cons| {
+            // 1. Start
+            let handled = handle_native_tool_lifecycle(
+                &T::ToolCallStart {
+                    id: "t1".into(),
+                    name: "terminal".into(),
+                },
+                &mut tool_names,
+                &mut input_buffers,
+                &enabled_tools,
+                &stream,
+                &mut cx_cons,
+            );
+            assert!(handled, "ToolCallStart must be fully handled");
+
+            // 2. Deltas — 3 frames, no emit
+            for frag in ["{\"comm", "and\":\"ls ", "-la\"}"] {
+                let handled = handle_native_tool_lifecycle(
+                    &T::ToolCallInputDelta {
+                        id: "t1".into(),
+                        delta: frag.into(),
+                    },
+                    &mut tool_names,
+                    &mut input_buffers,
+                    &enabled_tools,
+                    &stream,
+                    &mut cx_cons,
+                );
+                assert!(handled, "ToolCallInputDelta must be fully handled");
+            }
+
+            // 3. InputEnd — one update
+            let handled = handle_native_tool_lifecycle(
+                &T::ToolCallInputEnd { id: "t1".into() },
+                &mut tool_names,
+                &mut input_buffers,
+                &enabled_tools,
+                &stream,
+                &mut cx_cons,
+            );
+            assert!(handled, "ToolCallInputEnd must be fully handled");
+
+            // 4. ToolResult — falls through, cleans up maps
+            let handled = handle_native_tool_lifecycle(
+                &T::ToolResult {
+                    id: "t1".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                },
+                &mut tool_names,
+                &mut input_buffers,
+                &enabled_tools,
+                &stream,
+                &mut cx_cons,
+            );
+            assert!(
+                !handled,
+                "ToolResult must return false so dispatcher emits the final update"
+            );
+            assert!(
+                !tool_names.contains_key("t1"),
+                "tool_names must be cleaned up on ToolResult"
+            );
+            assert!(
+                !input_buffers.contains_key("t1"),
+                "input_buffers must be cleaned up on ToolResult"
+            );
+        })
+        .detach();
+
+        cx.run_until_parked();
+
+        let events = drain(&mut rx);
+
+        // Exactly 2 events from the consumer (Start + InputEnd-update);
+        // ToolResult falls through and would produce its own event via
+        // dispatch_translated_event, which we do NOT invoke here.
+        assert_eq!(
+            events.len(),
+            2,
+            "expected exactly 2 stream events (ToolCall + ToolCallUpdate), got {}: {:?}",
+            events.len(),
+            events
+        );
+
+        // Event 1: ToolCall with name=terminal, kind=Other (empty
+        // registry), status=Pending.
+        match &events[0] {
+            ThreadEvent::ToolCall(call) => {
+                assert_eq!(call.title, "terminal", "title defaults to tool name");
+                assert_eq!(call.kind, acp::ToolKind::Other);
+                assert_eq!(call.status, acp::ToolCallStatus::Pending);
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+
+        // Event 2: ToolCallUpdate status=InProgress with raw_input
+        // parsed from the aggregated delta frames.
+        match &events[1] {
+            ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(update)) => {
+                let fields = &update.fields;
+                assert_eq!(fields.status, Some(acp::ToolCallStatus::InProgress));
+                let raw = fields
+                    .raw_input
+                    .as_ref()
+                    .expect("raw_input must be set at InputEnd");
+                assert_eq!(
+                    raw,
+                    &serde_json::json!({ "command": "ls -la" }),
+                    "raw_input must reflect the aggregated delta payload"
+                );
+            }
+            other => panic!("expected ToolCallUpdate::UpdateFields, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    async fn input_delta_alone_never_emits(cx: &mut TestAppContext) {
+        let (stream, mut rx) = make_stream();
+        let mut tool_names: HashMap<String, SharedString> = HashMap::new();
+        let mut input_buffers: HashMap<String, String> = HashMap::new();
+        let enabled_tools: BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>> =
+            BTreeMap::new();
+
+        cx.spawn(async move |mut cx_cons| {
+            let _ = handle_native_tool_lifecycle(
+                &T::ToolCallInputDelta {
+                    id: "t9".into(),
+                    delta: "anything".into(),
+                },
+                &mut tool_names,
+                &mut input_buffers,
+                &enabled_tools,
+                &stream,
+                &mut cx_cons,
+            );
+            // Buffer was populated.
+            assert_eq!(
+                input_buffers.get("t9").map(String::as_str),
+                Some("anything")
+            );
+        })
+        .detach();
+
+        cx.run_until_parked();
+
+        let events = drain(&mut rx);
+        assert!(
+            events.is_empty(),
+            "ToolCallInputDelta must NOT emit any stream events, got {events:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn unhandled_variants_return_false(cx: &mut TestAppContext) {
+        let (stream, mut rx) = make_stream();
+        let mut tool_names: HashMap<String, SharedString> = HashMap::new();
+        let mut input_buffers: HashMap<String, String> = HashMap::new();
+        let enabled_tools: BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>> =
+            BTreeMap::new();
+
+        cx.spawn(async move |mut cx_cons| {
+            let handled = handle_native_tool_lifecycle(
+                &T::AgentText("hello".into()),
+                &mut tool_names,
+                &mut input_buffers,
+                &enabled_tools,
+                &stream,
+                &mut cx_cons,
+            );
+            assert!(
+                !handled,
+                "non-tool-lifecycle events must fall through to dispatcher"
+            );
+        })
+        .detach();
+
+        cx.run_until_parked();
+
+        let events = drain(&mut rx);
+        assert!(
+            events.is_empty(),
+            "handler must not emit anything for unhandled variants"
+        );
+    }
+
+    #[gpui::test]
+    async fn input_end_without_start_still_emits_update(cx: &mut TestAppContext) {
+        // Defensive: InputEnd arriving without a prior Start (e.g.
+        // engine resumed mid-stream) must still emit an InProgress
+        // update without panicking, even though raw_input will be
+        // absent (empty buffer → parse fails → None).
+        let (stream, mut rx) = make_stream();
+        let mut tool_names: HashMap<String, SharedString> = HashMap::new();
+        let mut input_buffers: HashMap<String, String> = HashMap::new();
+        let enabled_tools: BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>> =
+            BTreeMap::new();
+
+        cx.spawn(async move |mut cx_cons| {
+            let handled = handle_native_tool_lifecycle(
+                &T::ToolCallInputEnd { id: "t42".into() },
+                &mut tool_names,
+                &mut input_buffers,
+                &enabled_tools,
+                &stream,
+                &mut cx_cons,
+            );
+            assert!(handled);
+        })
+        .detach();
+
+        cx.run_until_parked();
+
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(update)) => {
+                assert_eq!(
+                    update.fields.status,
+                    Some(acp::ToolCallStatus::InProgress)
+                );
+                assert!(
+                    update.fields.raw_input.is_none(),
+                    "raw_input must be None when the buffer was empty / unparseable"
+                );
+            }
+            other => panic!("expected ToolCallUpdate::UpdateFields, got {other:?}"),
+        }
     }
 }
