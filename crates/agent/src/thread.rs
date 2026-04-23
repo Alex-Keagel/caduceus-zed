@@ -1155,6 +1155,12 @@ pub struct Thread {
     /// receiver that delivers events for the current generation only.
     /// Populated together with `caduceus_harness`; invalidated with it.
     caduceus_emitter: Option<caduceus_orchestrator::AgentEventEmitter>,
+    /// ST-A3: cached provider dispatcher for this session. Spawned once
+    /// against the currently-selected language model; invalidated on
+    /// model change (via `invalidate_caduceus_harness`) so the next
+    /// turn re-spawns against the new model. Cloning the handle is
+    /// cheap (just an `mpsc::Sender` clone).
+    caduceus_dispatcher: Option<crate::caduceus_provider_adapter::DispatcherHandle>,
     /// Cached total token estimate (invalidated on message changes).
     /// `Cell` allows population from `&self` callers — the cached value is
     /// observation-only state and never affects logical equality of Thread.
@@ -1309,6 +1315,7 @@ impl Thread {
             caduceus_native_state: None,
             caduceus_cancel_token: None,
             caduceus_emitter: None,
+            caduceus_dispatcher: None,
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
@@ -1565,6 +1572,7 @@ impl Thread {
             caduceus_native_state: None,
             caduceus_cancel_token: None,
             caduceus_emitter: None,
+            caduceus_dispatcher: None,
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
@@ -1734,6 +1742,7 @@ impl Thread {
         self.caduceus_native_state = None;
         self.caduceus_cancel_token = None;
         self.caduceus_emitter = None;
+        self.caduceus_dispatcher = None;
         // Intentionally keep `caduceus_bridge` — the bridge itself
         // (ContextManager config, native_loop flag) outlives the
         // harness. If the flag was the reason for invalidation the
