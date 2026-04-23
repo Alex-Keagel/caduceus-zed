@@ -2652,6 +2652,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "smallvec",
  "tempfile",
  "tiktoken-rs",
  "tokio",

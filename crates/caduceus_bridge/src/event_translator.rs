@@ -17,6 +17,12 @@
 //! across calls.
 
 use caduceus_core::AgentEvent;
+use smallvec::{SmallVec, smallvec};
+
+/// Return type for [`translate`]. Most engine events map to exactly one
+/// translated event; sizing the inline buffer to 1 avoids a heap
+/// allocation on the fast path (ST-C1 — audit C9 hot-path allocations).
+pub type TranslatedEvents = SmallVec<[TranslatedThreadEvent; 1]>;
 
 /// Bridge-owned mirror of the ThreadEvent shapes the translator can
 /// produce. Thread-side code maps each variant to its concrete
@@ -183,41 +189,41 @@ impl From<&caduceus_core::TokenUsage> for TokenUsageMirror {
 /// engine events need to fan out into multiple UI events — notably
 /// `ContextGroupsEvicted` which may carry enough data to render
 /// both a toast AND a status-bar change.
-pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
+pub fn translate(ev: &AgentEvent) -> TranslatedEvents {
     use TranslatedThreadEvent as T;
     match ev {
         // ── Streaming text ─────────────────────────────────────────────
-        AgentEvent::TextDelta { text } => vec![T::AgentText(text.clone())],
-        AgentEvent::ReasoningDelta { content } => vec![T::AgentThinking(content.clone())],
+        AgentEvent::TextDelta { text } => smallvec![T::AgentText(text.clone())],
+        AgentEvent::ReasoningDelta { content } => smallvec![T::AgentThinking(content.clone())],
         AgentEvent::ReasoningComplete {
             content,
             duration_ms,
-        } => vec![T::AgentThinkingComplete {
+        } => smallvec![T::AgentThinkingComplete {
             content: content.clone(),
             duration_ms: *duration_ms,
         }],
-        AgentEvent::ThinkingStarted { .. } => vec![T::Swallow {
+        AgentEvent::ThinkingStarted { .. } => smallvec![T::Swallow {
             reason: "thinking-started is a reducer signal; UI renders on first delta",
         }],
 
         // ── Tool lifecycle ────────────────────────────────────────────
-        AgentEvent::ToolCallStart { id, name } => vec![T::ToolCallStart {
+        AgentEvent::ToolCallStart { id, name } => smallvec![T::ToolCallStart {
             id: id.0.clone(),
             name: name.clone(),
         }],
-        AgentEvent::ToolCallInput { id, delta } => vec![T::ToolCallInputDelta {
+        AgentEvent::ToolCallInput { id, delta } => smallvec![T::ToolCallInputDelta {
             id: id.0.clone(),
             delta: delta.clone(),
         }],
-        AgentEvent::ToolCallEnd { id } => vec![T::ToolCallInputEnd { id: id.0.clone() }],
-        AgentEvent::ToolResultStart { .. } => vec![T::Swallow {
+        AgentEvent::ToolCallEnd { id } => smallvec![T::ToolCallInputEnd { id: id.0.clone() }],
+        AgentEvent::ToolResultStart { .. } => smallvec![T::Swallow {
             reason: "tool-result-start — wait for ToolResultEnd to emit a UI update",
         }],
         AgentEvent::ToolResultEnd {
             id,
             content,
             is_error,
-        } => vec![T::ToolResult {
+        } => smallvec![T::ToolResult {
             id: id.0.clone(),
             content: content.clone(),
             is_error: *is_error,
@@ -228,13 +234,13 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
             id,
             capability,
             description,
-        } => vec![T::PermissionRequest {
+        } => smallvec![T::PermissionRequest {
             id: id.clone(),
             tool: capability.clone(),
             description: description.clone(),
         }],
         AgentEvent::PermissionDecision { .. } | AgentEvent::ApprovalDecided { .. } => {
-            vec![T::Swallow {
+            smallvec![T::Swallow {
                 reason: "permission resolution — UI already updated on user action",
             }]
         }
@@ -243,7 +249,7 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
             resource,
             reason,
             tool,
-        } => vec![T::ScopeExpansion {
+        } => smallvec![T::ScopeExpansion {
             capability: capability.clone(),
             resource: resource.clone(),
             tool: tool.clone(),
@@ -254,14 +260,14 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
         AgentEvent::LoopDetected {
             tool_name,
             consecutive_count,
-        } => vec![T::Retry {
+        } => smallvec![T::Retry {
             kind: RetryKind::Loop,
             message: format!("Loop detected on '{tool_name}' ({consecutive_count} consecutive)"),
         }],
         AgentEvent::CircuitBreakerTriggered {
             consecutive_failures,
             last_tools,
-        } => vec![T::Retry {
+        } => smallvec![T::Retry {
             kind: RetryKind::CircuitBreaker,
             message: format!(
                 "Circuit breaker: {consecutive_failures} failures; last tools {last_tools:?}"
@@ -271,13 +277,13 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
             tool,
             timeout_secs,
             elapsed_ms,
-        } => vec![T::Retry {
+        } => smallvec![T::Retry {
             kind: RetryKind::ToolTimeout,
             message: format!(
                 "Tool '{tool}' timed out after {elapsed_ms}ms (budget {timeout_secs}s)"
             ),
         }],
-        AgentEvent::ToolCancelled { tool, elapsed_ms } => vec![T::Retry {
+        AgentEvent::ToolCancelled { tool, elapsed_ms } => smallvec![T::Retry {
             kind: RetryKind::ToolCancelled,
             message: format!("Tool '{tool}' cancelled after {elapsed_ms}ms"),
         }],
@@ -287,7 +293,7 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
             level,
             used_tokens,
             max_tokens,
-        } => vec![T::ContextWarning {
+        } => smallvec![T::ContextWarning {
             level: level.clone(),
             used: *used_tokens,
             max: *max_tokens,
@@ -296,7 +302,7 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
             freed_tokens,
             before,
             after,
-        } => vec![T::ContextCompacted {
+        } => smallvec![T::ContextCompacted {
             freed: *freed_tokens,
             before: *before,
             after: *after,
@@ -305,7 +311,7 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
             strategy,
             groups,
             total_tokens,
-        } => vec![T::ContextEvicted {
+        } => smallvec![T::ContextEvicted {
             strategy: strategy.clone(),
             groups: groups.len() as u32,
             total_tokens: *total_tokens,
@@ -321,7 +327,7 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
             depends_on,
             parent_step_id,
             ..
-        } => vec![T::PlanStep {
+        } => smallvec![T::PlanStep {
             step: *step,
             step_id: step_id.0,
             plan_revision: *plan_revision,
@@ -336,14 +342,14 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
             ok,
             reason,
             plan_revision,
-        } => vec![T::PlanAmended {
+        } => smallvec![T::PlanAmended {
             plan_revision: *plan_revision,
             kind: kind.clone(),
             step: *step,
             ok: *ok,
             reason: reason.clone(),
         }],
-        AgentEvent::AwaitingApproval { .. } => vec![T::Swallow {
+        AgentEvent::AwaitingApproval { .. } => smallvec![T::Swallow {
             reason: "awaiting-approval — reducer owns the plan-panel render path",
         }],
 
@@ -353,7 +359,7 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
             to_mode,
             from_lens,
             to_lens,
-        } => vec![T::ModeChanged {
+        } => smallvec![T::ModeChanged {
             from_mode: from_mode.clone(),
             to_mode: to_mode.clone(),
             from_lens: from_lens.clone(),
@@ -361,81 +367,81 @@ pub fn translate(ev: &AgentEvent) -> Vec<TranslatedThreadEvent> {
         }],
 
         // ── Turn lifecycle ────────────────────────────────────────────
-        AgentEvent::TurnComplete { stop_reason, usage } => vec![T::TurnComplete {
+        AgentEvent::TurnComplete { stop_reason, usage } => smallvec![T::TurnComplete {
             stop: map_stop_reason(stop_reason),
             usage: usage.into(),
         }],
-        AgentEvent::Error { message } => vec![T::TurnError {
+        AgentEvent::Error { message } => smallvec![T::TurnError {
             message: message.clone(),
         }],
 
         // ── Reducer-only events (no UI surface today) ─────────────────
-        AgentEvent::Introspection(_) => vec![T::Swallow {
+        AgentEvent::Introspection(_) => smallvec![T::Swallow {
             reason: "introspection — consumed by dag_state reducer",
         }],
-        AgentEvent::StepStarted { .. } | AgentEvent::StepCompleted { .. } => vec![T::Swallow {
+        AgentEvent::StepStarted { .. } | AgentEvent::StepCompleted { .. } => smallvec![T::Swallow {
             reason: "step boundary — reducer/telemetry only",
         }],
         AgentEvent::ExecutionTreeNode { .. } | AgentEvent::ExecutionTreeUpdate { .. } => {
-            vec![T::Swallow {
+            smallvec![T::Swallow {
                 reason: "execution-tree — rendered by a dedicated panel via reducer",
             }]
         }
-        AgentEvent::MessagePart { .. } => vec![T::Swallow {
+        AgentEvent::MessagePart { .. } => smallvec![T::Swallow {
             reason: "structured message part — AI-elements rendering path, not ThreadEvent",
         }],
-        AgentEvent::SessionPhaseChanged { .. } => vec![T::Swallow {
+        AgentEvent::SessionPhaseChanged { .. } => smallvec![T::Swallow {
             reason: "session-phase — reducer/status-bar only",
         }],
-        AgentEvent::RoutingDecision { .. } => vec![T::Swallow {
+        AgentEvent::RoutingDecision { .. } => smallvec![T::Swallow {
             reason: "routing decision — reducer/introspection panel only",
         }],
-        AgentEvent::EventBufferOverflow { .. } => vec![T::Swallow {
+        AgentEvent::EventBufferOverflow { .. } => smallvec![T::Swallow {
             reason: "buffer overflow — replay via emitter, not a UI event",
         }],
-        AgentEvent::DrainedStaleApproval { .. } => vec![T::Swallow {
+        AgentEvent::DrainedStaleApproval { .. } => smallvec![T::Swallow {
             reason: "stale approval drain — telemetry only",
         }],
-        AgentEvent::TokenLogprobSummary { .. } => vec![T::Swallow {
+        AgentEvent::TokenLogprobSummary { .. } => smallvec![T::Swallow {
             reason: "logprob summary — reducer renders confidence dot",
         }],
-        AgentEvent::BudgetUpdated { .. } => vec![T::Swallow {
+        AgentEvent::BudgetUpdated { .. } => smallvec![T::Swallow {
             reason: "budget updated — reducer/status-bar",
         }],
         AgentEvent::CheckpointCreated { .. } | AgentEvent::CheckpointReverted { .. } => {
-            vec![T::Swallow {
+            smallvec![T::Swallow {
                 reason: "checkpoint — timeline panel via reducer",
             }]
         }
-        AgentEvent::BackgroundAgentDone { .. } => vec![T::Swallow {
+        AgentEvent::BackgroundAgentDone { .. } => smallvec![T::Swallow {
             reason: "background agent — notification channel, not main thread",
         }],
-        AgentEvent::CritiqueCall { .. } => vec![T::Swallow {
+        AgentEvent::CritiqueCall { .. } => smallvec![T::Swallow {
             reason: "critique call — reducer",
         }],
         AgentEvent::VerificationStarted { .. } | AgentEvent::VerificationCompleted { .. } => {
-            vec![T::Swallow {
+            smallvec![T::Swallow {
                 reason: "verification phase — reducer",
             }]
         }
         AgentEvent::TestGateStarted { .. } | AgentEvent::TestGateCompleted { .. } => {
-            vec![T::Swallow {
+            smallvec![T::Swallow {
                 reason: "test gate — reducer",
             }]
         }
         AgentEvent::ParallelToolBatchStarted { .. }
-        | AgentEvent::ParallelToolBatchCompleted { .. } => vec![T::Swallow {
+        | AgentEvent::ParallelToolBatchCompleted { .. } => smallvec![T::Swallow {
             reason: "parallel batch diagnostics — reducer",
         }],
-        AgentEvent::ReflexionRecorded { .. } => vec![T::Swallow {
+        AgentEvent::ReflexionRecorded { .. } => smallvec![T::Swallow {
             reason: "reflexion — rendered inline on the failed tool_result, not a separate event",
         }],
-        AgentEvent::CriticVerdict { .. } => vec![T::Swallow {
+        AgentEvent::CriticVerdict { .. } => smallvec![T::Swallow {
             reason: "critic verdict — reducer",
         }],
 
         // Forward-compat catch-all.
-        AgentEvent::Unknown => vec![T::Swallow {
+        AgentEvent::Unknown => smallvec![T::Swallow {
             reason: "unknown event — client may be older than engine",
         }],
     }
