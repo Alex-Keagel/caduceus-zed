@@ -444,6 +444,12 @@ pub fn translate(ev: &AgentEvent) -> TranslatedEvents {
         AgentEvent::Unknown => smallvec![T::Swallow {
             reason: "unknown event — client may be older than engine",
         }],
+
+        // #[non_exhaustive] safety net: future engine additions fall through here
+        // until the translator is extended to handle them explicitly.
+        _ => smallvec![T::Swallow {
+            reason: "unrecognized AgentEvent variant — bridge translator outdated",
+        }],
     }
 }
 
