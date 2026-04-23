@@ -5504,8 +5504,10 @@ impl ThreadEventStream {
 //     tool adapters use, so the user sees a normal approval prompt.
 //  2. Spawning a task that awaits the user's decision, maps the
 //     `SelectedPermissionOutcome` to a boolean, and sends
-//     `(format!("perm_{id}"), allowed)` on `approval_tx` per the
-//     engine's documented contract (see `build_harness` docstring).
+//     `(id, allowed)` on `approval_tx`. The `id` received here is
+//     already the engine's `perm_{tool_use_id}` string — the engine
+//     formats the key in `agent_harness.rs:2281` and the event
+//     translator forwards it unchanged, so we must NOT re-prefix.
 //
 // Timeout policy is engine-side (default ~300s). If the user closes
 // the panel without deciding, the oneshot is dropped → engine receives
@@ -5524,9 +5526,15 @@ fn route_native_permission_request(
         id.to_string(),
         acp::ToolCallUpdateFields::new().title(title),
     );
-    // Minimal allow/deny dropdown — no always-allow persistence for
-    // native path yet (that's tied to Zed's ToolPermissionMode
-    // settings machinery, which we'll wire in a follow-up).
+    // Always-allow persistence is deferred — rubber-duck review flagged
+    // that passing the engine's `description` to
+    // `decide_permission_from_settings` is not semantically equivalent
+    // to legacy matching (engine humanizes+truncates the tool input at
+    // agent_harness.rs:2287-2297), so allow/deny regexes would silently
+    // fail to match. Landing that feature requires extending the engine
+    // `PermissionRequest` shape to carry raw tool inputs — tracked as a
+    // cross-repo follow-up. For now, every native permission request is
+    // an interactive allow-once / deny-once prompt.
     let options = acp_thread::PermissionOptions::Dropdown(vec![acp_thread::PermissionOptionChoice {
         allow: acp::PermissionOption::new(
             acp::PermissionOptionId::new("allow_once".to_string()),
@@ -5553,7 +5561,15 @@ fn route_native_permission_request(
         .is_err()
     {
         log::warn!("[native-loop] failed to send ToolCallAuthorization; denying by default");
-        let key = format!("perm_{id}");
+        // 🔴 bug-fix (rubber-duck): `id` received here is ALREADY the
+        // engine's `perm_{tool_use_id}` string (emitted by
+        // agent_harness.rs:2281-2286 and forwarded unchanged by the
+        // event translator at event_translator.rs:237-241). Re-prefixing
+        // produces `perm_perm_*` which fails the engine's `id == req_id`
+        // equality check at agent_harness.rs:2319, causing the approval
+        // channel to treat every native decision as a stale/mismatched
+        // reply — until now NW-3 approvals were silently never arriving.
+        let key = id.to_string();
         let approval_tx = approval_tx.clone();
         cx.spawn(async move |_| {
             let _ = approval_tx.send((key, false)).await;
@@ -5561,7 +5577,7 @@ fn route_native_permission_request(
         .detach();
         return;
     }
-    let key = format!("perm_{id}");
+    let key = id.to_string();
     cx.spawn(async move |_| {
         let allowed = match response_rx.await {
             Ok(outcome) => {
