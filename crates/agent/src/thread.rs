@@ -3402,25 +3402,114 @@ impl Thread {
         // capture it in phase 2), but we fall back to a warning-only
         // surface to preserve the legacy pre-NW-3 behaviour.
         let approval_tx_for_consumer = setup.approval_tx.clone();
+        // Follow-up: consumer-local state for tool-call enrichment.
+        // - `tool_names`: id → tool name, populated at ToolCallStart so
+        //   InputEnd / ToolResult arms can look up the AnyAgentTool.
+        // - `input_buffers`: id → accumulated JSON bytes from
+        //   ToolCallInputDelta frames, assembled at InputEnd so we can
+        //   call `tool.initial_title(input)` to refine the card title
+        //   and stash the parsed input as `raw_input` on the card.
+        //   Kept local to the consumer so `dispatch_translated_event`
+        //   stays stateless (its 15 G1f mapping tests depend on this).
+        let enabled_tools_for_consumer = setup.enabled_tools.clone();
         let consumer_task = cx.spawn(async move |cx_cons| {
+            use caduceus_bridge::event_translator::TranslatedThreadEvent as T;
+            let mut tool_names: std::collections::HashMap<String, SharedString> =
+                std::collections::HashMap::new();
+            let mut input_buffers: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             while let Some(ev) = trans_rx.recv().await {
-                if let caduceus_bridge::event_translator::TranslatedThreadEvent::PermissionRequest {
-                    id,
-                    tool,
-                    description,
-                } = &ev
-                {
-                    if let Some(ref approval_tx) = approval_tx_for_consumer {
-                        route_native_permission_request(
-                            id,
-                            tool,
-                            description,
-                            &stream_for_consumer,
-                            approval_tx.clone(),
-                            cx_cons,
-                        );
+                match &ev {
+                    T::PermissionRequest {
+                        id,
+                        tool,
+                        description,
+                    } => {
+                        if let Some(ref approval_tx) = approval_tx_for_consumer {
+                            route_native_permission_request(
+                                id,
+                                tool,
+                                description,
+                                &stream_for_consumer,
+                                approval_tx.clone(),
+                                cx_cons,
+                            );
+                            continue;
+                        }
+                    }
+                    T::ToolCallStart { id, name } => {
+                        let tool_name: SharedString = name.clone().into();
+                        tool_names.insert(id.clone(), tool_name.clone());
+                        // Resolve `kind` at start from the enabled-tools
+                        // registry. `initial_title` needs parsed JSON
+                        // input, which we don't have yet — fall back to
+                        // the tool name until InputEnd assembles it.
+                        let kind = enabled_tools_for_consumer
+                            .get(&tool_name)
+                            .map(|t| t.kind())
+                            .unwrap_or(acp::ToolKind::Other);
+                        stream_for_consumer
+                            .0
+                            .unbounded_send(Ok(ThreadEvent::ToolCall(
+                                acp::ToolCall::new(id.to_string(), name.to_string())
+                                    .kind(kind)
+                                    .status(acp::ToolCallStatus::Pending)
+                                    .meta(acp_thread::meta_with_tool_name(name)),
+                            )))
+                            .ok();
                         continue;
                     }
+                    T::ToolCallInputDelta { id, delta } => {
+                        input_buffers.entry(id.clone()).or_default().push_str(delta);
+                        continue;
+                    }
+                    T::ToolCallInputEnd { id } => {
+                        let buffered = input_buffers.remove(id).unwrap_or_default();
+                        let parsed: Option<serde_json::Value> =
+                            serde_json::from_str(&buffered).ok();
+                        let tool_name = tool_names.get(id).cloned();
+                        // If we have both a parsed input and a resolved
+                        // tool, ask the tool for its rich initial_title
+                        // and emit it alongside the InProgress status +
+                        // raw_input. Otherwise fall back to the status
+                        // flip only.
+                        let rich_title: Option<SharedString> = match (&parsed, tool_name.as_ref()) {
+                            (Some(input), Some(name)) => {
+                                let input = input.clone();
+                                let name = name.clone();
+                                let tools = enabled_tools_for_consumer.clone();
+                                cx_cons.update(|cx| {
+                                    tools.get(&name).map(|t| t.initial_title(input, cx))
+                                })
+                            }
+                            _ => None,
+                        };
+                        let mut fields = acp::ToolCallUpdateFields::new()
+                            .status(acp::ToolCallStatus::InProgress);
+                        if let Some(t) = rich_title {
+                            let title_str: String = t.to_string();
+                            fields = fields.title(title_str);
+                        }
+                        if let Some(raw) = parsed {
+                            fields = fields.raw_input(raw);
+                        }
+                        stream_for_consumer
+                            .0
+                            .unbounded_send(Ok(ThreadEvent::ToolCallUpdate(
+                                acp::ToolCallUpdate::new(id.to_string(), fields).into(),
+                            )))
+                            .ok();
+                        continue;
+                    }
+                    T::ToolResult { id, .. } => {
+                        // Fall through to the stateless dispatcher — it
+                        // already handles status + content + raw_output.
+                        // Clean up per-id state first so the maps don't
+                        // grow unbounded across a long turn.
+                        tool_names.remove(id);
+                        input_buffers.remove(id);
+                    }
+                    _ => {}
                 }
                 dispatch_translated_event(&ev, &stream_for_consumer);
             }
@@ -5637,17 +5726,17 @@ fn dispatch_translated_event(
         T::AgentThinkingComplete { content, .. } => stream.send_thinking(content),
 
         // Tool lifecycle → real `acp::ToolCall` / `acp::ToolCallUpdate`
-        // events so the panel renders proper tool-call cards. We don't
-        // have a resolved Zed-side tool reference here (no Tool trait
-        // object, no `initial_title`, no rich `kind`), so we use the
-        // raw tool name as the title and `ToolKind::Other` as the kind.
-        // Input-delta streaming isn't aggregated per-id at this layer
-        // (that would require session state) — the complete raw input
-        // is available on `ToolResult` via the engine, but the wire
-        // event only carries the output. A richer mapping that wires
-        // `tool.initial_title` + `tool.kind` will land with the
-        // provider-adapter follow-up that knows which Tool an id
-        // belongs to.
+        // events so the panel renders proper tool-call cards.
+        //
+        // NOTE: In production the consumer task at Phase 6 intercepts
+        // `ToolCallStart` / `ToolCallInputDelta` / `ToolCallInputEnd`
+        // BEFORE reaching this dispatcher so it can look up
+        // `enabled_tools[name]` for the rich `kind` + `initial_title`
+        // and aggregate input deltas per id. These arms remain here
+        // for the stateless contract the 15 G1f mapping tests pin —
+        // they render a plainer card (title=name, kind=Other, no raw
+        // input) and are exercised only when the dispatcher is used
+        // outside the native-loop consumer (tests, headless tools).
         T::ToolCallStart { id, name } => {
             stream
                 .0
@@ -7091,34 +7180,33 @@ mod native_dispatch_tests {
     }
 
     #[test]
-    fn tool_result_with_error_surfaces_warning() {
+    fn tool_result_with_error_surfaces_failed_update() {
         let evs = dispatch_one(T::ToolResult {
             id: "t1".into(),
             content: "boom".into(),
             is_error: true,
         });
         assert_one(&evs, |e| match e {
-            ThreadEvent::EngineDiagnostic(d) => {
-                assert_eq!(d.kind, "tool.result");
-                assert_eq!(d.severity, EngineDiagnosticSeverity::Warning);
-                assert!(d.detail.contains("is_error=true"));
+            ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(upd)) => {
+                assert_eq!(upd.tool_call_id.0.as_ref(), "t1");
+                assert_eq!(upd.fields.status, Some(acp::ToolCallStatus::Failed));
             }
-            other => panic!("expected EngineDiagnostic, got {other:?}"),
+            other => panic!("expected ToolCallUpdate::UpdateFields, got {other:?}"),
         });
     }
 
     #[test]
-    fn tool_result_ok_surfaces_info() {
+    fn tool_result_ok_surfaces_completed_update() {
         let evs = dispatch_one(T::ToolResult {
             id: "t2".into(),
             content: "ok".into(),
             is_error: false,
         });
         assert_one(&evs, |e| match e {
-            ThreadEvent::EngineDiagnostic(d) => {
-                assert_eq!(d.severity, EngineDiagnosticSeverity::Info);
+            ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(upd)) => {
+                assert_eq!(upd.fields.status, Some(acp::ToolCallStatus::Completed));
             }
-            other => panic!("expected EngineDiagnostic, got {other:?}"),
+            other => panic!("expected ToolCallUpdate::UpdateFields, got {other:?}"),
         });
     }
 
