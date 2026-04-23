@@ -454,6 +454,7 @@ pub(crate) async fn aggregate_stream(
     >,
 ) -> caduceus_core::Result<ChatResponse> {
     let mut content = String::new();
+    let mut thinking = String::new();
     let mut tool_calls: Vec<ToolUse> = Vec::new();
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
@@ -465,7 +466,7 @@ pub(crate) async fn aggregate_stream(
         match ev {
             Err(e) => return Err(classify_error(&e)),
             Ok(LanguageModelCompletionEvent::Text(s)) => content.push_str(&s),
-            Ok(LanguageModelCompletionEvent::Thinking { text, .. }) => content.push_str(&text),
+            Ok(LanguageModelCompletionEvent::Thinking { text, .. }) => thinking.push_str(&text),
             Ok(LanguageModelCompletionEvent::RedactedThinking { .. }) => {
                 // Intentionally drop — nothing to show.
             }
@@ -517,6 +518,7 @@ pub(crate) async fn aggregate_stream(
         stop_reason: stop,
         tool_calls,
         logprobs: None,
+        thinking,
     })
 }
 

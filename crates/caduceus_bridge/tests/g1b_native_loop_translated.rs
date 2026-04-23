@@ -33,6 +33,7 @@ fn mock_response(text: &str) -> ChatResponse {
         stop_reason: StopReason::EndTurn,
         tool_calls: vec![],
         logprobs: None,
+    thinking: String::new(),
     }
 }
 

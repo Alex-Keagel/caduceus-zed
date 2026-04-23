@@ -2784,6 +2784,7 @@ mod tests {
                 stop_reason: caduceus_providers::StopReason::EndTurn,
                 tool_calls: vec![],
                 logprobs: None,
+                thinking: String::new(),
             },
         ]));
         let tools = ToolRegistry::new();
@@ -3817,6 +3818,7 @@ mod tests {
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
                 logprobs: None,
+            thinking: String::new(),
             }
         }
 
