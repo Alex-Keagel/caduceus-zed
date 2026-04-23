@@ -3424,12 +3424,14 @@ impl Thread {
                         id,
                         tool,
                         description,
+                        raw_input,
                     } => {
                         if let Some(ref approval_tx) = approval_tx_for_consumer {
                             route_native_permission_request(
                                 id,
                                 tool,
                                 description,
+                                raw_input.as_ref(),
                                 &stream_for_consumer,
                                 approval_tx.clone(),
                                 cx_cons,
@@ -5598,6 +5600,11 @@ impl ThreadEventStream {
 //     formats the key in `agent_harness.rs:2281` and the event
 //     translator forwards it unchanged, so we must NOT re-prefix.
 //
+// `raw_input` is the structured tool input as emitted by the engine
+// (with secrets redacted by `caduceus_core::redact_secrets_for_event`).
+// Currently unused — threaded through in A1 so A2 can consume it for
+// always-allow matching without another cross-repo change.
+//
 // Timeout policy is engine-side (default ~300s). If the user closes
 // the panel without deciding, the oneshot is dropped → engine receives
 // `PermissionOutcome::ChannelClosed` → tool call is denied fail-fast.
@@ -5605,6 +5612,7 @@ fn route_native_permission_request(
     id: &str,
     tool: &str,
     description: &str,
+    _raw_input: Option<&serde_json::Value>,
     stream: &ThreadEventStream,
     approval_tx: tokio::sync::mpsc::Sender<(String, bool)>,
     cx: &mut AsyncApp,
@@ -5799,6 +5807,7 @@ fn dispatch_translated_event(
             id,
             tool,
             description,
+            raw_input: _,
         } => {
             stream.send_engine_diagnostic(
                 "permission.request",
@@ -7351,6 +7360,7 @@ mod native_dispatch_tests {
             id: "p1".into(),
             tool: "bash".into(),
             description: "run tests".into(),
+            raw_input: None,
         });
         assert_one(&evs, |e| match e {
             ThreadEvent::EngineDiagnostic(d) => {

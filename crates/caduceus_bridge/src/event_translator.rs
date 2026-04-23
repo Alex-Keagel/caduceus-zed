@@ -58,6 +58,12 @@ pub enum TranslatedThreadEvent {
         id: String,
         tool: String,
         description: String,
+        /// Structured tool-call input (secrets redacted engine-side via
+        /// `caduceus_core::redact_secrets_for_event`). Consumed by
+        /// `route_native_permission_request` to evaluate user-configured
+        /// `tool_permissions.<tool>.always_allow` rules. `None` on
+        /// legacy engine builds predating the A1 schema extension.
+        raw_input: Option<serde_json::Value>,
     },
     /// Context-usage warning from the engine (~70% / ~85% / ~95%).
     /// Level is the raw string (`"warning_70"` etc.) — UI may map to
@@ -234,10 +240,12 @@ pub fn translate(ev: &AgentEvent) -> TranslatedEvents {
             id,
             capability,
             description,
+            raw_input,
         } => smallvec![T::PermissionRequest {
             id: id.clone(),
             tool: capability.clone(),
             description: description.clone(),
+            raw_input: raw_input.clone(),
         }],
         AgentEvent::PermissionDecision { .. } | AgentEvent::ApprovalDecided { .. } => {
             smallvec![T::Swallow {
@@ -550,11 +558,49 @@ mod tests {
             id: "p1".into(),
             capability: "bash".into(),
             description: "run ls".into(),
+            raw_input: None,
         });
         match got {
-            TranslatedThreadEvent::PermissionRequest { id, tool, .. } => {
+            TranslatedThreadEvent::PermissionRequest {
+                id,
+                tool,
+                raw_input,
+                ..
+            } => {
                 assert_eq!(id, "p1");
                 assert_eq!(tool, "bash");
+                assert!(raw_input.is_none(), "None passes through");
+            }
+            other => panic!("expected PermissionRequest, got {other:?}"),
+        }
+    }
+
+    /// A1 regression: translator must preserve `raw_input` verbatim
+    /// from the engine event — consumed by `route_native_permission_request`
+    /// for always-allow matching (A2).
+    #[test]
+    fn permission_request_preserves_raw_input() {
+        use serde_json::json;
+        let input = json!({"command": "ls -la", "cwd": "/tmp"});
+        let got = one(&AgentEvent::PermissionRequest {
+            id: "p1".into(),
+            capability: "bash".into(),
+            description: "bash with args: {\"command\":\"ls -la\",\"cwd\":\"/tmp\"}".into(),
+            raw_input: Some(input.clone()),
+        });
+        match got {
+            TranslatedThreadEvent::PermissionRequest {
+                id,
+                tool,
+                description,
+                raw_input,
+            } => {
+                assert_eq!(id, "p1", "id preserved verbatim");
+                assert_eq!(tool, "bash");
+                assert!(description.contains("ls -la"), "description retained");
+                let v = raw_input.expect("raw_input Some");
+                assert_eq!(v["command"].as_str(), Some("ls -la"));
+                assert_eq!(v["cwd"].as_str(), Some("/tmp"));
             }
             other => panic!("expected PermissionRequest, got {other:?}"),
         }
