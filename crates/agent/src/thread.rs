@@ -5590,20 +5590,34 @@ impl ThreadEventStream {
 // `route_native_permission_request` bridges a
 // `TranslatedThreadEvent::PermissionRequest` back to the engine's
 // `approval_tx` channel by:
-//  1. Emitting a real `ThreadEvent::ToolCallAuthorization` with a
-//     oneshot `response` sender — reuses the same UI path the legacy
-//     tool adapters use, so the user sees a normal approval prompt.
-//  2. Spawning a task that awaits the user's decision, maps the
-//     `SelectedPermissionOutcome` to a boolean, and sends
-//     `(id, allowed)` on `approval_tx`. The `id` received here is
-//     already the engine's `perm_{tool_use_id}` string — the engine
-//     formats the key in `agent_harness.rs:2281` and the event
-//     translator forwards it unchanged, so we must NOT re-prefix.
+//  1. **A2 fast-path.** Consult the user's
+//     `tool_permissions.<tool>.always_allow / .always_deny /
+//     .always_confirm` regex rules (via
+//     `decide_permission_from_settings`) against the engine-supplied
+//     `raw_input`. If the decision is `Allow` / `Deny` we skip the UI
+//     prompt entirely and respond to the engine immediately; this is
+//     what the settings-level "always allow `ls `" affordance promises.
+//  2. **Interactive fall-through.** On `Confirm` (or when `raw_input`
+//     is absent, which happens on legacy engine builds predating A1),
+//     we emit a real `ThreadEvent::ToolCallAuthorization` with a
+//     oneshot `response` sender — same UI path the legacy tool adapters
+//     use — and spawn a task that awaits the user's decision, maps
+//     the `SelectedPermissionOutcome` to a boolean, and sends
+//     `(id, allowed)` on `approval_tx`.
 //
-// `raw_input` is the structured tool input as emitted by the engine
-// (with secrets redacted by `caduceus_core::redact_secrets_for_event`).
-// Currently unused — threaded through in A1 so A2 can consume it for
-// always-allow matching without another cross-repo change.
+// The `id` received here is already the engine's `perm_{tool_use_id}`
+// string — the engine formats the key in `agent_harness.rs:2281` and
+// the event translator forwards it unchanged, so we must NOT re-prefix
+// (NW-3 regression noted below).
+//
+// `raw_input` comes from the engine already secret-redacted
+// (`caduceus_core::redact_secrets_for_event`). We extract the
+// top-level string values as candidate matcher inputs; this covers
+// every built-in tool whose approval signal is a string field
+// (`command` for terminal, `path` for edit_file, `url` for
+// fetch_tool, ...). Tools with only numeric / object-valued fields
+// produce an empty input vector → matcher falls through to the tool's
+// default → interactive prompt (safe).
 //
 // Timeout policy is engine-side (default ~300s). If the user closes
 // the panel without deciding, the oneshot is dropped → engine receives
@@ -5612,26 +5626,74 @@ fn route_native_permission_request(
     id: &str,
     tool: &str,
     description: &str,
-    _raw_input: Option<&serde_json::Value>,
+    raw_input: Option<&serde_json::Value>,
     stream: &ThreadEventStream,
     approval_tx: tokio::sync::mpsc::Sender<(String, bool)>,
     cx: &mut AsyncApp,
 ) {
+    let key = id.to_string();
+
+    // A2 fast-path — evaluate user-configured always-allow rules BEFORE
+    // spawning an interactive prompt. Pure function over settings +
+    // extracted string inputs; no UI involved.
+    if let Some(raw) = raw_input {
+        let inputs = extract_match_inputs(raw);
+        let decision = cx.update(|cx| {
+            crate::tool_permissions::decide_permission_from_settings(
+                tool,
+                &inputs,
+                agent_settings::AgentSettings::get_global(cx),
+            )
+        });
+        match decision {
+            crate::tool_permissions::ToolPermissionDecision::Allow => {
+                // Auto-approve. Surface a diagnostic so the user can see
+                // the approval was rule-driven, not silently skipped.
+                stream.send_engine_diagnostic(
+                    "permission.auto_allow",
+                    format!("{tool} auto-approved by user rule"),
+                    EngineDiagnosticSeverity::Info,
+                );
+                let approval_tx = approval_tx.clone();
+                cx.spawn(async move |_| {
+                    if approval_tx.send((key, true)).await.is_err() {
+                        log::warn!(
+                            "[native-loop] approval_tx closed before auto-allow could be sent"
+                        );
+                    }
+                })
+                .detach();
+                return;
+            }
+            crate::tool_permissions::ToolPermissionDecision::Deny(reason) => {
+                stream.send_engine_diagnostic(
+                    "permission.auto_deny",
+                    format!("{tool} auto-denied by user rule: {reason}"),
+                    EngineDiagnosticSeverity::Warning,
+                );
+                let approval_tx = approval_tx.clone();
+                cx.spawn(async move |_| {
+                    if approval_tx.send((key, false)).await.is_err() {
+                        log::warn!(
+                            "[native-loop] approval_tx closed before auto-deny could be sent"
+                        );
+                    }
+                })
+                .detach();
+                return;
+            }
+            crate::tool_permissions::ToolPermissionDecision::Confirm => {
+                // Fall through to interactive prompt below.
+            }
+        }
+    }
+
     let (response_tx, response_rx) = oneshot::channel();
     let title = format!("{tool}: {description}");
     let tool_call = acp::ToolCallUpdate::new(
         id.to_string(),
         acp::ToolCallUpdateFields::new().title(title),
     );
-    // Always-allow persistence is deferred — rubber-duck review flagged
-    // that passing the engine's `description` to
-    // `decide_permission_from_settings` is not semantically equivalent
-    // to legacy matching (engine humanizes+truncates the tool input at
-    // agent_harness.rs:2287-2297), so allow/deny regexes would silently
-    // fail to match. Landing that feature requires extending the engine
-    // `PermissionRequest` shape to carry raw tool inputs — tracked as a
-    // cross-repo follow-up. For now, every native permission request is
-    // an interactive allow-once / deny-once prompt.
     let options = acp_thread::PermissionOptions::Dropdown(vec![acp_thread::PermissionOptionChoice {
         allow: acp::PermissionOption::new(
             acp::PermissionOptionId::new("allow_once".to_string()),
@@ -5666,15 +5728,14 @@ fn route_native_permission_request(
         // equality check at agent_harness.rs:2319, causing the approval
         // channel to treat every native decision as a stale/mismatched
         // reply — until now NW-3 approvals were silently never arriving.
-        let key = id.to_string();
         let approval_tx = approval_tx.clone();
+        let key_for_err = key.clone();
         cx.spawn(async move |_| {
-            let _ = approval_tx.send((key, false)).await;
+            let _ = approval_tx.send((key_for_err, false)).await;
         })
         .detach();
         return;
     }
-    let key = id.to_string();
     cx.spawn(async move |_| {
         let allowed = match response_rx.await {
             Ok(outcome) => {
@@ -5688,6 +5749,32 @@ fn route_native_permission_request(
         }
     })
     .detach();
+}
+
+/// Collect top-level string values of `raw_input` as candidate matcher
+/// inputs for [`crate::tool_permissions::decide_permission_from_settings`].
+///
+/// We deliberately look only at the **top level** of a JSON object:
+/// built-in tools that hook into always-allow rules (terminal,
+/// edit_file, fetch, create_directory, copy_path, delete_path,
+/// restore_file_from_disk) all expose the user-meaningful matching
+/// field as a top-level string. Nested objects might carry arbitrary
+/// values whose regex-match against `command` / `path` rules would be
+/// surprising, so we skip them. Non-object / non-string inputs
+/// produce an empty `Vec` → `decide_permission_from_settings` falls
+/// through to the tool's default (usually `Confirm`), preserving the
+/// safe interactive behavior.
+///
+/// The engine pre-redacts this value via
+/// `caduceus_core::redact_secrets_for_event`, so any secret-shaped
+/// top-level key has already been replaced with `"<redacted>"`.
+fn extract_match_inputs(raw: &serde_json::Value) -> Vec<String> {
+    let Some(obj) = raw.as_object() else {
+        return Vec::new();
+    };
+    obj.values()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
 }
 
 // ── G1d — translator → ThreadEvent dispatch ─────────────────────────
