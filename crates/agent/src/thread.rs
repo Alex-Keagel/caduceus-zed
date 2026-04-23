@@ -1161,6 +1161,14 @@ pub struct Thread {
     /// turn re-spawns against the new model. Cloning the handle is
     /// cheap (just an `mpsc::Sender` clone).
     caduceus_dispatcher: Option<crate::caduceus_provider_adapter::DispatcherHandle>,
+    /// NW-3: engine approval channel for the native loop.
+    /// `Some` when the native harness was built with the default HITL
+    /// approval set; `None` for legacy path (which handles permission
+    /// UI inline in tool adapters). Sender is the engine's
+    /// `approval_tx`; keys are `format!("perm_{tool_use_id}")` and the
+    /// bool is the user's decision (`true` = allow, `false` = deny).
+    /// Invalidated in lock-step with `caduceus_harness`.
+    caduceus_approval_tx: Option<tokio::sync::mpsc::Sender<(String, bool)>>,
     /// Cached total token estimate (invalidated on message changes).
     /// `Cell` allows population from `&self` callers — the cached value is
     /// observation-only state and never affects logical equality of Thread.
@@ -1316,6 +1324,7 @@ impl Thread {
             caduceus_cancel_token: None,
             caduceus_emitter: None,
             caduceus_dispatcher: None,
+            caduceus_approval_tx: None,
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
@@ -1573,6 +1582,7 @@ impl Thread {
             caduceus_cancel_token: None,
             caduceus_emitter: None,
             caduceus_dispatcher: None,
+            caduceus_approval_tx: None,
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
@@ -1743,6 +1753,7 @@ impl Thread {
         self.caduceus_cancel_token = None;
         self.caduceus_emitter = None;
         self.caduceus_dispatcher = None;
+        self.caduceus_approval_tx = None;
         // Intentionally keep `caduceus_bridge` — the bridge itself
         // (ContextManager config, native_loop flag) outlives the
         // harness. If the flag was the reason for invalidation the
@@ -3089,6 +3100,9 @@ impl Thread {
             harness: Option<std::sync::Arc<caduceus_orchestrator::AgentHarness>>,
             emitter: Option<caduceus_orchestrator::AgentEventEmitter>,
             dispatcher: Option<DispatcherHandle>,
+            /// NW-3: approval channel captured alongside the harness.
+            /// Keyed `perm_{tool_use_id}` per engine contract.
+            approval_tx: Option<tokio::sync::mpsc::Sender<(String, bool)>>,
             /// NW-1: enabled-tools snapshot captured in Phase 1 under
             /// the `this.update` borrow so Phase 2 can build the tool
             /// dispatcher without a second `update` round-trip.
@@ -3155,6 +3169,7 @@ impl Thread {
                 harness: this.caduceus_harness.clone(),
                 emitter: this.caduceus_emitter.clone(),
                 dispatcher: this.caduceus_dispatcher.clone(),
+                approval_tx: this.caduceus_approval_tx.clone(),
                 enabled_tools,
                 system_prompt,
                 caduceus_mode,
@@ -3285,8 +3300,17 @@ impl Thread {
                 .harness(provider, tool_registry, setup.system_prompt.clone())
                 .with_emitter()
                 .with_reducer_sink()
-                .no_approval()
                 .build();
+
+            // NW-3: capture approval_tx BEFORE consuming
+            // `built.harness` into the mode-decorator chain. With
+            // default approval (no `.no_approval()`), HarnessBuilder
+            // guarantees `Some(approval_tx)` — see the bridge
+            // docstring on `build_harness` for the key format
+            // (`perm_{tool_use_id}`).
+            let approval_tx = built
+                .approval_tx
+                .expect("default approval on HarnessBuilder guarantees Some(approval_tx)");
 
             // NW-2: attach mode + lens so the engine's
             // `effective_system_prompt` renders the `<agent_mode>`
@@ -3314,11 +3338,13 @@ impl Thread {
                 this.caduceus_harness = Some(harness_arc.clone());
                 this.caduceus_emitter = Some(emitter.clone());
                 this.caduceus_dispatcher = Some(disp_handle.clone());
+                this.caduceus_approval_tx = Some(approval_tx.clone());
             })?;
 
             setup.harness = Some(harness_arc);
             setup.emitter = Some(emitter);
             setup.dispatcher = Some(disp_handle);
+            setup.approval_tx = Some(approval_tx);
         }
 
         let harness = setup.harness.expect("built in phase 2");
@@ -3357,8 +3383,32 @@ impl Thread {
         // ── Phase 6: spawn translated consumer on GPUI foreground ──
         let (trans_tx, mut trans_rx) = tokio::sync::mpsc::unbounded_channel();
         let stream_for_consumer = event_stream.clone();
-        let consumer_task = cx.spawn(async move |_| {
+        // NW-3: approval_tx cloned into the consumer so
+        // `PermissionRequest` variants can round-trip user decisions
+        // back to the engine. `None` should not happen here (we always
+        // capture it in phase 2), but we fall back to a warning-only
+        // surface to preserve the legacy pre-NW-3 behaviour.
+        let approval_tx_for_consumer = setup.approval_tx.clone();
+        let consumer_task = cx.spawn(async move |cx_cons| {
             while let Some(ev) = trans_rx.recv().await {
+                if let caduceus_bridge::event_translator::TranslatedThreadEvent::PermissionRequest {
+                    id,
+                    tool,
+                    description,
+                } = &ev
+                {
+                    if let Some(ref approval_tx) = approval_tx_for_consumer {
+                        route_native_permission_request(
+                            id,
+                            tool,
+                            description,
+                            &stream_for_consumer,
+                            approval_tx.clone(),
+                            cx_cons,
+                        );
+                        continue;
+                    }
+                }
                 dispatch_translated_event(&ev, &stream_for_consumer);
             }
         });
@@ -5419,6 +5469,89 @@ impl ThreadEventStream {
             })))
             .ok();
     }
+}
+
+// ── NW-3 — native-path permission round-trip ──────────────────────
+//
+// `route_native_permission_request` bridges a
+// `TranslatedThreadEvent::PermissionRequest` back to the engine's
+// `approval_tx` channel by:
+//  1. Emitting a real `ThreadEvent::ToolCallAuthorization` with a
+//     oneshot `response` sender — reuses the same UI path the legacy
+//     tool adapters use, so the user sees a normal approval prompt.
+//  2. Spawning a task that awaits the user's decision, maps the
+//     `SelectedPermissionOutcome` to a boolean, and sends
+//     `(format!("perm_{id}"), allowed)` on `approval_tx` per the
+//     engine's documented contract (see `build_harness` docstring).
+//
+// Timeout policy is engine-side (default ~300s). If the user closes
+// the panel without deciding, the oneshot is dropped → engine receives
+// `PermissionOutcome::ChannelClosed` → tool call is denied fail-fast.
+fn route_native_permission_request(
+    id: &str,
+    tool: &str,
+    description: &str,
+    stream: &ThreadEventStream,
+    approval_tx: tokio::sync::mpsc::Sender<(String, bool)>,
+    cx: &mut AsyncApp,
+) {
+    let (response_tx, response_rx) = oneshot::channel();
+    let title = format!("{tool}: {description}");
+    let tool_call = acp::ToolCallUpdate::new(
+        id.to_string(),
+        acp::ToolCallUpdateFields::new().title(title),
+    );
+    // Minimal allow/deny dropdown — no always-allow persistence for
+    // native path yet (that's tied to Zed's ToolPermissionMode
+    // settings machinery, which we'll wire in a follow-up).
+    let options = acp_thread::PermissionOptions::Dropdown(vec![acp_thread::PermissionOptionChoice {
+        allow: acp::PermissionOption::new(
+            acp::PermissionOptionId::new("allow_once".to_string()),
+            "Allow".to_string(),
+            acp::PermissionOptionKind::AllowOnce,
+        ),
+        deny: acp::PermissionOption::new(
+            acp::PermissionOptionId::new("deny_once".to_string()),
+            "Deny".to_string(),
+            acp::PermissionOptionKind::RejectOnce,
+        ),
+        sub_patterns: vec![],
+    }]);
+    if stream
+        .0
+        .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
+            ToolCallAuthorization {
+                tool_call,
+                options,
+                response: response_tx,
+                context: None,
+            },
+        )))
+        .is_err()
+    {
+        log::warn!("[native-loop] failed to send ToolCallAuthorization; denying by default");
+        let key = format!("perm_{id}");
+        let approval_tx = approval_tx.clone();
+        cx.spawn(async move |_| {
+            let _ = approval_tx.send((key, false)).await;
+        })
+        .detach();
+        return;
+    }
+    let key = format!("perm_{id}");
+    cx.spawn(async move |_| {
+        let allowed = match response_rx.await {
+            Ok(outcome) => {
+                let option_id = outcome.option_id.0.as_ref();
+                option_id.starts_with("allow")
+            }
+            Err(_) => false, // oneshot dropped → deny fail-fast
+        };
+        if approval_tx.send((key, allowed)).await.is_err() {
+            log::warn!("[native-loop] approval_tx closed before decision could be sent");
+        }
+    })
+    .detach();
 }
 
 // ── G1d — translator → ThreadEvent dispatch ─────────────────────────
