@@ -34,7 +34,7 @@ pub mod tree_sitter;
 pub use engine::CaduceusEngine;
 
 // ST-B2 / contract `envelope-surface-v1` — Bridge re-exports
-// `PermissionEnvelope` as `BridgePermissionEnvelope` so downstream IDE
+// `PermissionEnvelope` as `PermissionEnvelope` so downstream IDE
 // consumers (agent panel, settings UI, tool gates) don't have to reach
 // across crates into `caduceus-permissions`. The type *is* the
 // orchestrator's `caduceus_permissions::PermissionEnvelope` — no serde
@@ -42,7 +42,7 @@ pub use engine::CaduceusEngine;
 // in both directions (golden-bytes test in `orchestrator::tests`).
 pub use caduceus_permissions::envelope::{
     ApprovalCadence, EnvelopeScope, ExecPolicy, FanoutPolicy, NetworkPolicy, PathAllowlist,
-    PermissionEnvelope as BridgePermissionEnvelope,
+    PermissionEnvelope,
 };
 
 // ST-B3 / contract `context-injector-v1` — bridge re-exports the

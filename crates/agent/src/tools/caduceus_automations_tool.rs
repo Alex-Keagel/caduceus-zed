@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 
 use caduceus_bridge::orchestrator::{
-    Automation, AutomationAgentConfig, AutomationTrigger, BridgeAgentMode, BridgeModelId,
+    Automation, AutomationAgentConfig, AutomationTrigger, AgentMode, ModelId,
 };
 
 use crate::tools::caduceus_file_lock::acquire_file_lock;
@@ -245,8 +245,8 @@ impl AgentTool for CaduceusAutomationsTool {
                         name: name.clone(),
                         trigger,
                         agent_config: AutomationAgentConfig {
-                            mode: BridgeAgentMode::Act,
-                            model: BridgeModelId::new("default"),
+                            mode: AgentMode::Act,
+                            model: ModelId::new("default"),
                             prompt_template,
                             tools: vec![],
                             max_turns: 10,

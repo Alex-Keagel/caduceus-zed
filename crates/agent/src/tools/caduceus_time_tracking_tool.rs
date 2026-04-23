@@ -61,7 +61,7 @@ impl From<CaduceusTimeTrackingToolOutput> for LanguageModelToolResultContent {
 }
 
 pub struct CaduceusTimeTrackingTool {
-    tracker: Arc<Mutex<caduceus_bridge::orchestrator::BridgeTimeTracker>>,
+    tracker: Arc<Mutex<caduceus_bridge::orchestrator::TimeTracker>>,
 }
 
 impl CaduceusTimeTrackingTool {

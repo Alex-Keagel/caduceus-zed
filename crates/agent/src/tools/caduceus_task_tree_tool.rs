@@ -64,7 +64,7 @@ impl From<CaduceusTaskTreeToolOutput> for LanguageModelToolResultContent {
 }
 
 pub struct CaduceusTaskTreeTool {
-    tree: Arc<Mutex<caduceus_bridge::orchestrator::BridgeTaskTree>>,
+    tree: Arc<Mutex<caduceus_bridge::orchestrator::TaskTree>>,
 }
 
 impl CaduceusTaskTreeTool {

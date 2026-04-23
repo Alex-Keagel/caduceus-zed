@@ -1402,7 +1402,7 @@ impl NativeAgentConnection {
                 format!("```\n{}\n```", ascii)
             }
             "mode" => {
-                use caduceus_bridge::orchestrator::BridgeAgentMode;
+                use caduceus_bridge::orchestrator::AgentMode;
                 let mode_name = args.trim();
                 if mode_name.is_empty() {
                     let current = self
@@ -1418,7 +1418,7 @@ impl NativeAgentConnection {
                         .collect::<Vec<_>>()
                         .join(", ");
                     format!("Current mode: **{current}**\nAvailable: {available}")
-                } else if let Some(canonical) = BridgeAgentMode::from_str_loose(mode_name) {
+                } else if let Some(canonical) = AgentMode::from_str_loose(mode_name) {
                     let canonical_name = canonical.name().to_string();
                     let modes = self
                         .0
@@ -2156,7 +2156,7 @@ impl CaduceusSessionModes {
     /// ST-B5 / `catalog-opaque-v1` — the canonical catalog is the
     /// engine. Zed holds NO hardcoded mode list. We iterate the
     /// bridge's [`list_modes`](caduceus_bridge::orchestrator::list_modes)
-    /// and translate each [`BridgeModeDescriptor`] into an
+    /// and translate each [`ModeDescriptor`] into an
     /// [`acp::SessionMode`], preserving the descriptor's `name` as the
     /// opaque id ACP will hand back on `set_mode`. Adding or renaming
     /// a mode in the engine now reaches the IDE's picker with zero
