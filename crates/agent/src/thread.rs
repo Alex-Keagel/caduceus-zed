@@ -6481,6 +6481,207 @@ mod atomic_write_tests {
 }
 
 #[cfg(test)]
+mod caduceus_native_loop_tests {
+    //! ST-A9 — end-to-end wiring tests for the native-loop gate +
+    //! harness provisioning inside `try_run_turn_native`.
+    //!
+    //! The full turn round-trip (engine → fake LLM → translated events
+    //! → Thread.messages) is deliberately **not** exercised here; the
+    //! orchestrator requires a fair amount of scaffolding to run with a
+    //! real `AgentHarness` and the current ST-A2 baseline ships with an
+    //! empty `ToolRegistry` + empty system prompt — any tool-call the
+    //! model requests would fail at the engine boundary (tracked to
+    //! ST-B1/B2). Once ST-B lands, a richer E2E test belongs in the
+    //! G1g rollout session alongside flipping the feature flag ON.
+    //!
+    //! What *is* covered here:
+    //! 1. Flag OFF → `try_run_turn_native` returns false and the bridge
+    //!    is never provisioned.
+    //! 2. Flag ON + worktree → `ensure_caduceus_harness` populates
+    //!    bridge/state/cancel_token and reports newly-provisioned.
+    //! 3. Flag ON without a worktree → `ensure_caduceus_harness` errors
+    //!    out cleanly (legacy path keeps running — failure contract).
+
+    use super::*;
+    use agent_settings::AgentSettings;
+    use gpui::{TestAppContext, UpdateGlobal};
+    use settings::SettingsStore;
+    use std::sync::Arc;
+    use util::path;
+
+    /// Build a Thread sitting on top of a real in-memory worktree so
+    /// `ensure_caduceus_harness` can resolve a project root.
+    async fn setup_thread_with_worktree(cx: &mut TestAppContext) -> Entity<Thread> {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            AgentSettings::register(cx);
+        });
+
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/project"), serde_json::json!({})).await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let templates = Templates::new();
+
+        cx.update(|cx| {
+            let project_context = cx.new(|_cx| prompt_store::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| ContextServerRegistry::new(context_server_store, cx));
+            cx.new(|cx| {
+                Thread::new(
+                    project,
+                    project_context,
+                    context_server_registry,
+                    templates,
+                    None,
+                    cx,
+                )
+            })
+        })
+    }
+
+    fn enable_native_loop(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(
+                        r#"{ "agent": { "caduceus_native_loop": true } }"#,
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn flag_off_skips_native_provisioning(cx: &mut TestAppContext) {
+        let thread = setup_thread_with_worktree(cx).await;
+        // Setting is OFF by default (serde default=false).
+        cx.update(|cx| {
+            let provisioned = thread
+                .update(cx, |t, cx| t.ensure_caduceus_harness(cx))
+                .unwrap();
+            assert!(
+                !provisioned,
+                "ensure_caduceus_harness must be a no-op when caduceus_native_loop=false"
+            );
+            let t = thread.read(cx);
+            assert!(t.caduceus_bridge.is_none(), "bridge must stay None");
+            assert!(t.caduceus_native_state.is_none(), "native_state must stay None");
+            assert!(t.caduceus_cancel_token.is_none(), "cancel_token must stay None");
+            assert!(t.caduceus_harness.is_none(), "harness must stay None");
+        });
+    }
+
+    #[gpui::test]
+    async fn flag_on_with_worktree_provisions_bridge_and_state(cx: &mut TestAppContext) {
+        let thread = setup_thread_with_worktree(cx).await;
+        enable_native_loop(cx);
+
+        cx.update(|cx| {
+            let provisioned = thread
+                .update(cx, |t, cx| t.ensure_caduceus_harness(cx))
+                .unwrap();
+            assert!(
+                provisioned,
+                "ensure_caduceus_harness must report newly-provisioned when \
+                 caduceus_native_loop=true and a worktree exists"
+            );
+            let t = thread.read(cx);
+            assert!(t.caduceus_bridge.is_some(), "bridge must be Some");
+            assert!(
+                t.caduceus_native_state.is_some(),
+                "native_state must be Some"
+            );
+            assert!(
+                t.caduceus_cancel_token.is_some(),
+                "cancel_token must be Some"
+            );
+            // Harness itself is built lazily inside try_run_turn_native
+            // (ST-A2 phase 2) — NOT by ensure_caduceus_harness.
+            assert!(
+                t.caduceus_harness.is_none(),
+                "harness must still be None (built on first native turn)"
+            );
+            assert!(
+                !t.caduceus_native_loop_ready(),
+                "ready() requires harness + emitter, which are built per-turn"
+            );
+        });
+
+        // `ensure_caduceus_harness`'s idempotency gate is
+        // `caduceus_native_loop_ready()`, which requires the harness
+        // itself to be Some — and the harness is built lazily inside
+        // `try_run_turn_native` (phase 2), not here. Until the first
+        // native turn runs, repeat calls will re-allocate the bridge.
+        // That's documented behavior, not a bug: the bridge is cheap
+        // (no I/O in `new`) and becomes stable after turn 1.
+        cx.update(|cx| {
+            let provisioned_again = thread
+                .update(cx, |t, cx| t.ensure_caduceus_harness(cx))
+                .unwrap();
+            assert!(
+                provisioned_again,
+                "pre-harness calls rebuild bridge/state/token; becomes a no-op \
+                 only after try_run_turn_native populates caduceus_harness"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn flag_on_without_worktree_errors_cleanly(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            AgentSettings::register(cx);
+        });
+        enable_native_loop(cx);
+
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        // No worktree paths — `Project::test(fs, [], cx)` creates an
+        // empty project with zero worktrees. `ensure_caduceus_harness`
+        // must surface a clean error (not panic) and leave the fields
+        // None so legacy dispatch keeps running.
+        let project = Project::test(fs.clone(), [], cx).await;
+        let templates = Templates::new();
+
+        let thread = cx.update(|cx| {
+            let project_context = cx.new(|_cx| prompt_store::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| ContextServerRegistry::new(context_server_store, cx));
+            cx.new(|cx| {
+                Thread::new(
+                    project,
+                    project_context,
+                    context_server_registry,
+                    templates,
+                    None,
+                    cx,
+                )
+            })
+        });
+
+        cx.update(|cx| {
+            let res = thread.update(cx, |t, cx| t.ensure_caduceus_harness(cx));
+            assert!(
+                res.is_err(),
+                "ensure_caduceus_harness must return Err when flag is ON but no worktree exists"
+            );
+            let t = thread.read(cx);
+            assert!(
+                t.caduceus_bridge.is_none(),
+                "bridge must stay None after error (legacy path fallback contract)"
+            );
+        });
+
+        // Silence unused-import warning if Arc is not needed.
+        let _ = Arc::new(());
+    }
+}
+
+#[cfg(test)]
 mod native_dispatch_tests {
     //! G1d — exhaustive mapping tests for
     //! [`dispatch_translated_event`]. These pin the translator →
