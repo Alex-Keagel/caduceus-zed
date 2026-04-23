@@ -3093,6 +3093,18 @@ impl Thread {
             /// the `this.update` borrow so Phase 2 can build the tool
             /// dispatcher without a second `update` round-trip.
             enabled_tools: std::collections::BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>>,
+            /// NW-2: rendered base system prompt captured in Phase 1.
+            /// The engine's `effective_system_prompt` wraps this with
+            /// behavior_rules + mode block + envelope, so we pass only
+            /// the Zed-side project/tool-list content here — NOT the
+            /// mode prefix or behavior preamble (engine handles those).
+            system_prompt: String,
+            /// NW-2: Caduceus mode/lens strings to thread onto the
+            /// harness via `with_mode` + `with_mode_lens` so the
+            /// engine's `effective_system_prompt` includes the
+            /// `<agent_mode>` block and mode-driven defaults.
+            caduceus_mode: String,
+            caduceus_lens: Option<String>,
         }
 
         let setup = this.update(cx, |this, cx| -> Option<TurnSetup> {
@@ -3119,6 +3131,21 @@ impl Thread {
                 })
                 .unwrap_or_default();
             let enabled_tools = this.enabled_tools(cx);
+            // NW-2: render SystemPromptTemplate with the same inputs
+            // the legacy path uses. Engine adds behavior_rules + mode
+            // on top; we pass only the project-focused content here
+            // so nothing double-renders.
+            let available_tools: Vec<SharedString> =
+                enabled_tools.keys().cloned().collect();
+            let system_prompt = SystemPromptTemplate {
+                project: this.project_context.read(cx),
+                available_tools,
+                model_name: Some(model.name().0.to_string()),
+            }
+            .render(&this.templates)
+            .unwrap_or_default();
+            let caduceus_mode = this.caduceus_mode_from_profile().to_string();
+            let caduceus_lens = this.caduceus_lens_from_profile();
             Some(TurnSetup {
                 bridge,
                 model,
@@ -3129,6 +3156,9 @@ impl Thread {
                 emitter: this.caduceus_emitter.clone(),
                 dispatcher: this.caduceus_dispatcher.clone(),
                 enabled_tools,
+                system_prompt,
+                caduceus_mode,
+                caduceus_lens,
             })
         })?;
         let mut setup = match setup {
@@ -3252,13 +3282,30 @@ impl Thread {
                 as std::sync::Arc<dyn caduceus_providers::LlmAdapter>;
             let built = setup
                 .bridge
-                .harness(provider, tool_registry, "")
+                .harness(provider, tool_registry, setup.system_prompt.clone())
                 .with_emitter()
                 .with_reducer_sink()
                 .no_approval()
                 .build();
 
-            let harness_arc = std::sync::Arc::new(built.harness);
+            // NW-2: attach mode + lens so the engine's
+            // `effective_system_prompt` renders the `<agent_mode>`
+            // block on top of the SystemPromptTemplate output. We use
+            // `from_str_loose` which falls back to Plan / Normal on
+            // unknown strings — same policy as
+            // `mode_prompt_for_profile`.
+            let harness_with_mode = {
+                use caduceus_orchestrator::modes::{ActLens, AgentMode};
+                let mode = AgentMode::from_str_loose(&setup.caduceus_mode)
+                    .unwrap_or(AgentMode::Plan);
+                let lens = setup
+                    .caduceus_lens
+                    .as_deref()
+                    .and_then(ActLens::from_str_loose)
+                    .unwrap_or(ActLens::Normal);
+                built.harness.with_mode(mode).with_mode_lens(lens)
+            };
+            let harness_arc = std::sync::Arc::new(harness_with_mode);
             let emitter = built
                 .emitter
                 .expect("with_emitter() on HarnessBuilder guarantees Some");
