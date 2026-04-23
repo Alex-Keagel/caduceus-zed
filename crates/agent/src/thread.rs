@@ -3163,6 +3163,14 @@ impl Thread {
             }
             .render(&this.templates)
             .unwrap_or_default();
+            // Follow-up #2: native path must include the same Caduceus
+            // context block the legacy path builds (project instructions,
+            // wiki overview, pinned context, @mention resolution, cross-
+            // repo config, tool guide). Engine prepends behavior_rules +
+            // mode block on top — so we only append the Zed-side context
+            // here, matching `build_request_messages`.
+            let caduceus_guidance = this.build_caduceus_context_block(cx);
+            let system_prompt = format!("{system_prompt}{caduceus_guidance}");
             let caduceus_mode = this.caduceus_mode_from_profile().to_string();
             let caduceus_lens = this.caduceus_lens_from_profile();
             Some(TurnSetup {
@@ -4685,155 +4693,7 @@ impl Thread {
         };
 
         // Inject Caduceus tool guidance so the LLM knows when to use them
-        let caduceus_guidance = {
-            use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
-
-            // Budget: 12.5% of model context, capped at 4000 tokens
-            let model_limit = self.model_max_tokens() as usize;
-            let budget = (model_limit / 8).min(4000);
-            let mut assembler = ContextAssembler::new(budget);
-
-            if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
-                let root = worktree.read(cx).abs_path().to_path_buf();
-
-                // Project instructions (cached after first load)
-                let instr = if let Some(cached) = &self.cached_project_instructions {
-                    cached.clone()
-                } else {
-                    let orch = caduceus_bridge::orchestrator::OrchestratorBridge::new(&root);
-                    match orch.load_instructions() {
-                        Ok(i) if !i.system_prompt.is_empty() => {
-                            self.cached_project_instructions = Some(i.system_prompt.clone());
-                            i.system_prompt
-                        }
-                        Ok(_) => {
-                            self.cached_project_instructions = Some(String::new());
-                            String::new()
-                        }
-                        Err(e) => {
-                            log::warn!("[caduceus] Instructions load failed: {e}");
-                            String::new()
-                        }
-                    }
-                };
-                if !instr.is_empty() {
-                    assembler.add_source(ContextSource::Instructions(instr));
-                }
-
-                // Wiki overview (compact)
-                if let Some(overview) = caduceus_bridge::memory::get(
-                    &root,
-                    caduceus_bridge::memory::KEY_PROJECT_OVERVIEW,
-                ) {
-                    let compact: String = overview.chars().take(300).collect();
-                    assembler.add_source(ContextSource::MemoryBank(compact));
-                }
-
-                // Inject pinned context items (survive compaction)
-                for pin in self.context_pins.list_pins() {
-                    assembler.add_source(ContextSource::Pinned(format!(
-                        "[Pinned: {}] {}",
-                        pin.label, pin.content
-                    )));
-                }
-
-                // Resolve @mentions from the latest user message
-                if let Some(last_user_text) = self.messages.iter().rev().find_map(|m| {
-                    if let Message::User(u) = m {
-                        Some(
-                            u.content
-                                .iter()
-                                .filter_map(|c| {
-                                    if let UserMessageContent::Text(t) = c {
-                                        Some(t.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                        )
-                    } else {
-                        None
-                    }
-                }) {
-                    let resolver = caduceus_bridge::orchestrator::MentionResolver::new(&root);
-                    if let Ok(Some(resolved)) = resolver.resolve(&last_user_text) {
-                        if !resolved.is_empty() {
-                            let truncated: String = resolved.chars().take(2000).collect();
-                            assembler.add_source(ContextSource::FileContext {
-                                path: "@mention".to_string(),
-                                content: truncated,
-                                priority: 2,
-                            });
-                        }
-                    }
-                }
-
-                // Cross-repo context from project.json
-                let config_path = root.join(".caduceus").join("project.json");
-                if config_path.exists() {
-                    if let Ok(data) = std::fs::read_to_string(&config_path) {
-                        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
-                            let mut ctx = String::new();
-                            if let Some(n) = cfg["project"]["name"].as_str() {
-                                ctx.push_str(&format!("Project: {}\n", n));
-                            }
-                            if let Some(repos) = cfg["repos"].as_object() {
-                                for (name, repo) in repos {
-                                    let role = repo["role"].as_str().unwrap_or("?");
-                                    ctx.push_str(&format!("- {}: {}\n", name, role));
-                                }
-                            }
-                            if !ctx.is_empty() {
-                                assembler.add_source(ContextSource::Instructions(ctx));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Tool guidance — structured guide for the LLM
-            assembler.add_source(ContextSource::SystemPrompt(
-                "## Caduceus Tool Guide\n\
-                \n\
-                **Search & Understand**: caduceus_semantic_search (find code by meaning), caduceus_code_graph (dependencies), \
-                caduceus_tree_sitter (AST outline of a file), caduceus_cross_search (search across repos)\n\
-                **Read Code**: caduceus_git_read (git status/log/diff), caduceus_dependency_scan (vulnerabilities)\n\
-                **Plan & Track**: caduceus_prd (parse requirements), caduceus_task_decompose (break into parallel subtasks), \
-                caduceus_task_tree (hierarchical tasks), caduceus_kanban (board with worktree isolation)\n\
-                **Write & Edit**: Use edit_file/save_file for code. caduceus_project_wiki \
-                (file-based project wiki with auto-populate + per-page CRUD), caduceus_checkpoint (save/restore snapshots)\n\
-                **Memory**: caduceus_memory_read (recall facts), caduceus_memory_write (store facts). \
-                NOT caduceus_storage (that's for structured task persistence).\n\
-                **Security**: caduceus_security_scan (SAST), caduceus_mcp_security (MCP tool vetting), caduceus_policy (compliance)\n\
-                **Project**: caduceus_project (multi-repo config), caduceus_api_registry (API catalog), \
-                caduceus_architect (health score), caduceus_product (feature tracking)\n\
-                **Meta**: caduceus_progress (velocity), \
-                caduceus_telemetry (token usage), caduceus_time_tracking (session time)\n\
-                \n\
-                Rules: PERMISSION DENIED = the envelope preflight blocked this call; surface the error verbatim and try an alternative tool or fall back — do NOT ask the user to switch modes (the engine's behavior_rules preamble already covers this). \
-                LOOP DETECTED = try a different approach. \
-                Use edit_file for code changes, NOT terminal heredocs.\n\
-                **Verify-after-edit**: After making code changes, ALWAYS run `diagnostics` to check for errors. \
-                If errors are found, fix them before moving on. This is the verify step.\n\
-                **Show-before-apply**: For large changes (>20 lines), show a brief summary of what you'll change \
-                before applying edits. List files and the type of change (add/modify/delete).\n\
-                **Work incrementally**: Create files ONE AT A TIME, not all at once. \
-                After each file, confirm it was created successfully before moving to the next. \
-                Never try to create an entire project in a single response — break it into steps.\n\
-                Before spawning sub-agents: explain plan, wait for approval.".to_string()
-            ));
-
-            let assembled = assembler.assemble();
-            log::debug!(
-                "[caduceus] Context: {} tokens, {} included, {} truncated",
-                assembled.total_tokens,
-                assembled.sources_included.len(),
-                assembled.sources_truncated.len()
-            );
-            assembled.content
-        };
+        let caduceus_guidance = self.build_caduceus_context_block(cx);
 
         let system_prompt = format!("{system_prompt}{caduceus_guidance}");
         let mut messages = vec![LanguageModelRequestMessage {
@@ -4855,6 +4715,164 @@ impl Thread {
         }
 
         messages
+    }
+
+    /// Builds the Caduceus-side context block (project instructions, wiki
+    /// overview, pinned context, @mention resolution, cross-repo config,
+    /// tool guide) that is appended after the base system prompt.
+    ///
+    /// Shared between the legacy `build_request_messages` path and the
+    /// native-loop turn setup so both paths produce identical context —
+    /// previously the native path had only the bare `SystemPromptTemplate`
+    /// output and was missing @mentions / pinned / wiki overview.
+    pub(crate) fn build_caduceus_context_block(&mut self, cx: &App) -> String {
+        use caduceus_bridge::orchestrator::{ContextAssembler, ContextSource};
+
+        // Budget: 12.5% of model context, capped at 4000 tokens
+        let model_limit = self.model_max_tokens() as usize;
+        let budget = (model_limit / 8).min(4000);
+        let mut assembler = ContextAssembler::new(budget);
+
+        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
+            let root = worktree.read(cx).abs_path().to_path_buf();
+
+            // Project instructions (cached after first load)
+            let instr = if let Some(cached) = &self.cached_project_instructions {
+                cached.clone()
+            } else {
+                let orch = caduceus_bridge::orchestrator::OrchestratorBridge::new(&root);
+                match orch.load_instructions() {
+                    Ok(i) if !i.system_prompt.is_empty() => {
+                        self.cached_project_instructions = Some(i.system_prompt.clone());
+                        i.system_prompt
+                    }
+                    Ok(_) => {
+                        self.cached_project_instructions = Some(String::new());
+                        String::new()
+                    }
+                    Err(e) => {
+                        log::warn!("[caduceus] Instructions load failed: {e}");
+                        String::new()
+                    }
+                }
+            };
+            if !instr.is_empty() {
+                assembler.add_source(ContextSource::Instructions(instr));
+            }
+
+            // Wiki overview (compact)
+            if let Some(overview) = caduceus_bridge::memory::get(
+                &root,
+                caduceus_bridge::memory::KEY_PROJECT_OVERVIEW,
+            ) {
+                let compact: String = overview.chars().take(300).collect();
+                assembler.add_source(ContextSource::MemoryBank(compact));
+            }
+
+            // Inject pinned context items (survive compaction)
+            for pin in self.context_pins.list_pins() {
+                assembler.add_source(ContextSource::Pinned(format!(
+                    "[Pinned: {}] {}",
+                    pin.label, pin.content
+                )));
+            }
+
+            // Resolve @mentions from the latest user message
+            if let Some(last_user_text) = self.messages.iter().rev().find_map(|m| {
+                if let Message::User(u) = m {
+                    Some(
+                        u.content
+                            .iter()
+                            .filter_map(|c| {
+                                if let UserMessageContent::Text(t) = c {
+                                    Some(t.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    )
+                } else {
+                    None
+                }
+            }) {
+                let resolver = caduceus_bridge::orchestrator::MentionResolver::new(&root);
+                if let Ok(Some(resolved)) = resolver.resolve(&last_user_text) {
+                    if !resolved.is_empty() {
+                        let truncated: String = resolved.chars().take(2000).collect();
+                        assembler.add_source(ContextSource::FileContext {
+                            path: "@mention".to_string(),
+                            content: truncated,
+                            priority: 2,
+                        });
+                    }
+                }
+            }
+
+            // Cross-repo context from project.json
+            let config_path = root.join(".caduceus").join("project.json");
+            if config_path.exists() {
+                if let Ok(data) = std::fs::read_to_string(&config_path) {
+                    if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+                        let mut ctx = String::new();
+                        if let Some(n) = cfg["project"]["name"].as_str() {
+                            ctx.push_str(&format!("Project: {}\n", n));
+                        }
+                        if let Some(repos) = cfg["repos"].as_object() {
+                            for (name, repo) in repos {
+                                let role = repo["role"].as_str().unwrap_or("?");
+                                ctx.push_str(&format!("- {}: {}\n", name, role));
+                            }
+                        }
+                        if !ctx.is_empty() {
+                            assembler.add_source(ContextSource::Instructions(ctx));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tool guidance — structured guide for the LLM
+        assembler.add_source(ContextSource::SystemPrompt(
+            "## Caduceus Tool Guide\n\
+            \n\
+            **Search & Understand**: caduceus_semantic_search (find code by meaning), caduceus_code_graph (dependencies), \
+            caduceus_tree_sitter (AST outline of a file), caduceus_cross_search (search across repos)\n\
+            **Read Code**: caduceus_git_read (git status/log/diff), caduceus_dependency_scan (vulnerabilities)\n\
+            **Plan & Track**: caduceus_prd (parse requirements), caduceus_task_decompose (break into parallel subtasks), \
+            caduceus_task_tree (hierarchical tasks), caduceus_kanban (board with worktree isolation)\n\
+            **Write & Edit**: Use edit_file/save_file for code. caduceus_project_wiki \
+            (file-based project wiki with auto-populate + per-page CRUD), caduceus_checkpoint (save/restore snapshots)\n\
+            **Memory**: caduceus_memory_read (recall facts), caduceus_memory_write (store facts). \
+            NOT caduceus_storage (that's for structured task persistence).\n\
+            **Security**: caduceus_security_scan (SAST), caduceus_mcp_security (MCP tool vetting), caduceus_policy (compliance)\n\
+            **Project**: caduceus_project (multi-repo config), caduceus_api_registry (API catalog), \
+            caduceus_architect (health score), caduceus_product (feature tracking)\n\
+            **Meta**: caduceus_progress (velocity), \
+            caduceus_telemetry (token usage), caduceus_time_tracking (session time)\n\
+            \n\
+            Rules: PERMISSION DENIED = the envelope preflight blocked this call; surface the error verbatim and try an alternative tool or fall back — do NOT ask the user to switch modes (the engine's behavior_rules preamble already covers this). \
+            LOOP DETECTED = try a different approach. \
+            Use edit_file for code changes, NOT terminal heredocs.\n\
+            **Verify-after-edit**: After making code changes, ALWAYS run `diagnostics` to check for errors. \
+            If errors are found, fix them before moving on. This is the verify step.\n\
+            **Show-before-apply**: For large changes (>20 lines), show a brief summary of what you'll change \
+            before applying edits. List files and the type of change (add/modify/delete).\n\
+            **Work incrementally**: Create files ONE AT A TIME, not all at once. \
+            After each file, confirm it was created successfully before moving to the next. \
+            Never try to create an entire project in a single response — break it into steps.\n\
+            Before spawning sub-agents: explain plan, wait for approval.".to_string()
+        ));
+
+        let assembled = assembler.assemble();
+        log::debug!(
+            "[caduceus] Context: {} tokens, {} included, {} truncated",
+            assembled.total_tokens,
+            assembled.sources_included.len(),
+            assembled.sources_truncated.len()
+        );
+        assembled.content
     }
 
     pub fn to_markdown(&self) -> String {
