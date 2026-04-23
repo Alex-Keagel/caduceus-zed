@@ -3040,62 +3040,214 @@ impl Thread {
         }
     }
 
-    /// G1d: attempt the native-loop dispatch. Returns `Ok(true)` if
-    /// the native path fully handled the turn (caller returns), or
-    /// `Ok(false)` if the legacy path should be used. Returns `Err`
-    /// only on catastrophic failure (propagates out of the turn).
+    /// G1d → ST-A2: native-loop dispatch. Returns `Ok(true)` if the
+    /// native path fully handled the turn (caller returns immediately),
+    /// or `Ok(false)` if the legacy path should run.
     ///
-    /// **Current behavior (pre-provider-adapter):** emits a one-time
-    /// `EngineDiagnostic` when the setting is ON and the bridge can
-    /// be provisioned, then ALWAYS returns `Ok(false)`. This lets us
-    /// land the dispatch skeleton while the real provider adapter is
-    /// being built. Once `G1d-provider-adapter` lands, this function
-    /// flips to building the harness and driving
-    /// `run_caduceus_loop_translated`; the surrounding gate contract
-    /// does not change.
+    /// **What "native" does today:**
+    /// * Builds a per-session `AgentHarness` on first turn (cached on
+    ///   Thread; invalidated on model/mode change).
+    /// * Spawns a GPUI-foreground provider dispatcher that owns the
+    ///   zed `LanguageModel` and answers `DispatchRequest`s from the
+    ///   engine via `stream_completion`.
+    /// * Subscribes a fresh broadcast receiver per turn (ST-A2a) and
+    ///   bridges it into the mpsc `event_rx` that
+    ///   `run_caduceus_loop_translated` currently consumes.
+    /// * Bumps the cancel-token generation (ST-A2b / ST-A8) so stale
+    ///   cancels from a prior turn cannot poison this one.
+    /// * Acquires `caduceus_native_state` (async Mutex) so concurrent
+    ///   `try_run_turn_native` calls serialise correctly.
+    /// * Drives `dispatch_translated_event` off a `cx.spawn`'d
+    ///   consumer so every `TranslatedThreadEvent` routes to the
+    ///   ThreadEventStream.
+    ///
+    /// **Known limitations of this first cut (ST-A2 baseline, ST-B
+    /// fills in):** tools registry is empty — tool-calls requested by
+    /// the model will not execute. System prompt is empty. No
+    /// approval flow (`no_approval()`). These surface as
+    /// `EngineDiagnostic`s via the translator; full tool + approval
+    /// wiring is tracked by ST-B1/B2 on follow-up.
     async fn try_run_turn_native(
         this: &WeakEntity<Self>,
         event_stream: &ThreadEventStream,
         _cancellation_rx: &mut watch::Receiver<bool>,
         cx: &mut AsyncApp,
     ) -> Result<bool> {
-        let provisioned = this.update(cx, |this, cx| {
-            // `ensure_caduceus_harness` is a no-op when the setting
-            // is OFF and returns Ok(true) the first time it
-            // populates the bridge. We only care that the setting
-            // is ON *and* bridge provisioning didn't error.
-            let flag_on = agent_settings::AgentSettings::get_global(cx).caduceus_native_loop;
-            if !flag_on {
-                return false;
-            }
-            match this.ensure_caduceus_harness(cx) {
-                Ok(_) => this.caduceus_bridge.is_some(),
-                Err(err) => {
-                    log::warn!(
-                        "[native-loop] ensure_caduceus_harness failed: {err}; falling back to legacy"
-                    );
-                    false
-                }
-            }
-        })?;
+        use crate::caduceus_provider_adapter::{
+            DispatcherHandle, ZedLlmAdapter, dispatcher_channel, drive_dispatcher_fn,
+        };
 
-        if !provisioned {
-            return Ok(false);
+        // ── Phase 1: gate + extract synchronously ──────────────────
+        struct TurnSetup {
+            bridge: std::sync::Arc<caduceus_bridge::orchestrator::OrchestratorBridge>,
+            model: std::sync::Arc<dyn language_model::LanguageModel>,
+            user_input: String,
+            native_state:
+                std::sync::Arc<tokio::sync::Mutex<crate::caduceus_native_state::NativeLoopState>>,
+            cancel_token: caduceus_core::CancellationToken,
+            harness: Option<std::sync::Arc<caduceus_orchestrator::AgentHarness>>,
+            emitter: Option<caduceus_orchestrator::AgentEventEmitter>,
+            dispatcher: Option<DispatcherHandle>,
         }
 
-        // Gate check passed; emit the "not wired yet" diagnostic so
-        // integration tests can assert the setting is observed.
-        // When `G1d-provider-adapter` lands, replace this block with
-        // the harness build + `run_caduceus_loop_translated` + the
-        // biased select over (cancellation, translated_rx, harness).
-        event_stream.send_engine_diagnostic(
-            "native.provider_adapter_missing",
-            "caduceus_native_loop is enabled but the Zed LanguageModel → \
-             caduceus_providers::LlmAdapter adapter has not yet landed; \
-             falling back to the legacy turn loop. See todo G1d-provider-adapter.",
-            EngineDiagnosticSeverity::Warning,
-        );
-        Ok(false)
+        let setup = this.update(cx, |this, cx| -> Option<TurnSetup> {
+            let flag_on = agent_settings::AgentSettings::get_global(cx).caduceus_native_loop;
+            if !flag_on {
+                return None;
+            }
+            if let Err(err) = this.ensure_caduceus_harness(cx) {
+                log::warn!("[native-loop] ensure_caduceus_harness failed: {err}");
+                return None;
+            }
+            let bridge = this.caduceus_bridge.clone()?;
+            let native_state = this.caduceus_native_state.clone()?;
+            let cancel_token = this.caduceus_cancel_token.clone()?;
+            let model = this.model.clone()?;
+            let user_input = this
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    Message::User(u) => Some(u.to_markdown()),
+                    Message::Resume => Some("Continue where you left off.".to_string()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Some(TurnSetup {
+                bridge,
+                model,
+                user_input,
+                native_state,
+                cancel_token,
+                harness: this.caduceus_harness.clone(),
+                emitter: this.caduceus_emitter.clone(),
+                dispatcher: this.caduceus_dispatcher.clone(),
+            })
+        })?;
+        let mut setup = match setup {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        // ── Phase 2: lazy per-session harness build ────────────────
+        if setup.harness.is_none() {
+            let (disp_handle, disp_rx) = dispatcher_channel();
+            let model_for_dispatcher = setup.model.clone();
+            let cx_for_dispatcher = cx.clone();
+            cx.spawn(async move |_| {
+                drive_dispatcher_fn(disp_rx, move |req| {
+                    let m = model_for_dispatcher.clone();
+                    let mut cx2 = cx_for_dispatcher.clone();
+                    async move { m.stream_completion(req, &mut cx2).await }
+                })
+                .await;
+            })
+            .detach();
+
+            let provider_id =
+                caduceus_core::ProviderId::new(setup.model.provider_id().0.as_ref());
+            let provider = std::sync::Arc::new(ZedLlmAdapter::new(provider_id, disp_handle.clone()))
+                as std::sync::Arc<dyn caduceus_providers::LlmAdapter>;
+            let built = setup
+                .bridge
+                .harness(provider, caduceus_tools::ToolRegistry::new(), "")
+                .with_emitter()
+                .with_reducer_sink()
+                .no_approval()
+                .build();
+
+            let harness_arc = std::sync::Arc::new(built.harness);
+            let emitter = built
+                .emitter
+                .expect("with_emitter() on HarnessBuilder guarantees Some");
+
+            this.update(cx, |this, _| {
+                this.caduceus_harness = Some(harness_arc.clone());
+                this.caduceus_emitter = Some(emitter.clone());
+                this.caduceus_dispatcher = Some(disp_handle.clone());
+            })?;
+
+            setup.harness = Some(harness_arc);
+            setup.emitter = Some(emitter);
+            setup.dispatcher = Some(disp_handle);
+        }
+
+        let harness = setup.harness.expect("built in phase 2");
+        let emitter = setup.emitter.expect("built in phase 2");
+
+        // ── Phase 3: bump cancel generation (ST-A8) ────────────────
+        setup.cancel_token.bump_generation();
+        let turn_gen = setup.cancel_token.current_generation();
+
+        // ── Phase 4: serialise concurrent turns via state Mutex ────
+        let mut state_guard = setup.native_state.lock().await;
+        state_guard.turn_generation_at_lock = turn_gen;
+
+        // ── Phase 5: subscribe a FRESH broadcast receiver (ST-A2a)
+        // and bridge into the mpsc that run_caduceus_loop_translated
+        // currently consumes.
+        let mut broadcast_rx = emitter.subscribe();
+        let (turn_event_tx, turn_event_rx) =
+            tokio::sync::mpsc::channel::<caduceus_core::AgentEvent>(256);
+        let bridge_task = tokio::spawn(async move {
+            loop {
+                match broadcast_rx.recv().await {
+                    Ok(ev) => {
+                        if turn_event_tx.send(ev).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("[native-loop] broadcast lagged by {n} events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        // ── Phase 6: spawn translated consumer on GPUI foreground ──
+        let (trans_tx, mut trans_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream_for_consumer = event_stream.clone();
+        let consumer_task = cx.spawn(async move |_| {
+            while let Some(ev) = trans_rx.recv().await {
+                dispatch_translated_event(&ev, &stream_for_consumer);
+            }
+        });
+
+        // ── Phase 7: run the engine loop ───────────────────────────
+        let reducer = setup.bridge.new_reducer_handle();
+        let state_mut = &mut *state_guard;
+        let run_result = setup
+            .bridge
+            .run_caduceus_loop_translated(
+                &harness,
+                &mut state_mut.session,
+                &mut state_mut.history,
+                &setup.user_input,
+                reducer,
+                turn_event_rx,
+                trans_tx,
+            )
+            .await;
+
+        // ── Phase 8: drain + cleanup ───────────────────────────────
+        drop(state_guard);
+        bridge_task.abort();
+        consumer_task.await;
+
+        // `run_caduceus_loop_translated`'s TurnComplete/TurnError is
+        // already surfaced by `dispatch_translated_event`; the outer
+        // run_turn caller will send its own Stop on Ok(()). That's a
+        // harmless double-stop (receiver takes the first) — accepted
+        // cost of not plumbing a "native handled stop" signal yet.
+        if let Err(e) = run_result {
+            event_stream.send_engine_diagnostic(
+                "native.run_failed",
+                format!("caduceus native loop failed: {e}"),
+                EngineDiagnosticSeverity::Error,
+            );
+        }
+        Ok(true)
     }
 
     fn process_tool_result(
