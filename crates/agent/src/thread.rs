@@ -3076,6 +3076,7 @@ impl Thread {
         use crate::caduceus_provider_adapter::{
             DispatcherHandle, ZedLlmAdapter, dispatcher_channel, drive_dispatcher_fn,
         };
+        use crate::caduceus_tool_adapter as ct;
 
         // ── Phase 1: gate + extract synchronously ──────────────────
         struct TurnSetup {
@@ -3088,6 +3089,10 @@ impl Thread {
             harness: Option<std::sync::Arc<caduceus_orchestrator::AgentHarness>>,
             emitter: Option<caduceus_orchestrator::AgentEventEmitter>,
             dispatcher: Option<DispatcherHandle>,
+            /// NW-1: enabled-tools snapshot captured in Phase 1 under
+            /// the `this.update` borrow so Phase 2 can build the tool
+            /// dispatcher without a second `update` round-trip.
+            enabled_tools: std::collections::BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>>,
         }
 
         let setup = this.update(cx, |this, cx| -> Option<TurnSetup> {
@@ -3113,6 +3118,7 @@ impl Thread {
                     _ => None,
                 })
                 .unwrap_or_default();
+            let enabled_tools = this.enabled_tools(cx);
             Some(TurnSetup {
                 bridge,
                 model,
@@ -3122,6 +3128,7 @@ impl Thread {
                 harness: this.caduceus_harness.clone(),
                 emitter: this.caduceus_emitter.clone(),
                 dispatcher: this.caduceus_dispatcher.clone(),
+                enabled_tools,
             })
         })?;
         let mut setup = match setup {
@@ -3144,13 +3151,108 @@ impl Thread {
             })
             .detach();
 
+            // NW-1: tool-side dispatcher. Distinct from the provider
+            // dispatcher above — they carry different request types
+            // (`DispatchRequest` for tools vs the provider adapter's
+            // own request type). We run the tool-exec loop directly
+            // on `cx.spawn` (not via `caduceus_tool_adapter::drive`)
+            // because `drive()` requires `Send` futures and GPUI tool
+            // execution takes `&mut App` which is !Send. Concurrency
+            // is the gpui foreground executor's natural
+            // serialization; tools call each other through `cx.update`
+            // and progress is bounded by the main-thread queue.
+            let (tool_tx, mut tool_rx) =
+                tokio::sync::mpsc::channel::<ct::DispatchRequest>(ct::REQUEST_CHANNEL_CAP);
+            let tool_handle = ct::DispatcherHandle::new(tool_tx);
+
+            // Snapshot capture for the exec loop. Cloning the BTreeMap
+            // of `Arc<dyn AnyAgentTool>` is cheap. Mid-session tool-set
+            // changes don't mutate the harness's view — acceptable
+            // because profile switches already trigger
+            // `invalidate_caduceus_harness`.
+            let tool_map = setup.enabled_tools.clone();
+            let this_weak = this.clone();
+            cx.spawn(async move |cx_loop| {
+                while let Some(req) = tool_rx.recv().await {
+                    let ct::DispatchRequest {
+                        tool_name,
+                        input,
+                        respond_to,
+                    } = req;
+                    let Some(tool) = tool_map.get(tool_name.as_str()).cloned() else {
+                        let _ = respond_to.send(Err(ct::AdapterError::UnknownTool(tool_name)));
+                        continue;
+                    };
+                    let tool_use_id = language_model::LanguageModelToolUseId::from(
+                        format!("native-{}-{}", tool_name, uuid::Uuid::new_v4()),
+                    );
+                    // Run the Zed tool on the gpui main thread.
+                    let this_weak = this_weak.clone();
+                    let spawn_res = this_weak.update(cx_loop, |this, cx| {
+                        let fs = this.project.read(cx).fs().clone();
+                        let (_tx, cancellation_rx) = watch::channel(false);
+                        // Throwaway event stream: tool UI events go via
+                        // the engine's TranslatedThreadEvent::ToolCall
+                        // surface (see dispatch_translated_event). NW-3
+                        // upgrades this to the real Thread event stream
+                        // when approval routing lands.
+                        let (ev_tx, _ev_rx) = futures::channel::mpsc::unbounded();
+                        let throwaway_stream = ThreadEventStream(ev_tx);
+                        let stream = ToolCallEventStream::new(
+                            tool_use_id.clone(),
+                            throwaway_stream,
+                            Some(fs),
+                            cancellation_rx,
+                        );
+                        let input = ToolInput::ready(input);
+                        tool.clone().run(input, stream, cx)
+                    });
+                    let task = match spawn_res {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let _ = respond_to
+                                .send(Err(ct::AdapterError::Execution(e.to_string())));
+                            continue;
+                        }
+                    };
+                    let output = task.await;
+                    let (is_error, out) = match output {
+                        Ok(o) => (false, o),
+                        Err(o) => (true, o),
+                    };
+                    let text = match &out.llm_output {
+                        language_model::LanguageModelToolResultContent::Text(t) => t.to_string(),
+                        other => format!("{other:?}"),
+                    };
+                    let result = if is_error {
+                        caduceus_core::ToolResult::error(text)
+                    } else {
+                        caduceus_core::ToolResult::success(text)
+                    };
+                    let _ = respond_to.send(Ok(result));
+                }
+            })
+            .detach();
+
+            let tool_registry =
+                crate::caduceus_tool_adapter::build_zed_tool_registry(
+                    &setup.enabled_tools,
+                    tool_handle,
+                    |_| true,
+                )
+                .unwrap_or_else(|e| {
+                    log::warn!("[native-loop] build_zed_tool_registry failed: {e}; \
+                                falling back to empty registry");
+                    caduceus_tools::ToolRegistry::new()
+                });
+
             let provider_id =
                 caduceus_core::ProviderId::new(setup.model.provider_id().0.as_ref());
             let provider = std::sync::Arc::new(ZedLlmAdapter::new(provider_id, disp_handle.clone()))
                 as std::sync::Arc<dyn caduceus_providers::LlmAdapter>;
             let built = setup
                 .bridge
-                .harness(provider, caduceus_tools::ToolRegistry::new(), "")
+                .harness(provider, tool_registry, "")
                 .with_emitter()
                 .with_reducer_sink()
                 .no_approval()
