@@ -1738,6 +1738,12 @@ pub struct BuiltHarness {
     pub reducer_handle: Option<crate::dag_state::ReducerHandle>,
     pub event_rx: Option<tokio::sync::mpsc::Receiver<AgentEvent>>,
     pub replay_handle: Option<ReplayHandle>,
+    /// ST-A2c: a clone of the underlying [`AgentEventEmitter`] when one
+    /// was built. Long-lived (per-session) consumers hold this and call
+    /// `.subscribe()` at the start of each turn to get a fresh broadcast
+    /// receiver, bypassing the one-shot mpsc `event_rx`. Per-turn
+    /// consumers that still take ownership of `event_rx` are unaffected.
+    pub emitter: Option<AgentEventEmitter>,
 }
 
 impl<'a> HarnessBuilder<'a> {
@@ -1827,14 +1833,15 @@ impl<'a> HarnessBuilder<'a> {
             }
         };
 
-        let (event_rx, replay_handle) = match emitter {
-            EmitterChoice::None => (None, None),
+        let (event_rx, replay_handle, emitter_clone) = match emitter {
+            EmitterChoice::None => (None, None, None),
             EmitterChoice::AutoDefault => {
                 let (em, rx) =
                     AgentEventEmitter::channel(OrchestratorBridge::DEFAULT_EVENT_CHANNEL_BUFFER);
                 let replay = ReplayHandle::new(em.clone());
+                let em_for_subscribe = em.clone();
                 base = base.with_emitter(em);
-                (Some(rx), Some(replay))
+                (Some(rx), Some(replay), Some(em_for_subscribe))
             }
         };
 
@@ -1866,6 +1873,7 @@ impl<'a> HarnessBuilder<'a> {
             reducer_handle,
             event_rx,
             replay_handle,
+            emitter: emitter_clone,
         }
     }
 }
