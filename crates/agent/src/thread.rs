@@ -1150,6 +1150,11 @@ pub struct Thread {
     /// engine cancel flips this; the harness cooperates via its internal
     /// `select!`.
     caduceus_cancel_token: Option<caduceus_core::CancellationToken>,
+    /// ST-A2d: long-lived emitter clone from the per-session harness.
+    /// Per-turn code calls `.subscribe()` to get a fresh broadcast
+    /// receiver that delivers events for the current generation only.
+    /// Populated together with `caduceus_harness`; invalidated with it.
+    caduceus_emitter: Option<caduceus_orchestrator::AgentEventEmitter>,
     /// Cached total token estimate (invalidated on message changes).
     /// `Cell` allows population from `&self` callers — the cached value is
     /// observation-only state and never affects logical equality of Thread.
@@ -1303,6 +1308,7 @@ impl Thread {
             caduceus_harness: None,
             caduceus_native_state: None,
             caduceus_cancel_token: None,
+            caduceus_emitter: None,
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
@@ -1558,6 +1564,7 @@ impl Thread {
             caduceus_harness: None,
             caduceus_native_state: None,
             caduceus_cancel_token: None,
+            caduceus_emitter: None,
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
@@ -1718,24 +1725,33 @@ impl Thread {
             && self.caduceus_bridge.is_some()
     }
 
-    /// Drops the harness, state, cancel token, and bridge handle so
-    /// the next `ensure_caduceus_harness` rebuilds them. Cheap:
-    /// dropping an Arc is O(1); the async mutex's inner drop is Send.
-    /// Safe to call from `&mut self` contexts; never blocks.
+    /// Drops the harness, state, cancel token, emitter, and bridge
+    /// handle so the next `ensure_caduceus_harness` rebuilds them.
+    /// Cheap: dropping an Arc is O(1); the async mutex's inner drop is
+    /// Send. Safe to call from `&mut self` contexts; never blocks.
     pub fn invalidate_caduceus_harness(&mut self) {
         self.caduceus_harness = None;
         self.caduceus_native_state = None;
         self.caduceus_cancel_token = None;
+        self.caduceus_emitter = None;
         // Intentionally keep `caduceus_bridge` — the bridge itself
         // (ContextManager config, native_loop flag) outlives the
         // harness. If the flag was the reason for invalidation the
         // caller is expected to update the flag separately.
     }
 
-    /// Idempotent lazy constructor. Populates the four native-loop
+    /// Idempotent lazy constructor. Populates the native-loop
     /// fields iff the `caduceus_native_loop` setting is ON. Returns
     /// `true` if provisioning happened in this call, `false` if
     /// already provisioned (no-op) or the flag is OFF.
+    ///
+    /// ST-A2d: also populates `caduceus_native_state` (previously
+    /// discarded) and leaves `caduceus_cancel_token` populated so a
+    /// subsequent turn can bump its generation. The `AgentHarness`
+    /// itself (`caduceus_harness`) + its `caduceus_emitter` are still
+    /// built lazily by `try_run_turn_native` in ST-A2, because that's
+    /// where the provider adapter + tool registry + system prompt are
+    /// known.
     ///
     /// Failure modes (return `Err`): no worktree, bridge build
     /// failure. On any error the fields stay `None` and the legacy
@@ -1768,24 +1784,18 @@ impl Thread {
             crate::caduceus_native_state::NativeLoopState::new(root.clone()),
         ));
 
-        // Harness build is deferred to G1b-tool-adapter / G1d — at
-        // that point we know the Zed tool registry and can wire the
-        // ZedToolAdapter. For G1a we only set up the bridge + state;
-        // `caduceus_harness` stays `None` until the first native
-        // turn actually constructs it. `caduceus_native_loop_ready()`
-        // therefore still returns `false` here, which is correct:
-        // dispatch should fall through to the legacy path until the
-        // G1d sub-task lands.
-        let _ = cancel_token;
-        let _ = state;
-
+        // ST-A2d: stash bridge + cancel token + native state so
+        // `try_run_turn_native` (ST-A2) can build the harness lazily
+        // with full turn context (provider, tools, system prompt).
+        // The harness and its emitter clone are populated there, not
+        // here. `caduceus_native_loop_ready()` therefore still reports
+        // `false` until the first native turn completes ensure-harness
+        // + emitter population, which is the correct invariant for
+        // `run_turn_internal` dispatch (legacy path remains until
+        // harness is fully built).
         self.caduceus_bridge = Some(bridge);
-        // Re-assert: until G1b/G1d, harness + state + token stay
-        // None so `caduceus_native_loop_ready()` reports false and
-        // `run_turn_internal` keeps using the legacy body. Landing
-        // G1a-settings + G1a-harness-field alone is a no-op at the
-        // UI layer; the observable change is the bridge field
-        // existing.
+        self.caduceus_cancel_token = Some(cancel_token);
+        self.caduceus_native_state = Some(state);
         Ok(true)
     }
 
