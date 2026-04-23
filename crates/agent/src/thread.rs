@@ -7458,3 +7458,275 @@ mod native_dispatch_tests {
         });
     }
 }
+
+#[cfg(test)]
+mod route_native_permission_tests {
+    //! C1 — approval round-trip integration tests for
+    //! [`route_native_permission_request`]. These pin:
+    //!   * NW-3 contract: `id` received from the engine is forwarded
+    //!     back on `approval_tx` verbatim (no `perm_` re-prefix).
+    //!   * A2 fast-path: user-configured always_allow / always_deny
+    //!     rules short-circuit the interactive UI and auto-respond on
+    //!     `approval_tx` with a diagnostic surfaced on the stream.
+    //!   * Legacy fall-through: when the engine omits `raw_input`
+    //!     (old build) we fall through to the interactive prompt.
+    //!   * `extract_match_inputs` behavior: top-level-string-only.
+    //!
+    //! These would have caught the NW-3 double-prefix regression that
+    //! was only found by a rubber-duck review.
+    use super::*;
+    use agent_settings::AgentSettings;
+    use futures::StreamExt;
+    use futures::channel::mpsc as fmpsc;
+    use gpui::{TestAppContext, UpdateGlobal};
+    use settings::SettingsStore;
+    use tokio::sync::mpsc as tmpsc;
+
+    fn init_settings(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            AgentSettings::register(cx);
+        });
+    }
+
+    fn set_user_settings_json(cx: &mut TestAppContext, json: &str) {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.set_user_settings(json, cx).unwrap();
+            });
+        });
+    }
+
+    fn make_stream() -> (ThreadEventStream, fmpsc::UnboundedReceiver<Result<ThreadEvent>>) {
+        let (tx, rx) = fmpsc::unbounded::<Result<ThreadEvent>>();
+        (ThreadEventStream(tx), rx)
+    }
+
+    fn drain(rx: &mut fmpsc::UnboundedReceiver<Result<ThreadEvent>>) -> Vec<ThreadEvent> {
+        let mut out = Vec::new();
+        while let Ok(Some(item)) = rx.try_next() {
+            out.push(item.expect("stream only carries Ok"));
+        }
+        out
+    }
+
+    // ── extract_match_inputs (pure) ──
+
+    #[test]
+    fn extract_match_inputs_collects_top_level_strings() {
+        let raw = serde_json::json!({
+            "command": "ls -la",
+            "cwd": "/tmp",
+            "timeout_ms": 30_000,
+            "env": { "FOO": "bar" },
+        });
+        let mut inputs = extract_match_inputs(&raw);
+        inputs.sort();
+        assert_eq!(inputs, vec!["/tmp".to_string(), "ls -la".to_string()]);
+    }
+
+    #[test]
+    fn extract_match_inputs_non_object_yields_empty() {
+        assert!(extract_match_inputs(&serde_json::json!("not an object")).is_empty());
+        assert!(extract_match_inputs(&serde_json::json!(42)).is_empty());
+        assert!(extract_match_inputs(&serde_json::json!([1, 2, 3])).is_empty());
+        assert!(extract_match_inputs(&serde_json::json!(null)).is_empty());
+    }
+
+    #[test]
+    fn extract_match_inputs_skips_nested_strings() {
+        let raw = serde_json::json!({
+            "path": "/etc/shadow",
+            "metadata": { "nested_string": "SHOULD NOT APPEAR" },
+        });
+        let inputs = extract_match_inputs(&raw);
+        assert_eq!(inputs, vec!["/etc/shadow".to_string()]);
+    }
+
+    // ── NW-3: id pass-through (the most important regression guard) ──
+
+    #[gpui::test]
+    async fn nw3_id_passes_through_verbatim_on_auto_allow(cx: &mut TestAppContext) {
+        init_settings(cx);
+        // Rule: always allow `terminal` when command matches `^ls `.
+        set_user_settings_json(
+            cx,
+            r#"{
+                "agent": {
+                    "tool_permissions": {
+                        "tools": {
+                            "terminal": { "always_allow": [{"pattern": "^ls "}] }
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        let (approval_tx, mut approval_rx) = tmpsc::channel::<(String, bool)>(4);
+        let (stream, mut stream_rx) = make_stream();
+        let raw_input = serde_json::json!({ "command": "ls -la" });
+        let engine_id = "perm_abc123";
+
+        cx.spawn(async move |mut async_cx| {
+            route_native_permission_request(
+                engine_id,
+                "terminal",
+                "run ls -la",
+                Some(&raw_input),
+                &stream,
+                approval_tx,
+                &mut async_cx,
+            );
+        })
+        .detach();
+
+        cx.run_until_parked();
+
+        let (key, allowed) = approval_rx
+            .try_recv()
+            .expect("auto-allow must respond immediately");
+        assert_eq!(
+            key, "perm_abc123",
+            "id MUST pass through verbatim — no `perm_` re-prefix (NW-3 regression guard)"
+        );
+        assert!(allowed, "always_allow rule must resolve to true");
+
+        // Diagnostic surfaced; no ToolCallAuthorization emitted.
+        let events = drain(&mut stream_rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ThreadEvent::EngineDiagnostic(d) if d.kind == "permission.auto_allow")),
+            "expected permission.auto_allow diagnostic, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, ThreadEvent::ToolCallAuthorization { .. })),
+            "UI prompt must NOT be emitted on auto-allow"
+        );
+    }
+
+    #[gpui::test]
+    async fn a2_auto_deny_responds_false(cx: &mut TestAppContext) {
+        init_settings(cx);
+        set_user_settings_json(
+            cx,
+            r#"{
+                "agent": {
+                    "tool_permissions": {
+                        "tools": {
+                            "terminal": { "always_deny": [{"pattern": "rm -rf"}] }
+                        }
+                    }
+                }
+            }"#,
+        );
+
+        let (approval_tx, mut approval_rx) = tmpsc::channel::<(String, bool)>(4);
+        let (stream, mut stream_rx) = make_stream();
+        let raw_input = serde_json::json!({ "command": "rm -rf /" });
+
+        cx.spawn(async move |mut async_cx| {
+            route_native_permission_request(
+                "perm_xyz",
+                "terminal",
+                "destructive",
+                Some(&raw_input),
+                &stream,
+                approval_tx,
+                &mut async_cx,
+            );
+        })
+        .detach();
+
+        cx.run_until_parked();
+
+        let (key, allowed) = approval_rx.try_recv().expect("auto-deny must respond");
+        assert_eq!(key, "perm_xyz");
+        assert!(!allowed, "always_deny rule must resolve to false");
+
+        let events = drain(&mut stream_rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ThreadEvent::EngineDiagnostic(d) if d.kind == "permission.auto_deny")),
+            "expected permission.auto_deny diagnostic, got {events:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn no_raw_input_falls_through_to_interactive_prompt(cx: &mut TestAppContext) {
+        init_settings(cx);
+
+        let (approval_tx, mut approval_rx) = tmpsc::channel::<(String, bool)>(4);
+        let (stream, mut stream_rx) = make_stream();
+
+        cx.spawn(async move |mut async_cx| {
+            route_native_permission_request(
+                "perm_legacy",
+                "terminal",
+                "ls",
+                None, // legacy engine build pre-A1
+                &stream,
+                approval_tx,
+                &mut async_cx,
+            );
+        })
+        .detach();
+
+        cx.run_until_parked();
+
+        // No auto-response on approval_tx.
+        assert!(
+            approval_rx.try_recv().is_err(),
+            "legacy path must NOT auto-respond"
+        );
+
+        // UI prompt emitted.
+        let events = drain(&mut stream_rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ThreadEvent::ToolCallAuthorization { .. })),
+            "expected ToolCallAuthorization for interactive prompt, got {events:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn raw_input_but_no_rule_falls_through_to_prompt(cx: &mut TestAppContext) {
+        init_settings(cx);
+        // No user rules configured for `terminal` → default Confirm.
+
+        let (approval_tx, mut approval_rx) = tmpsc::channel::<(String, bool)>(4);
+        let (stream, mut stream_rx) = make_stream();
+        let raw_input = serde_json::json!({ "command": "some-novel-cmd" });
+
+        cx.spawn(async move |mut async_cx| {
+            route_native_permission_request(
+                "perm_nomatch",
+                "terminal",
+                "novel",
+                Some(&raw_input),
+                &stream,
+                approval_tx,
+                &mut async_cx,
+            );
+        })
+        .detach();
+
+        cx.run_until_parked();
+
+        assert!(
+            approval_rx.try_recv().is_err(),
+            "no-matching-rule path must NOT auto-respond"
+        );
+
+        let events = drain(&mut stream_rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ThreadEvent::ToolCallAuthorization { .. })),
+            "expected ToolCallAuthorization on fall-through, got {events:?}"
+        );
+    }
+}
