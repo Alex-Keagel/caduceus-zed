@@ -5602,17 +5602,28 @@ fn dispatch_translated_event(
         T::AgentThinking(text) => stream.send_thinking(text),
         T::AgentThinkingComplete { content, .. } => stream.send_thinking(content),
 
-        // Tool lifecycle. These aren't enough to reconstruct a full
-        // `acp::ToolCall` (missing kind/title) without Zed-side
-        // metadata. Provider-adapter PR supplies the missing bits;
-        // for now surface them as diagnostics so a live trace is
-        // visible end-to-end in integration tests.
+        // Tool lifecycle → real `acp::ToolCall` / `acp::ToolCallUpdate`
+        // events so the panel renders proper tool-call cards. We don't
+        // have a resolved Zed-side tool reference here (no Tool trait
+        // object, no `initial_title`, no rich `kind`), so we use the
+        // raw tool name as the title and `ToolKind::Other` as the kind.
+        // Input-delta streaming isn't aggregated per-id at this layer
+        // (that would require session state) — the complete raw input
+        // is available on `ToolResult` via the engine, but the wire
+        // event only carries the output. A richer mapping that wires
+        // `tool.initial_title` + `tool.kind` will land with the
+        // provider-adapter follow-up that knows which Tool an id
+        // belongs to.
         T::ToolCallStart { id, name } => {
-            stream.send_engine_diagnostic(
-                "tool.call.start",
-                format!("{name} id={id}"),
-                EngineDiagnosticSeverity::Info,
-            );
+            stream
+                .0
+                .unbounded_send(Ok(ThreadEvent::ToolCall(
+                    acp::ToolCall::new(id.to_string(), name.to_string())
+                        .kind(acp::ToolKind::Other)
+                        .status(acp::ToolCallStatus::Pending)
+                        .meta(acp_thread::meta_with_tool_name(name)),
+                )))
+                .ok();
         }
         T::ToolCallInputDelta { id, delta } => {
             stream.send_engine_diagnostic(
@@ -5622,27 +5633,39 @@ fn dispatch_translated_event(
             );
         }
         T::ToolCallInputEnd { id } => {
-            stream.send_engine_diagnostic(
-                "tool.call.input_end",
-                format!("id={id}"),
-                EngineDiagnosticSeverity::Info,
-            );
+            // Input streaming done; tool is about to execute. Flip
+            // status to InProgress so the card shows a spinner.
+            stream
+                .0
+                .unbounded_send(Ok(ThreadEvent::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(
+                        id.to_string(),
+                        acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
+                    )
+                    .into(),
+                )))
+                .ok();
         }
         T::ToolResult {
             id,
             content,
             is_error,
         } => {
-            let severity = if *is_error {
-                EngineDiagnosticSeverity::Warning
+            let status = if *is_error {
+                acp::ToolCallStatus::Failed
             } else {
-                EngineDiagnosticSeverity::Info
+                acp::ToolCallStatus::Completed
             };
-            stream.send_engine_diagnostic(
-                "tool.result",
-                format!("id={id} is_error={is_error} bytes={}", content.len()),
-                severity,
-            );
+            let fields = acp::ToolCallUpdateFields::new()
+                .status(status)
+                .content(vec![content.clone().into()])
+                .raw_output(serde_json::Value::String(content.clone()));
+            stream
+                .0
+                .unbounded_send(Ok(ThreadEvent::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(id.to_string(), fields).into(),
+                )))
+                .ok();
         }
 
         // Permission — surface as warning. Real routing to

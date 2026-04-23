@@ -642,7 +642,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         }
     }
@@ -695,7 +695,8 @@ mod tests {
                 description: "search".into(),
                 input_schema: serde_json::json!({"type":"object"}),
                 required_capability: None,
-            }],
+            }]
+            .into(),
             logprobs: None,
         };
         let lm = translate_chat_request(&req);
