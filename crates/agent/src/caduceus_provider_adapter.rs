@@ -735,6 +735,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         }
     }
 
@@ -862,6 +864,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         let lm = translate_chat_request(&req);
         assert_eq!(lm.messages[0].role, Role::Assistant);
@@ -1125,6 +1129,32 @@ mod tests {
     }
 
     // ─────────────────────────── T3 — bridge adapter drops ─────────────────
+
+    #[test]
+    fn fu2_thinking_effort_and_speed_forward_through_translate() {
+        let mut req = mk_req(vec![mk_user_msg("hello")]);
+        req.thinking_effort = Some("high".into());
+        req.speed = Some(caduceus_providers::Speed::Fast);
+        let lm = translate_chat_request(&req);
+        assert_eq!(lm.thinking_effort.as_deref(), Some("high"));
+        assert_eq!(lm.speed, Some(language_model::Speed::Fast));
+    }
+
+    #[test]
+    fn fu2_none_fields_stay_none() {
+        let req = mk_req(vec![mk_user_msg("hello")]);
+        let lm = translate_chat_request(&req);
+        assert_eq!(lm.thinking_effort, None);
+        assert_eq!(lm.speed, None);
+    }
+
+    #[test]
+    fn fu2_speed_standard_maps_to_zed_standard() {
+        let mut req = mk_req(vec![mk_user_msg("hello")]);
+        req.speed = Some(caduceus_providers::Speed::Standard);
+        let lm = translate_chat_request(&req);
+        assert_eq!(lm.speed, Some(language_model::Speed::Standard));
+    }
 
     #[test]
     fn t3_i7_image_block_round_trips_to_message_content_image() {
