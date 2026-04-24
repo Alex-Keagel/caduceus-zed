@@ -708,6 +708,47 @@ pub enum ThreadEvent {
     /// reducer failure, envelope violation. Carries a severity level
     /// so the UI can decide whether to surface a banner.
     EngineDiagnostic(EngineDiagnostic),
+    /// Native-loop — per-turn token usage snapshot emitted at turn
+    /// boundary, BEFORE the corresponding `Stop(reason)` event. The
+    /// engine's `TurnComplete` carries a `TokenUsage` payload (wiring
+    /// plan part 1 L269 / L443 / L837 + H2 note at
+    /// `event_translator.rs:129-130`) that the translator preserves;
+    /// previously the dispatcher dropped this with a `..` pattern and
+    /// the UI had no way to update its per-turn token meter without
+    /// round-tripping to the reducer. This variant surfaces the
+    /// structured payload so the UI (or a downstream observer) can
+    /// update its meter directly off the stream.
+    ///
+    /// Emitted once per turn, always immediately before `Stop`. Legacy
+    /// ACP consumers (`agent.rs:1961+`) log-and-drop; native consumers
+    /// can render a token-usage badge.
+    UsageUpdated(NativeTokenUsage),
+}
+
+/// Payload for [`ThreadEvent::UsageUpdated`]. Mirrors
+/// `caduceus_bridge::event_translator::TokenUsageMirror` (which itself
+/// mirrors `caduceus_core::TokenUsage`) — decoupled as a thread-local
+/// struct so the public `ThreadEvent` surface does not leak bridge
+/// internals to legacy consumers that never opt into the native loop.
+/// Named `NativeTokenUsage` (not `TokenUsage`) to avoid colliding with
+/// `language_model::TokenUsage` which is already in scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeTokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_write_tokens: u32,
+}
+
+impl From<caduceus_bridge::event_translator::TokenUsageMirror> for NativeTokenUsage {
+    fn from(m: caduceus_bridge::event_translator::TokenUsageMirror) -> Self {
+        Self {
+            input_tokens: m.input_tokens,
+            output_tokens: m.output_tokens,
+            cache_read_tokens: m.cache_read_tokens,
+            cache_write_tokens: m.cache_write_tokens,
+        }
+    }
 }
 
 /// Payload for [`ThreadEvent::ContextNotice`]. Informational; the turn
@@ -5999,8 +6040,15 @@ fn dispatch_translated_event(
         }
 
         // Turn lifecycle.
-        T::TurnComplete { stop, .. } => {
+        T::TurnComplete { stop, usage } => {
             use caduceus_bridge::event_translator::StopReasonKind as K;
+            // Emit structured usage BEFORE Stop — H2 contract per
+            // event_translator.rs:129-130. Callers that exit on Stop
+            // still see the usage event first thanks to ordering.
+            stream
+                .0
+                .unbounded_send(Ok(ThreadEvent::UsageUpdated((*usage).into())))
+                .ok();
             let reason = match stop {
                 K::EndTurn => acp::StopReason::EndTurn,
                 K::ToolUse => acp::StopReason::EndTurn,
@@ -7408,13 +7456,30 @@ mod native_dispatch_tests {
         });
     }
 
+    /// Helper — `TurnComplete` now emits `UsageUpdated` first then
+    /// `Stop`. The Stop-reason mapping tests only care about the Stop;
+    /// this helper skips the leading UsageUpdated and hands back the
+    /// tail so the original assert_one pattern still works.
+    fn assert_usage_then<F: FnOnce(&ThreadEvent)>(evs: &[ThreadEvent], check: F) {
+        assert_eq!(
+            evs.len(),
+            2,
+            "TurnComplete must emit UsageUpdated then Stop (got {evs:?})"
+        );
+        match &evs[0] {
+            ThreadEvent::UsageUpdated(_) => {}
+            other => panic!("expected UsageUpdated as first event, got {other:?}"),
+        }
+        check(&evs[1]);
+    }
+
     #[test]
     fn turn_complete_end_turn_maps_to_stop_end_turn() {
         let evs = dispatch_one(T::TurnComplete {
             stop: TStop::EndTurn,
             usage: TokenUsageMirror::default(),
         });
-        assert_one(&evs, |e| match e {
+        assert_usage_then(&evs, |e| match e {
             ThreadEvent::Stop(acp::StopReason::EndTurn) => {}
             other => panic!("expected Stop(EndTurn), got {other:?}"),
         });
@@ -7426,7 +7491,7 @@ mod native_dispatch_tests {
             stop: TStop::MaxTokens,
             usage: TokenUsageMirror::default(),
         });
-        assert_one(&evs, |e| match e {
+        assert_usage_then(&evs, |e| match e {
             ThreadEvent::Stop(acp::StopReason::MaxTokens) => {}
             other => panic!("expected Stop(MaxTokens), got {other:?}"),
         });
@@ -7441,10 +7506,42 @@ mod native_dispatch_tests {
             stop: TStop::BudgetExceeded,
             usage: TokenUsageMirror::default(),
         });
-        assert_one(&evs, |e| match e {
+        assert_usage_then(&evs, |e| match e {
             ThreadEvent::Stop(acp::StopReason::MaxTokens) => {}
             other => panic!("expected Stop(MaxTokens), got {other:?}"),
         });
+    }
+
+    #[test]
+    fn turn_complete_forwards_usage_payload_before_stop() {
+        // R2-1 regression guard: `TurnComplete.usage` must be
+        // preserved all the way to `ThreadEvent::UsageUpdated` without
+        // field-dropping, AND emitted before the terminal `Stop` so a
+        // meter consumer that exits on Stop still sees the update.
+        let usage = TokenUsageMirror {
+            input_tokens: 1_234,
+            output_tokens: 567,
+            cache_read_tokens: 100,
+            cache_write_tokens: 42,
+        };
+        let evs = dispatch_one(T::TurnComplete {
+            stop: TStop::EndTurn,
+            usage,
+        });
+        assert_eq!(evs.len(), 2, "expected UsageUpdated + Stop, got {evs:?}");
+        match &evs[0] {
+            ThreadEvent::UsageUpdated(u) => {
+                assert_eq!(u.input_tokens, 1_234);
+                assert_eq!(u.output_tokens, 567);
+                assert_eq!(u.cache_read_tokens, 100);
+                assert_eq!(u.cache_write_tokens, 42);
+            }
+            other => panic!("expected UsageUpdated first, got {other:?}"),
+        }
+        match &evs[1] {
+            ThreadEvent::Stop(acp::StopReason::EndTurn) => {}
+            other => panic!("expected Stop(EndTurn) second, got {other:?}"),
+        }
     }
 
     #[test]

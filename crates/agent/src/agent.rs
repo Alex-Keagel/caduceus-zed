@@ -1983,6 +1983,21 @@ impl NativeAgentConnection {
                                     diag.detail
                                 );
                             }
+                            ThreadEvent::UsageUpdated(usage) => {
+                                // Native-loop-only: per-turn token
+                                // meter. Legacy ACP path has no meter
+                                // UI hook, so log-and-drop. Native
+                                // panel consumers wire this directly
+                                // off the stream before reaching this
+                                // consumer.
+                                log::debug!(
+                                    "UsageUpdated: in={} out={} cache_r={} cache_w={}",
+                                    usage.input_tokens,
+                                    usage.output_tokens,
+                                    usage.cache_read_tokens,
+                                    usage.cache_write_tokens,
+                                );
+                            }
                         }
                     }
                     Err(e) => {
