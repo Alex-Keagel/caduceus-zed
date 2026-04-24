@@ -7727,12 +7727,294 @@ mod native_dispatch_tests {
 }
 
 #[cfg(test)]
+mod native_turn_e2e_tests {
+    //! NW-4 — headless full-turn E2E harness.
+    //!
+    //! The GUI dogfood flow (flag ON → user sends a message → engine
+    //! reasons, calls tools, returns content, ends turn) traverses a
+    //! fixed translator → dispatcher → `ThreadEvent` pipeline. This
+    //! harness scripts a realistic turn as a sequence of
+    //! `TranslatedThreadEvent`s and asserts the full, ordered
+    //! `ThreadEvent` output the UI would observe.
+    //!
+    //! This substitutes for the manual GUI smoke in the G1g rollout
+    //! gate: anything the human tester would visually confirm (tool
+    //! card appears, per-turn token meter ticks, Stop fires) is pinned
+    //! here as a programmatic contract. Future regressions in the
+    //! translator / dispatcher will fail this test before a human
+    //! tester ever loads Zed.
+
+    use super::*;
+    use caduceus_bridge::event_translator::{
+        StopReasonKind as TStop, TokenUsageMirror, TranslatedThreadEvent as T,
+    };
+    use futures::channel::mpsc;
+
+    /// Dispatch a scripted turn end-to-end and collect every
+    /// `ThreadEvent` the stream carries.
+    fn dispatch_turn(script: Vec<T>) -> Vec<ThreadEvent> {
+        let (tx, mut rx) = mpsc::unbounded::<Result<ThreadEvent>>();
+        let stream = ThreadEventStream(tx);
+        for ev in &script {
+            dispatch_translated_event(ev, &stream);
+        }
+        drop(stream);
+        let mut out = Vec::new();
+        while let Ok(Some(item)) = rx.try_next() {
+            out.push(item.expect("dispatcher only produces Ok"));
+        }
+        out
+    }
+
+    /// A realistic single-tool turn: agent thinks briefly, streams
+    /// prose, invokes a tool, the tool returns, agent closes, turn
+    /// ends with usage + Stop. This is the minimum viable "native
+    /// loop actually works end-to-end" assertion.
+    #[test]
+    fn full_turn_text_then_tool_then_text_then_stop_with_usage() {
+        let script = vec![
+            // Agent reasoning + prose stream.
+            T::AgentThinking("Let me read the file…".into()),
+            T::AgentThinkingComplete {
+                content: "Let me read the file.".into(),
+                duration_ms: 42,
+            },
+            T::AgentText("I'll read ".into()),
+            T::AgentText("src/main.rs.".into()),
+            // Tool call lifecycle.
+            T::ToolCallStart {
+                id: "t1".into(),
+                name: "read_file".into(),
+            },
+            T::ToolCallInputDelta {
+                id: "t1".into(),
+                delta: "{\"path\":\"src/main.rs\"".into(),
+            },
+            T::ToolCallInputDelta {
+                id: "t1".into(),
+                delta: "}".into(),
+            },
+            T::ToolCallInputEnd { id: "t1".into() },
+            T::ToolResult {
+                id: "t1".into(),
+                content: "fn main() {}".into(),
+                is_error: false,
+            },
+            // Post-tool prose + turn end.
+            T::AgentText(" The file is empty.".into()),
+            T::TurnComplete {
+                stop: TStop::EndTurn,
+                usage: TokenUsageMirror {
+                    input_tokens: 1200,
+                    output_tokens: 85,
+                    cache_read_tokens: 400,
+                    cache_write_tokens: 10,
+                },
+            },
+        ];
+
+        let evs = dispatch_turn(script);
+
+        // Sanity: at least one event per script entry that isn't a
+        // Swallow. 11 script entries, all surface → ≥ 11 events; the
+        // tool-call + TurnComplete fan-out produces extras.
+        assert!(
+            evs.len() >= 11,
+            "expected ≥11 events for a scripted turn, got {}: {:?}",
+            evs.len(),
+            evs
+        );
+
+        // Per-turn contract assertions, in flow order.
+        // 1. AgentThinking fires before AgentText.
+        let first_thinking = evs
+            .iter()
+            .position(|e| matches!(e, ThreadEvent::AgentThinking(_)))
+            .expect("must see AgentThinking");
+        let first_text = evs
+            .iter()
+            .position(|e| matches!(e, ThreadEvent::AgentText(_)))
+            .expect("must see AgentText");
+        assert!(
+            first_thinking < first_text,
+            "AgentThinking must precede AgentText; got order {evs:?}"
+        );
+
+        // 2. A ToolCall (or ToolCallUpdate) appears — the UI card must
+        //    materialise for the user to see the tool run.
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                ThreadEvent::ToolCall(_) | ThreadEvent::ToolCallUpdate(_)
+            )),
+            "must see at least one tool-call event for read_file; got {evs:?}"
+        );
+
+        // 3. UsageUpdated fires before Stop — pins the R2-1 contract
+        //    so a future refactor can't silently break it.
+        let usage_idx = evs
+            .iter()
+            .position(|e| matches!(e, ThreadEvent::UsageUpdated(_)))
+            .expect("must see UsageUpdated at turn close");
+        let stop_idx = evs
+            .iter()
+            .position(|e| matches!(e, ThreadEvent::Stop(_)))
+            .expect("must see Stop at turn close");
+        assert!(
+            usage_idx < stop_idx,
+            "UsageUpdated must precede Stop; got {evs:?}"
+        );
+
+        // 4. UsageUpdated payload round-trips the scripted tokens
+        //    field-for-field — the per-turn token meter the user
+        //    sees in the GUI reads from this exact struct.
+        match &evs[usage_idx] {
+            ThreadEvent::UsageUpdated(u) => {
+                assert_eq!(u.input_tokens, 1200);
+                assert_eq!(u.output_tokens, 85);
+                assert_eq!(u.cache_read_tokens, 400);
+                assert_eq!(u.cache_write_tokens, 10);
+            }
+            other => panic!("usage_idx pointed at non-usage event {other:?}"),
+        }
+
+        // 5. Stop reason is the user-visible "EndTurn" mapping, not a
+        //    diagnostic. If this flips to MaxTokens/Refusal/etc. the
+        //    GUI would render a warning badge — not what a clean turn
+        //    should show.
+        match &evs[stop_idx] {
+            ThreadEvent::Stop(reason) => {
+                use acp::StopReason;
+                assert_eq!(
+                    *reason,
+                    StopReason::EndTurn,
+                    "clean TurnComplete must surface as Stop(EndTurn)"
+                );
+            }
+            other => panic!("stop_idx pointed at non-stop event {other:?}"),
+        }
+
+        // 6. Stop is the final event. A consumer that breaks out of
+        //    the stream on Stop must not miss trailing data.
+        assert_eq!(
+            stop_idx,
+            evs.len() - 1,
+            "Stop must be the final event; got tail {:?}",
+            &evs[stop_idx..]
+        );
+    }
+
+    /// Failed-tool variant: the same turn shape but the tool returns
+    /// an error. Pins that the tool-call card flips to failed without
+    /// disrupting the rest of the turn contract.
+    #[test]
+    fn full_turn_with_failed_tool_still_closes_cleanly() {
+        let script = vec![
+            T::AgentText("Trying…".into()),
+            T::ToolCallStart {
+                id: "t1".into(),
+                name: "read_file".into(),
+            },
+            T::ToolCallInputEnd { id: "t1".into() },
+            T::ToolResult {
+                id: "t1".into(),
+                content: "file not found".into(),
+                is_error: true,
+            },
+            T::AgentText(" Hmm, that failed.".into()),
+            T::TurnComplete {
+                stop: TStop::EndTurn,
+                usage: TokenUsageMirror::default(),
+            },
+        ];
+
+        let evs = dispatch_turn(script);
+
+        // Contract: failed tool-result must surface as a ToolCallUpdate
+        // whose status is Failed (otherwise the GUI card stays stuck
+        // on "running").
+        let failed_update = evs.iter().any(|e| matches!(
+            e,
+            ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(u))
+                if matches!(u.fields.status, Some(acp::ToolCallStatus::Failed))
+        ));
+        assert!(
+            failed_update,
+            "failed tool must surface a ToolCallUpdate with status=Failed; got {evs:?}"
+        );
+
+        // Turn still closes: UsageUpdated → Stop(EndTurn) at the tail.
+        assert!(matches!(evs.last(), Some(ThreadEvent::Stop(_))));
+        let usage_idx = evs
+            .iter()
+            .position(|e| matches!(e, ThreadEvent::UsageUpdated(_)))
+            .expect("usage must fire even on failed-tool turns");
+        let stop_idx = evs.len() - 1;
+        assert!(usage_idx < stop_idx);
+    }
+
+    /// Permission-request variant: mid-turn the engine asks for tool
+    /// approval. The `PermissionRequest` is routed back through
+    /// `route_native_permission_request` in production; on the
+    /// dispatcher path it surfaces as a ThreadEvent the GUI renders
+    /// as a permission prompt. This pins that the permission event
+    /// does NOT terminate the stream (turn resumes afterward).
+    #[test]
+    fn full_turn_with_permission_request_preserves_stream() {
+        let script = vec![
+            T::AgentText("About to run a tool…".into()),
+            T::PermissionRequest {
+                id: "p1".into(),
+                tool: "write_file".into(),
+                description: "Write src/lib.rs".into(),
+                raw_input: Some(serde_json::json!({"path":"src/lib.rs"})),
+            },
+            T::ToolCallStart {
+                id: "t1".into(),
+                name: "write_file".into(),
+            },
+            T::ToolCallInputEnd { id: "t1".into() },
+            T::ToolResult {
+                id: "t1".into(),
+                content: "written".into(),
+                is_error: false,
+            },
+            T::TurnComplete {
+                stop: TStop::EndTurn,
+                usage: TokenUsageMirror::default(),
+            },
+        ];
+
+        let evs = dispatch_turn(script);
+
+        // Sanity: the permission surfaces in the stream as an
+        // EngineDiagnostic with kind="permission.request". Note: in
+        // production the full approval round-trip is handled by
+        // `route_native_permission_request` which short-circuits the
+        // dispatcher for permission events; on the dispatcher-only
+        // path tested here, the event falls through to a warning
+        // diagnostic. Either way, the stream MUST keep flowing.
+        let perm_diag = evs.iter().any(|e| matches!(
+            e,
+            ThreadEvent::EngineDiagnostic(d)
+                if d.kind == "permission.request"
+                && d.severity == EngineDiagnosticSeverity::Warning
+        ));
+        assert!(
+            perm_diag,
+            "permission request must surface as EngineDiagnostic(permission.request, Warning); got {evs:?}"
+        );
+
+        // Turn still reaches Stop.
+        assert!(
+            matches!(evs.last(), Some(ThreadEvent::Stop(_))),
+            "turn must still close after a permission request; got {evs:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod route_native_permission_tests {
-    //! C1 — approval round-trip integration tests for
-    //! [`route_native_permission_request`]. These pin:
-    //!   * NW-3 contract: `id` received from the engine is forwarded
-    //!     back on `approval_tx` verbatim (no `perm_` re-prefix).
-    //!   * A2 fast-path: user-configured always_allow / always_deny
     //!     rules short-circuit the interactive UI and auto-respond on
     //!     `approval_tx` with a diagnostic surfaced on the stream.
     //!   * Legacy fall-through: when the engine omits `raw_input`
