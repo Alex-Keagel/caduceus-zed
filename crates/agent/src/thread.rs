@@ -1242,6 +1242,14 @@ pub(crate) struct CaduceusState {
     /// bool is the user's decision (`true` = allow, `false` = deny).
     /// Invalidated in lock-step with `harness`.
     pub(crate) approval_tx: Option<tokio::sync::mpsc::Sender<(String, bool)>>,
+    /// T4 (Audit C6): flag value in effect when the current harness
+    /// was provisioned. `None` means no harness is provisioned yet.
+    /// If the live `caduceus_native_loop` setting no longer matches
+    /// this value at turn start, `ensure_caduceus_harness` invalidates
+    /// the harness so the next turn rebuilds with current state. This
+    /// closes the gap where a ON→OFF→ON transition would reuse a
+    /// harness built against a since-invalidated flag.
+    pub(crate) last_native_loop_flag: Option<bool>,
 }
 
 impl Thread {
@@ -1800,6 +1808,9 @@ impl Thread {
         self.caduceus.emitter = None;
         self.caduceus.dispatcher = None;
         self.caduceus.approval_tx = None;
+        // T4 (Audit C6): clear the init-time flag snapshot so the
+        // next ensure_caduceus_harness re-records the current setting.
+        self.caduceus.last_native_loop_flag = None;
         // Intentionally keep `caduceus_bridge` — the bridge itself
         // (ContextManager config, native_loop flag) outlives the
         // harness. If the flag was the reason for invalidation the
@@ -1823,12 +1834,33 @@ impl Thread {
     /// failure. On any error the fields stay `None` and the legacy
     /// path keeps running.
     pub fn ensure_caduceus_harness(&mut self, cx: &mut Context<Self>) -> Result<bool> {
-        // Already provisioned?
+        let enabled = agent_settings::AgentSettings::get_global(cx).caduceus_native_loop;
+
+        // T4 (Audit C6): detect a live flag transition vs the flag
+        // value that was in effect when the current harness was
+        // provisioned. If they differ — OFF→ON or ON→OFF — drop the
+        // stale harness so we rebuild (ON) or release resources (OFF).
+        if let Some(prev) = self.caduceus.last_native_loop_flag {
+            if prev != enabled {
+                log::info!(
+                    "[native-loop] caduceus_native_loop flag transitioned {prev} → {enabled}; \
+                     invalidating harness so next turn rebuilds with current setting"
+                );
+                self.invalidate_caduceus_harness();
+                // T4: on a flag transition we also drop the bridge.
+                // `invalidate_caduceus_harness` intentionally keeps
+                // the bridge across normal invalidations (mode/model
+                // change), but a flag transition is a different
+                // lifecycle event — the bridge is only meaningful
+                // when the flag is ON, so drop it unconditionally.
+                self.caduceus.bridge = None;
+            }
+        }
+
+        // Already provisioned against the current flag?
         if self.caduceus_native_loop_ready() {
             return Ok(false);
         }
-        // Flag check — avoid any allocation when native loop is OFF.
-        let enabled = agent_settings::AgentSettings::get_global(cx).caduceus_native_loop;
         if !enabled {
             return Ok(false);
         }
@@ -1862,6 +1894,9 @@ impl Thread {
         self.caduceus.bridge = Some(bridge);
         self.caduceus.cancel_token = Some(cancel_token);
         self.caduceus.native_state = Some(state);
+        // T4 (Audit C6): record the flag value we built against so a
+        // future transition is detected at the top of this function.
+        self.caduceus.last_native_loop_flag = Some(enabled);
         Ok(true)
     }
 
@@ -3173,7 +3208,17 @@ impl Thread {
                 return None;
             }
             if let Err(err) = this.ensure_caduceus_harness(cx) {
-                log::warn!("[native-loop] ensure_caduceus_harness failed: {err}");
+                // T4 (Audit C6): flag was explicitly ON but the native
+                // harness could not be built. Previously this was a
+                // `warn!` + silent legacy fallback. Keep the fallback
+                // (to avoid breaking user turns) but escalate the log
+                // level and include actionable context so the failure
+                // is visible in logs / bug reports.
+                log::error!(
+                    "[native-loop] ensure_caduceus_harness failed with flag ON: {err}. \
+                     Falling back to legacy turn path. User expected native loop; \
+                     investigate missing worktree / bridge build failure."
+                );
                 return None;
             }
             let bridge = this.caduceus.bridge.clone()?;
@@ -7288,6 +7333,69 @@ mod caduceus_native_loop_tests {
 
         // Silence unused-import warning if Arc is not needed.
         let _ = Arc::new(());
+    }
+
+    /// T4 (Audit C6): an ON→OFF→ON flag transition must invalidate
+    /// the stale harness state so the next `ensure_caduceus_harness`
+    /// rebuilds against the current flag.
+    #[gpui::test]
+    async fn flag_transition_on_off_on_invalidates_harness(cx: &mut TestAppContext) {
+        let thread = setup_thread_with_worktree(cx).await;
+        enable_native_loop(cx);
+
+        // Turn 1: flag ON → provisions bridge + state.
+        cx.update(|cx| {
+            let provisioned = thread
+                .update(cx, |t, cx| t.ensure_caduceus_harness(cx))
+                .unwrap();
+            assert!(provisioned, "turn 1 must provision");
+            let t = thread.read(cx);
+            assert_eq!(t.caduceus.last_native_loop_flag, Some(true));
+            assert!(t.caduceus.bridge.is_some());
+        });
+
+        // User flips flag OFF.
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(
+                        r#"{ "agent": { "caduceus_native_loop": false } }"#,
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+
+        // Turn 2: ensure observes the transition ON→OFF and invalidates.
+        cx.update(|cx| {
+            let provisioned = thread
+                .update(cx, |t, cx| t.ensure_caduceus_harness(cx))
+                .unwrap();
+            assert!(!provisioned, "flag OFF must not provision");
+            let t = thread.read(cx);
+            assert!(
+                t.caduceus.bridge.is_none(),
+                "ON→OFF transition must drop stale bridge"
+            );
+            assert_eq!(
+                t.caduceus.last_native_loop_flag, None,
+                "flag snapshot must be cleared on invalidation"
+            );
+        });
+
+        // User flips flag back ON.
+        enable_native_loop(cx);
+
+        // Turn 3: ensure re-provisions a fresh bridge, not the stale one.
+        cx.update(|cx| {
+            let provisioned = thread
+                .update(cx, |t, cx| t.ensure_caduceus_harness(cx))
+                .unwrap();
+            assert!(provisioned, "turn 3 must re-provision after OFF→ON");
+            let t = thread.read(cx);
+            assert_eq!(t.caduceus.last_native_loop_flag, Some(true));
+            assert!(t.caduceus.bridge.is_some(), "bridge must be Some again");
+        });
     }
 }
 
