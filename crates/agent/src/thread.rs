@@ -3489,21 +3489,21 @@ impl Thread {
         // surface to preserve the legacy pre-NW-3 behaviour.
         let approval_tx_for_consumer = setup.approval_tx.clone();
         // Follow-up: consumer-local state for tool-call enrichment.
-        // - `tool_names`: id → tool name, populated at ToolCallStart so
-        //   InputEnd / ToolResult arms can look up the AnyAgentTool.
-        // - `input_buffers`: id → accumulated JSON bytes from
-        //   ToolCallInputDelta frames, assembled at InputEnd so we can
-        //   call `tool.initial_title(input)` to refine the card title
-        //   and stash the parsed input as `raw_input` on the card.
-        //   Kept local to the consumer so `dispatch_translated_event`
-        //   stays stateless (its 15 G1f mapping tests depend on this).
+        // Handled by [`caduceus_bridge::event_translator::ToolInputAggregator`]
+        // (FU#4) which owns id→name + id→input-JSON bookkeeping and
+        // has its own unit tests. Consumer just drives observe_* /
+        // finalize from the event loop.
         let enabled_tools_for_consumer = setup.enabled_tools.clone();
         let consumer_task = cx.spawn(async move |cx_cons| {
-            use caduceus_bridge::event_translator::TranslatedThreadEvent as T;
-            let mut tool_names: std::collections::HashMap<String, SharedString> =
-                std::collections::HashMap::new();
-            let mut input_buffers: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
+            use caduceus_bridge::event_translator::{
+                TranslatedThreadEvent as T, ToolInputAggregator,
+            };
+            // FU#4: per-id aggregation (id → name, id → input bytes)
+            // now lives in the bridge crate's `ToolInputAggregator`,
+            // with its own 7 unit tests. The consumer just drives
+            // it via observe_* and reads the aggregated payload at
+            // InputEnd — see caduceus_bridge::event_translator.
+            let mut input_agg = ToolInputAggregator::new();
             while let Some(ev) = trans_rx.recv().await {
                 // Permission requests route through their own helper
                 // (NW-3 / A2). Everything else funnels through the
@@ -3532,8 +3532,7 @@ impl Thread {
                 }
                 let handled_fully = handle_native_tool_lifecycle(
                     &ev,
-                    &mut tool_names,
-                    &mut input_buffers,
+                    &mut input_agg,
                     &enabled_tools_for_consumer,
                     &stream_for_consumer,
                     cx_cons,
@@ -5826,8 +5825,7 @@ fn extract_match_inputs(raw: &serde_json::Value) -> Vec<String> {
 ///    `ToolCallUpdate` at input-end (no emit during delta frames).
 fn handle_native_tool_lifecycle(
     ev: &caduceus_bridge::event_translator::TranslatedThreadEvent,
-    tool_names: &mut std::collections::HashMap<String, SharedString>,
-    input_buffers: &mut std::collections::HashMap<String, String>,
+    input_agg: &mut caduceus_bridge::event_translator::ToolInputAggregator,
     enabled_tools: &std::collections::BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>>,
     stream: &ThreadEventStream,
     cx: &mut AsyncApp,
@@ -5835,8 +5833,8 @@ fn handle_native_tool_lifecycle(
     use caduceus_bridge::event_translator::TranslatedThreadEvent as T;
     match ev {
         T::ToolCallStart { id, name } => {
+            input_agg.observe_start(id, name);
             let tool_name: SharedString = name.clone().into();
-            tool_names.insert(id.clone(), tool_name.clone());
             let kind = enabled_tools
                 .get(&tool_name)
                 .map(|t| t.kind())
@@ -5853,18 +5851,16 @@ fn handle_native_tool_lifecycle(
             true
         }
         T::ToolCallInputDelta { id, delta } => {
-            input_buffers.entry(id.clone()).or_default().push_str(delta);
+            input_agg.observe_delta(id, delta);
             true
         }
         T::ToolCallInputEnd { id } => {
-            let buffered = input_buffers.remove(id).unwrap_or_default();
-            let parsed: Option<serde_json::Value> = serde_json::from_str(&buffered).ok();
-            let tool_name = tool_names.get(id).cloned();
-            let rich_title: Option<SharedString> = match (&parsed, tool_name.as_ref()) {
+            let agg = input_agg.observe_input_end(id);
+            let rich_title: Option<SharedString> = match (&agg.parsed, agg.tool_name.as_ref()) {
                 (Some(input), Some(name)) => {
                     let input = input.clone();
-                    let name = name.clone();
-                    cx.update(|cx| enabled_tools.get(&name).map(|t| t.initial_title(input, cx)))
+                    let name_ss: SharedString = name.clone().into();
+                    cx.update(|cx| enabled_tools.get(&name_ss).map(|t| t.initial_title(input, cx)))
                 }
                 _ => None,
             };
@@ -5873,7 +5869,7 @@ fn handle_native_tool_lifecycle(
             if let Some(t) = rich_title {
                 fields = fields.title(t.to_string());
             }
-            if let Some(raw) = parsed {
+            if let Some(raw) = agg.parsed {
                 fields = fields.raw_input(raw);
             }
             stream
@@ -5888,8 +5884,7 @@ fn handle_native_tool_lifecycle(
             // Clean up per-id state so the maps don't grow unbounded,
             // then fall through to the stateless dispatcher which
             // already emits status + content + raw_output.
-            tool_names.remove(id);
-            input_buffers.remove(id);
+            input_agg.finalize(id);
             false
         }
         _ => false,
@@ -8428,8 +8423,7 @@ mod native_tool_lifecycle_tests {
     #[gpui::test]
     async fn full_lifecycle_emits_one_start_and_one_end_update(cx: &mut TestAppContext) {
         let (stream, mut rx) = make_stream();
-        let mut tool_names: HashMap<String, SharedString> = HashMap::new();
-        let mut input_buffers: HashMap<String, String> = HashMap::new();
+        let mut input_agg = caduceus_bridge::event_translator::ToolInputAggregator::new();
         let enabled_tools: BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>> =
             BTreeMap::new();
 
@@ -8440,8 +8434,7 @@ mod native_tool_lifecycle_tests {
                     id: "t1".into(),
                     name: "terminal".into(),
                 },
-                &mut tool_names,
-                &mut input_buffers,
+                &mut input_agg,
                 &enabled_tools,
                 &stream,
                 &mut cx_cons,
@@ -8455,8 +8448,7 @@ mod native_tool_lifecycle_tests {
                         id: "t1".into(),
                         delta: frag.into(),
                     },
-                    &mut tool_names,
-                    &mut input_buffers,
+                    &mut input_agg,
                     &enabled_tools,
                     &stream,
                     &mut cx_cons,
@@ -8467,8 +8459,7 @@ mod native_tool_lifecycle_tests {
             // 3. InputEnd — one update
             let handled = handle_native_tool_lifecycle(
                 &T::ToolCallInputEnd { id: "t1".into() },
-                &mut tool_names,
-                &mut input_buffers,
+                &mut input_agg,
                 &enabled_tools,
                 &stream,
                 &mut cx_cons,
@@ -8482,8 +8473,7 @@ mod native_tool_lifecycle_tests {
                     content: "ok".into(),
                     is_error: false,
                 },
-                &mut tool_names,
-                &mut input_buffers,
+                &mut input_agg,
                 &enabled_tools,
                 &stream,
                 &mut cx_cons,
@@ -8493,12 +8483,8 @@ mod native_tool_lifecycle_tests {
                 "ToolResult must return false so dispatcher emits the final update"
             );
             assert!(
-                !tool_names.contains_key("t1"),
-                "tool_names must be cleaned up on ToolResult"
-            );
-            assert!(
-                !input_buffers.contains_key("t1"),
-                "input_buffers must be cleaned up on ToolResult"
+                input_agg.active_ids().is_empty(),
+                "aggregator must be fully cleaned up on ToolResult"
             );
         })
         .detach();
@@ -8552,8 +8538,7 @@ mod native_tool_lifecycle_tests {
     #[gpui::test]
     async fn input_delta_alone_never_emits(cx: &mut TestAppContext) {
         let (stream, mut rx) = make_stream();
-        let mut tool_names: HashMap<String, SharedString> = HashMap::new();
-        let mut input_buffers: HashMap<String, String> = HashMap::new();
+        let mut input_agg = caduceus_bridge::event_translator::ToolInputAggregator::new();
         let enabled_tools: BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>> =
             BTreeMap::new();
 
@@ -8563,17 +8548,14 @@ mod native_tool_lifecycle_tests {
                     id: "t9".into(),
                     delta: "anything".into(),
                 },
-                &mut tool_names,
-                &mut input_buffers,
+                &mut input_agg,
                 &enabled_tools,
                 &stream,
                 &mut cx_cons,
             );
             // Buffer was populated.
-            assert_eq!(
-                input_buffers.get("t9").map(String::as_str),
-                Some("anything")
-            );
+            let out = input_agg.observe_input_end("t9");
+            assert_eq!(out.raw_json, "anything");
         })
         .detach();
 
@@ -8589,16 +8571,14 @@ mod native_tool_lifecycle_tests {
     #[gpui::test]
     async fn unhandled_variants_return_false(cx: &mut TestAppContext) {
         let (stream, mut rx) = make_stream();
-        let mut tool_names: HashMap<String, SharedString> = HashMap::new();
-        let mut input_buffers: HashMap<String, String> = HashMap::new();
+        let mut input_agg = caduceus_bridge::event_translator::ToolInputAggregator::new();
         let enabled_tools: BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>> =
             BTreeMap::new();
 
         cx.spawn(async move |mut cx_cons| {
             let handled = handle_native_tool_lifecycle(
                 &T::AgentText("hello".into()),
-                &mut tool_names,
-                &mut input_buffers,
+                &mut input_agg,
                 &enabled_tools,
                 &stream,
                 &mut cx_cons,
@@ -8626,16 +8606,14 @@ mod native_tool_lifecycle_tests {
         // update without panicking, even though raw_input will be
         // absent (empty buffer → parse fails → None).
         let (stream, mut rx) = make_stream();
-        let mut tool_names: HashMap<String, SharedString> = HashMap::new();
-        let mut input_buffers: HashMap<String, String> = HashMap::new();
+        let mut input_agg = caduceus_bridge::event_translator::ToolInputAggregator::new();
         let enabled_tools: BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>> =
             BTreeMap::new();
 
         cx.spawn(async move |mut cx_cons| {
             let handled = handle_native_tool_lifecycle(
                 &T::ToolCallInputEnd { id: "t42".into() },
-                &mut tool_names,
-                &mut input_buffers,
+                &mut input_agg,
                 &enabled_tools,
                 &stream,
                 &mut cx_cons,

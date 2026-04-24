@@ -473,6 +473,221 @@ fn map_stop_reason(sr: &caduceus_core::StopReason) -> StopReasonKind {
     }
 }
 
+// ── FU#4 — ToolInputAggregator ───────────────────────────────────────────
+//
+// The native-loop consumer needs two per-id maps:
+//   * id → tool name        (populated at ToolCallStart, consumed at
+//                            ToolCallInputEnd / ToolResult to look up the
+//                            concrete AnyAgentTool for initial_title /
+//                            kind enrichment).
+//   * id → input JSON buffer (accumulated from ToolCallInputDelta chunks,
+//                            parsed at ToolCallInputEnd so the UI can
+//                            render rich args + set `raw_input` on the
+//                            card).
+//
+// Every consumer that observes a [`TranslatedThreadEvent`] stream needs
+// the same bookkeeping. Keeping it inline in `thread.rs` (50+ lines of
+// HashMap juggling + edge-case cleanup on ToolResult) duplicated the
+// logic and made it hard to test in isolation. This helper concentrates
+// the state machine in the bridge crate with its own unit tests;
+// consumers just drive it and read the aggregated payload at
+// `observe_input_end`.
+//
+// Why not move the aggregation *inside* `translate()` itself: the
+// translator is intentionally stateless (each `AgentEvent` maps to a
+// deterministic `TranslatedEvents` regardless of history). 15+ G1f
+// mapping tests rely on this purity. `ToolInputAggregator` is the
+// pragmatic compromise — stateful helper next to the stateless
+// translator, composable by any consumer, not injected into the core
+// mapping pipeline.
+
+use std::collections::HashMap;
+
+/// Per-tool-call aggregation state. One long-lived instance per
+/// consumer (typically one per native-loop turn). Methods take
+/// `&mut self` so the state evolves as the stream progresses.
+#[derive(Debug, Default)]
+pub struct ToolInputAggregator {
+    /// id → tool name captured at `ToolCallStart`.
+    names: HashMap<String, String>,
+    /// id → accumulated raw JSON bytes from `ToolCallInputDelta`.
+    /// `String` (not `Vec<u8>`) because the wire format is always
+    /// UTF-8 JSON. Retained across deltas; taken at InputEnd.
+    buffers: HashMap<String, String>,
+}
+
+/// Output of [`ToolInputAggregator::observe_input_end`] — everything
+/// the consumer needs to enrich a `ToolCallUpdate` at the moment the
+/// engine signals input is fully assembled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregatedToolInput {
+    /// Tool name captured at the matching `ToolCallStart`, or
+    /// `None` if the start event was missed (which indicates an
+    /// upstream dropped-frame bug — consumers should log).
+    pub tool_name: Option<String>,
+    /// Raw JSON string assembled from all input-delta chunks.
+    /// Empty string if no deltas were observed.
+    pub raw_json: String,
+    /// Successfully parsed `raw_json`, or `None` if the provider
+    /// streamed malformed JSON. Consumers MUST tolerate `None`
+    /// (best-effort rendering, don't drop the event).
+    pub parsed: Option<serde_json::Value>,
+}
+
+impl ToolInputAggregator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drive the aggregator from a `ToolCallStart` event.
+    pub fn observe_start(&mut self, id: &str, name: &str) {
+        self.names.insert(id.to_string(), name.to_string());
+    }
+
+    /// Drive the aggregator from a `ToolCallInputDelta` event.
+    pub fn observe_delta(&mut self, id: &str, delta: &str) {
+        self.buffers
+            .entry(id.to_string())
+            .or_default()
+            .push_str(delta);
+    }
+
+    /// Drive the aggregator from a `ToolCallInputEnd` event and
+    /// receive the assembled input. Removes the id's buffer (but
+    /// keeps the name in `names` — consumers may still want it
+    /// when `ToolResult` arrives). Use [`Self::finalize`] to drop
+    /// the name as well.
+    pub fn observe_input_end(&mut self, id: &str) -> AggregatedToolInput {
+        let raw_json = self.buffers.remove(id).unwrap_or_default();
+        let parsed: Option<serde_json::Value> = if raw_json.trim().is_empty() {
+            None
+        } else {
+            serde_json::from_str(&raw_json).ok()
+        };
+        let tool_name = self.names.get(id).cloned();
+        AggregatedToolInput {
+            tool_name,
+            raw_json,
+            parsed,
+        }
+    }
+
+    /// Look up a tool name for an id without consuming state.
+    /// Useful at `ToolResult` time when consumers want to attach
+    /// provenance (e.g. the concrete `AnyAgentTool::kind`).
+    pub fn tool_name(&self, id: &str) -> Option<&str> {
+        self.names.get(id).map(String::as_str)
+    }
+
+    /// Drop all state for `id`. Call at `ToolResult` or when
+    /// the consumer is sure no further events with this id will
+    /// arrive — prevents unbounded growth over long turns with
+    /// thousands of tool calls.
+    pub fn finalize(&mut self, id: &str) {
+        self.names.remove(id);
+        self.buffers.remove(id);
+    }
+
+    /// Test / diagnostic accessor.
+    #[cfg(any(test, debug_assertions))]
+    pub fn active_ids(&self) -> Vec<&str> {
+        let mut ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for k in self.names.keys() {
+            ids.insert(k.as_str());
+        }
+        for k in self.buffers.keys() {
+            ids.insert(k.as_str());
+        }
+        ids.into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod aggregator_tests {
+    use super::*;
+
+    #[test]
+    fn full_happy_path_returns_parsed_input() {
+        let mut agg = ToolInputAggregator::new();
+        agg.observe_start("t1", "grep");
+        agg.observe_delta("t1", "{\"pattern\":");
+        agg.observe_delta("t1", "\"foo\"}");
+        let out = agg.observe_input_end("t1");
+        assert_eq!(out.tool_name.as_deref(), Some("grep"));
+        assert_eq!(out.raw_json, "{\"pattern\":\"foo\"}");
+        assert_eq!(
+            out.parsed,
+            Some(serde_json::json!({"pattern": "foo"}))
+        );
+    }
+
+    #[test]
+    fn missing_start_yields_none_tool_name() {
+        let mut agg = ToolInputAggregator::new();
+        agg.observe_delta("orphan", "{}");
+        let out = agg.observe_input_end("orphan");
+        assert!(out.tool_name.is_none());
+        assert_eq!(out.raw_json, "{}");
+        assert_eq!(out.parsed, Some(serde_json::json!({})));
+    }
+
+    #[test]
+    fn malformed_json_parsed_is_none_but_raw_preserved() {
+        let mut agg = ToolInputAggregator::new();
+        agg.observe_start("t1", "t");
+        agg.observe_delta("t1", "{not-json");
+        let out = agg.observe_input_end("t1");
+        assert_eq!(out.raw_json, "{not-json");
+        assert!(out.parsed.is_none());
+    }
+
+    #[test]
+    fn no_deltas_yields_empty_and_none_parsed() {
+        let mut agg = ToolInputAggregator::new();
+        agg.observe_start("t1", "t");
+        let out = agg.observe_input_end("t1");
+        assert_eq!(out.raw_json, "");
+        assert!(out.parsed.is_none());
+    }
+
+    #[test]
+    fn input_end_leaves_name_until_finalize() {
+        let mut agg = ToolInputAggregator::new();
+        agg.observe_start("t1", "grep");
+        let _ = agg.observe_input_end("t1");
+        assert_eq!(agg.tool_name("t1"), Some("grep"));
+        agg.finalize("t1");
+        assert_eq!(agg.tool_name("t1"), None);
+        assert!(agg.active_ids().is_empty());
+    }
+
+    #[test]
+    fn multiple_concurrent_ids_are_isolated() {
+        let mut agg = ToolInputAggregator::new();
+        agg.observe_start("a", "grep");
+        agg.observe_start("b", "read");
+        agg.observe_delta("a", "{\"x\":1}");
+        agg.observe_delta("b", "{\"y\":2}");
+        let a = agg.observe_input_end("a");
+        let b = agg.observe_input_end("b");
+        assert_eq!(a.tool_name.as_deref(), Some("grep"));
+        assert_eq!(b.tool_name.as_deref(), Some("read"));
+        assert_eq!(a.parsed, Some(serde_json::json!({"x":1})));
+        assert_eq!(b.parsed, Some(serde_json::json!({"y":2})));
+    }
+
+    #[test]
+    fn finalize_clears_both_buffer_and_name() {
+        let mut agg = ToolInputAggregator::new();
+        agg.observe_start("t1", "n");
+        agg.observe_delta("t1", "{}");
+        // Caller may call finalize without ever seeing InputEnd
+        // (e.g. cancellation, transport drop).
+        agg.finalize("t1");
+        assert!(agg.active_ids().is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
