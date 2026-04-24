@@ -3460,10 +3460,17 @@ impl Thread {
         // ── Phase 5: subscribe a FRESH broadcast receiver (ST-A2a)
         // and bridge into the mpsc that run_caduceus_loop_translated
         // currently consumes.
+        //
+        // NOTE: this bridge task used to call `tokio::spawn`, which
+        // panics with `TryCurrentError` because `try_run_turn_native`
+        // is driven by GPUI's foreground executor — not a Tokio
+        // runtime. Use `cx.background_spawn` so the task lives on
+        // GPUI's background executor; drop-on-scope gives us the
+        // same cancellation semantics as the old `.abort()` call.
         let mut broadcast_rx = emitter.subscribe();
         let (turn_event_tx, turn_event_rx) =
             tokio::sync::mpsc::channel::<caduceus_core::AgentEvent>(256);
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = cx.background_spawn(async move {
             loop {
                 match broadcast_rx.recv().await {
                     Ok(ev) => {
@@ -3562,7 +3569,9 @@ impl Thread {
 
         // ── Phase 8: drain + cleanup ───────────────────────────────
         drop(state_guard);
-        bridge_task.abort();
+        // GPUI `Task` cancels on drop — explicit drop here to match
+        // the original `.abort()` timing (before we await the consumer).
+        drop(bridge_task);
         consumer_task.await;
 
         // `run_caduceus_loop_translated`'s TurnComplete/TurnError is
