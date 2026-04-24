@@ -3401,6 +3401,33 @@ impl Thread {
                 .with_reducer_sink()
                 .build();
 
+            // FU#5 / emitter-mpsc-leak fix: HarnessBuilder hands us
+            // `built.event_rx` — the single-consumer mpsc `Receiver`
+            // for the emitter's live channel. The native path consumes
+            // events via `emitter.subscribe()` (broadcast fan-out), NOT
+            // via this mpsc. If we let `built` drop with `event_rx`
+            // still inside it, the `Receiver` is destroyed and every
+            // subsequent `emit()` in the harness trips
+            // `TrySendError::Closed`, spamming ~N warnings per turn
+            // ("AgentEventEmitter receiver closed; event will be
+            // retained in ring only"). The events are preserved in the
+            // retention ring and broadcast fan-out, so UI delivery is
+            // unaffected — but the noise hides real signal and the
+            // emitter keeps paying the `try_send` cost.
+            //
+            // Drain-and-drop on a background task for the turn's
+            // lifetime. The task ends when the emitter's last `Sender`
+            // drops (i.e. when the harness + emitter clone are dropped
+            // at the end of the turn). Uses `cx.background_spawn`
+            // because GPUI foreground drives this async fn and
+            // `tokio::spawn` would panic (same class as the NW-4
+            // crash). Requires NO tokio runtime — mpsc::Receiver::recv
+            // is runtime-agnostic.
+            if let Some(mut mpsc_rx) = built.event_rx {
+                cx.background_spawn(async move { while mpsc_rx.recv().await.is_some() {} })
+                    .detach();
+            }
+
             // NW-3: capture approval_tx BEFORE consuming
             // `built.harness` into the mode-decorator chain. With
             // default approval (no `.no_approval()`), HarnessBuilder
