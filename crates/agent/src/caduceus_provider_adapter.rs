@@ -28,9 +28,9 @@
 //!   *only* observable via `chat()`. This matches how the existing
 //!   orchestrator code handles streaming (see
 //!   `caduceus_orchestrator::lib::try_stream_or_chat`).
-//! * Thinking deltas are dropped in streaming mode (no corresponding
-//!   field on `StreamChunk`) and folded into the aggregated content
-//!   in non-streaming mode.
+//! * Thinking deltas: surfaced on `StreamChunk.thinking` in streaming
+//!   mode and folded into `ChatResponse.thinking` in non-streaming
+//!   mode (T3/I9).
 //! * Images on tool results are mapped as a text placeholder since
 //!   caduceus `ToolResult` carries only `String` content today.
 //! * List-models returns `Ok(vec![])` — the Zed model registry owns
@@ -54,7 +54,7 @@ use futures::{
 };
 use language_model::{
     CompletionIntent as LmIntent, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
+    LanguageModelImage, LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
     LanguageModelToolChoice, LanguageModelToolResult, LanguageModelToolResultContent,
     LanguageModelToolUse, MessageContent, Role, StopReason as LmStopReason,
 };
@@ -302,8 +302,20 @@ pub(crate) fn translate_chat_request(req: &ChatRequest) -> LanguageModelRequest 
             reasoning_details: None,
         });
     }
+    // T3/I8: build a tool_use_id → tool_name map from prior assistant
+    // tool_calls so tool-result messages (which carry only the id in
+    // caduceus's schema) can be translated with the real tool name
+    // instead of an empty string. Zed downstream callers rely on
+    // `tool_name` for provenance + UI rendering.
+    let mut tool_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for m in &req.messages {
-        messages.push(translate_message(m));
+        for tc in &m.tool_calls {
+            tool_names.insert(tc.id.clone(), tc.name.clone());
+        }
+    }
+    for m in &req.messages {
+        messages.push(translate_message(m, &tool_names));
     }
 
     let tools = req
@@ -369,7 +381,10 @@ fn translate_tool_choice(tc: &ToolChoice) -> Option<LanguageModelToolChoice> {
     }
 }
 
-fn translate_message(m: &Message) -> LanguageModelRequestMessage {
+fn translate_message(
+    m: &Message,
+    tool_names: &std::collections::HashMap<String, String>,
+) -> LanguageModelRequestMessage {
     let role = match m.role.as_str() {
         "system" => Role::System,
         "assistant" => Role::Assistant,
@@ -386,10 +401,17 @@ fn translate_message(m: &Message) -> LanguageModelRequestMessage {
                 MessageContentBlock::Text { text, .. } => {
                     content.push(MessageContent::Text(text.clone()));
                 }
-                MessageContentBlock::Image { .. } => {
-                    // Image translation deferred; upstream crates
-                    // (caduceus_tool_adapter / tool results) are the
-                    // primary carriers of image data today.
+                MessageContentBlock::Image { base64, .. } => {
+                    // T3/I7: forward image blocks. Caduceus carries
+                    // base64 + media_type; Zed's LanguageModelImage
+                    // assumes PNG source (per its doc comment) and
+                    // carries no explicit media_type. We map the
+                    // base64 payload across and drop media_type on
+                    // the floor — providers downstream re-detect.
+                    content.push(MessageContent::Image(LanguageModelImage {
+                        source: base64.clone().into(),
+                        size: None,
+                    }));
                 }
             }
         }
@@ -412,9 +434,16 @@ fn translate_message(m: &Message) -> LanguageModelRequestMessage {
     // Tool result payloads on user-role messages.
     if let Some(tr) = &m.tool_result {
         if let Some(id) = &tr.tool_use_id {
+            // T3/I8: look up the tool name from prior assistant
+            // tool_calls in the same request; fall back to empty
+            // string (matches prior behavior) for orphan results.
+            let name = tool_names
+                .get(id.as_str())
+                .map(|s| Arc::from(s.as_str()))
+                .unwrap_or_else(|| Arc::from(""));
             content.push(MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: id.clone().into(),
-                tool_name: Arc::from(""),
+                tool_name: name,
                 is_error: tr.is_error,
                 content: LanguageModelToolResultContent::Text(Arc::from(tr.content.as_str())),
                 output: None,
@@ -596,6 +625,7 @@ impl Stream for ChunkStream {
                         output_tokens: self.output_tokens,
                         cache_read_tokens: self.cache_read_tokens,
                         cache_creation_tokens: self.cache_creation_tokens,
+                        thinking: String::new(),
                     })));
                 }
                 Poll::Ready(Some(Err(e))) => {
@@ -611,6 +641,7 @@ impl Stream for ChunkStream {
                             output_tokens: None,
                             cache_read_tokens: None,
                             cache_creation_tokens: None,
+                            thinking: String::new(),
                         })));
                     }
                     LanguageModelCompletionEvent::UsageUpdate(u) => {
@@ -632,11 +663,30 @@ impl Stream for ChunkStream {
                             output_tokens: self.output_tokens,
                             cache_read_tokens: self.cache_read_tokens,
                             cache_creation_tokens: self.cache_creation_tokens,
+                            thinking: String::new(),
                         })));
                     }
-                    // Silent for thinking/tool-use/queued/etc. in
-                    // streaming — text-only per the orchestrator
-                    // streaming contract.
+                    // T3/I9: forward thinking deltas as a dedicated
+                    // chunk. Engine orchestrator promotes non-empty
+                    // `chunk.thinking` to `AgentEvent::ReasoningDelta`.
+                    LanguageModelCompletionEvent::Thinking { text, .. } => {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        return Poll::Ready(Some(Ok(StreamChunk {
+                            delta: String::new(),
+                            is_final: false,
+                            input_tokens: None,
+                            output_tokens: None,
+                            cache_read_tokens: None,
+                            cache_creation_tokens: None,
+                            thinking: text,
+                        })));
+                    }
+                    // Silent for tool-use/queued/redacted-thinking/etc.
+                    // in streaming — the orchestrator streaming contract
+                    // is text+thinking only; structured events come via
+                    // the non-streaming `chat()` path.
                     _ => continue,
                 },
             }
@@ -1059,5 +1109,111 @@ mod tests {
         );
         let adapter = ZedLlmAdapter::new(ProviderId("t".into()), handle);
         assert!(adapter.list_models().await.unwrap().is_empty());
+    }
+
+    // ─────────────────────────── T3 — bridge adapter drops ─────────────────
+
+    #[test]
+    fn t3_i7_image_block_round_trips_to_message_content_image() {
+        use caduceus_providers::MessageContentBlock;
+        let mut msg = mk_user_msg("");
+        msg.content = String::new();
+        msg.content_blocks = Some(vec![
+            MessageContentBlock::Text {
+                text: "caption".into(),
+                cache_control: None,
+            },
+            MessageContentBlock::Image {
+                base64: "AAAA".into(),
+                media_type: "image/png".into(),
+            },
+        ]);
+        let req = mk_req(vec![msg]);
+        let lm = translate_chat_request(&req);
+        let user_msg = &lm.messages[0];
+        assert_eq!(user_msg.content.len(), 2, "text + image preserved");
+        match &user_msg.content[1] {
+            MessageContent::Image(img) => {
+                assert_eq!(img.source.as_ref(), "AAAA");
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t3_i8_tool_result_tool_name_looked_up_from_prior_tool_call() {
+        use caduceus_core::{ToolResult as CoreToolResult, ToolUse as CoreToolUse};
+        use caduceus_providers::Message as ProvMsg;
+
+        // Assistant issued a tool call earlier in the same request.
+        let asst = ProvMsg {
+            role: "assistant".into(),
+            content: String::new(),
+            content_blocks: None,
+            tool_calls: vec![CoreToolUse {
+                id: "call_42".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "a.txt"}),
+            }],
+            tool_result: None,
+            cache_breakpoint: false,
+        };
+        // User followed up with the tool result referencing id "call_42".
+        let tool_result_msg = ProvMsg {
+            role: "user".into(),
+            content: String::new(),
+            content_blocks: None,
+            tool_calls: vec![],
+            tool_result: Some(
+                CoreToolResult::success("hello").with_tool_use_id("call_42"),
+            ),
+            cache_breakpoint: false,
+        };
+        let req = mk_req(vec![asst, tool_result_msg]);
+        let lm = translate_chat_request(&req);
+        // Find the ToolResult content in the translated stream.
+        let mut found = false;
+        for m in &lm.messages {
+            for c in &m.content {
+                if let MessageContent::ToolResult(tr) = c {
+                    assert_eq!(tr.tool_use_id.to_string(), "call_42");
+                    assert_eq!(tr.tool_name.as_ref(), "read_file");
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "ToolResult must appear in translated messages");
+    }
+
+    #[tokio::test]
+    async fn t3_i9_streaming_thinking_surfaces_on_stream_chunk() {
+        let events: BoxStream<'static, _> = stream::iter(vec![
+            Ok(LanguageModelCompletionEvent::Thinking {
+                text: "hmm ".into(),
+                signature: None,
+            }),
+            Ok(LanguageModelCompletionEvent::Text("answer".into())),
+            Ok(LanguageModelCompletionEvent::Stop(LmStopReason::EndTurn)),
+        ])
+        .boxed();
+        let mut s = Box::pin(stream_to_chunks(events));
+        let mut thinking = String::new();
+        let mut text = String::new();
+        let mut saw_final = false;
+        while let Some(item) = s.next().await {
+            let chunk = item.expect("ok");
+            if !chunk.thinking.is_empty() {
+                thinking.push_str(&chunk.thinking);
+            }
+            if !chunk.delta.is_empty() {
+                text.push_str(&chunk.delta);
+            }
+            if chunk.is_final {
+                saw_final = true;
+            }
+        }
+        assert_eq!(thinking, "hmm ", "thinking delta must propagate");
+        assert_eq!(text, "answer");
+        assert!(saw_final);
     }
 }
