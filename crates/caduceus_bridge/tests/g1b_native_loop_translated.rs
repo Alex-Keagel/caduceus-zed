@@ -138,7 +138,7 @@ async fn native_loop_translated_refuses_when_flag_off() {
     assert!(result.is_err(), "flag OFF must refuse");
     let err = result.unwrap_err();
     assert!(
-        err.contains("native loop is disabled"),
+        err.to_string().contains("native loop is disabled"),
         "error should mention flag, got: {err}"
     );
 }

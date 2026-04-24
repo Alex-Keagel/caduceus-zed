@@ -12,6 +12,7 @@
 //! - Memory persistence via filesystem
 //! - Session management via `SqliteStorage`
 
+pub mod bridge_error;
 pub mod context_events;
 pub mod crdt;
 pub mod dag_state;

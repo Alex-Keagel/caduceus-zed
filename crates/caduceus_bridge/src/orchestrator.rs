@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::PermissionEnvelope;
+use crate::bridge_error::BridgeError;
 use crate::{BuiltinScopedContextInjector, ContextInjector};
 
 // Re-export orchestrator types for consumers.
@@ -133,8 +134,8 @@ pub fn apply_plan_amendment(
 /// P3.1 — Render a snapshot of the current [`ActionPlan`] as JSON for
 /// the UI. The shape mirrors the per‑step revision so the React panel can
 /// detect divergence on the next amendment attempt.
-pub fn snapshot_plan_json(plan: &ActionPlan) -> Result<String, String> {
-    serde_json::to_string(plan).map_err(|e| e.to_string())
+pub fn snapshot_plan_json(plan: &ActionPlan) -> Result<String, BridgeError> {
+    serde_json::to_string(plan).map_err(Into::into)
 }
 
 // ── P3.3 — per-tool-batch checkpoint + 1-click revert ─────────────────────
@@ -209,9 +210,9 @@ pub fn revert_checkpoint(
 /// Render the full checkpoint timeline as JSON for the React panel.
 /// Order is newest-first (matches `CheckpointStore::list`); the panel
 /// can render directly without reversing.
-pub fn list_checkpoints_json(store: &CheckpointStore) -> Result<String, String> {
+pub fn list_checkpoints_json(store: &CheckpointStore) -> Result<String, BridgeError> {
     let v: Vec<&ToolBatchCheckpoint> = store.list();
-    serde_json::to_string(&v).map_err(|e| e.to_string())
+    serde_json::to_string(&v).map_err(Into::into)
 }
 
 // ── P3.4 — background notifications fabric ───────────────────────────────
@@ -253,8 +254,8 @@ pub fn publish_automation_completion(
 /// Render a [`BusMessage`] payload as a typed
 /// [`Notification`]. Returns `Err` only if the message did not
 /// originate from the notifications publisher (malformed JSON).
-pub fn parse_notification(msg: &BusMessage) -> Result<Notification, String> {
-    serde_json::from_str(&msg.content).map_err(|e| e.to_string())
+pub fn parse_notification(msg: &BusMessage) -> Result<Notification, BridgeError> {
+    serde_json::from_str(&msg.content).map_err(Into::into)
 }
 
 // ── P4.1 — MemoryBlocks bridge ───────────────────────────────────────────
@@ -298,8 +299,8 @@ pub fn compact_memory_blocks(blocks: &mut MemoryBlocks) -> MemoryCompactionRepor
 }
 
 /// Render the entire memory-blocks snapshot as JSON for the panel.
-pub fn snapshot_memory_blocks_json(blocks: &MemoryBlocks) -> Result<String, String> {
-    serde_json::to_string(blocks).map_err(|e| e.to_string())
+pub fn snapshot_memory_blocks_json(blocks: &MemoryBlocks) -> Result<String, BridgeError> {
+    serde_json::to_string(blocks).map_err(Into::into)
 }
 
 // ── P4.2 — context_fold bridge ───────────────────────────────────────────
@@ -456,14 +457,14 @@ pub fn train_bradley_terry_from_jsonl(jsonl: &str) -> BradleyTerryModel {
 
 /// Snapshot a trained model as JSON for persistence under
 /// `.caduceus/models/compaction.json`.
-pub fn snapshot_bradley_terry_json(model: &BradleyTerryModel) -> Result<String, String> {
-    serde_json::to_string(model).map_err(|e| e.to_string())
+pub fn snapshot_bradley_terry_json(model: &BradleyTerryModel) -> Result<String, BridgeError> {
+    serde_json::to_string(model).map_err(Into::into)
 }
 
 /// Restore a model from a JSON blob. Errors surface as `Err(String)`
 /// so the IDE can fall back to the heuristic selector.
-pub fn load_bradley_terry_json(json: &str) -> Result<BradleyTerryModel, String> {
-    serde_json::from_str(json).map_err(|e| e.to_string())
+pub fn load_bradley_terry_json(json: &str) -> Result<BradleyTerryModel, BridgeError> {
+    serde_json::from_str(json).map_err(Into::into)
 }
 
 // ── P5.3 — Learned compaction-strategy selector bridge ──────────────────
@@ -658,16 +659,16 @@ pub use caduceus_core::{
 /// serialise to JSON. The IDE persists this form to the on-disk session
 /// log so a future build (newer or older schema) can decode without losing
 /// the original payload — unknown variants fall back to `AgentEvent::Unknown`.
-pub fn wrap_event_json(event: &AgentEvent) -> Result<String, String> {
+pub fn wrap_event_json(event: &AgentEvent) -> Result<String, BridgeError> {
     let envelope = VersionedAgentEvent::current(event.clone());
-    serde_json::to_string(&envelope).map_err(|e| e.to_string())
+    serde_json::to_string(&envelope).map_err(Into::into)
 }
 
 /// Decode a versioned envelope. Returns the inner event together with a
 /// flag set when the producer's schema version is newer than this build —
 /// the UI can then surface a "client out of date" hint.
-pub fn parse_versioned_event_json(s: &str) -> Result<(AgentEvent, bool), String> {
-    let envelope: VersionedAgentEvent = serde_json::from_str(s).map_err(|e| e.to_string())?;
+pub fn parse_versioned_event_json(s: &str) -> Result<(AgentEvent, bool), BridgeError> {
+    let envelope: VersionedAgentEvent = serde_json::from_str(s)?;
     let from_newer = envelope.is_from_newer_producer();
     Ok((envelope.event, from_newer))
 }
@@ -924,9 +925,9 @@ impl OrchestratorBridge {
     }
 
     /// Load workspace instructions from .caduceus/ hierarchy.
-    pub fn load_instructions(&self) -> Result<InstructionSet, String> {
+    pub fn load_instructions(&self) -> Result<InstructionSet, BridgeError> {
         let loader = InstructionLoader::new(&self.project_root);
-        loader.load().map_err(|e| e.to_string())
+        loader.load().map_err(|e| BridgeError::workspace(e.to_string()))
     }
 
     /// Create a new conversation history.
@@ -961,13 +962,13 @@ impl OrchestratorBridge {
     // ── Conversation history persistence ─────────────────────────────────
 
     /// Serialize conversation history to JSON.
-    pub fn conversation_serialize(history: &ConversationHistory) -> Result<String, String> {
-        history.serialize().map_err(|e| e.to_string())
+    pub fn conversation_serialize(history: &ConversationHistory) -> Result<String, BridgeError> {
+        history.serialize().map_err(|e| BridgeError::workspace(e.to_string()))
     }
 
     /// Deserialize conversation history from JSON.
-    pub fn conversation_deserialize(json: &str) -> Result<ConversationHistory, String> {
-        ConversationHistory::deserialize(json).map_err(|e| e.to_string())
+    pub fn conversation_deserialize(json: &str) -> Result<ConversationHistory, BridgeError> {
+        ConversationHistory::deserialize(json).map_err(|e| BridgeError::workspace(e.to_string()))
     }
 
     /// Truncate conversation history, keeping at most `max` messages.
@@ -1355,13 +1356,9 @@ impl OrchestratorBridge {
         user_input: &str,
         reducer: crate::dag_state::ReducerHandle,
         event_rx: tokio::sync::mpsc::Receiver<AgentEvent>,
-    ) -> Result<String, String> {
+    ) -> Result<String, BridgeError> {
         if !self.native_loop_enabled() {
-            return Err(
-                "caduceus native loop is disabled; enable via set_native_loop_enabled(true) \
-                 (flag: caduceus.native_loop)"
-                    .into(),
-            );
+            return Err(BridgeError::NativeLoopDisabled);
         }
 
         // Forwarder pumps the emitter stream into the reducer until the
@@ -1378,7 +1375,7 @@ impl OrchestratorBridge {
         let run_result = harness
             .run(state, history, user_input)
             .await
-            .map_err(|e| e.to_string());
+            .map_err(BridgeError::from);
 
         // Signal drain; ignore send errors (forwarder already observed
         // channel close, which is the preferred path anyway).
@@ -1420,13 +1417,9 @@ impl OrchestratorBridge {
         translated_tx: tokio::sync::mpsc::UnboundedSender<
             crate::event_translator::TranslatedThreadEvent,
         >,
-    ) -> Result<String, String> {
+    ) -> Result<String, BridgeError> {
         if !self.native_loop_enabled() {
-            return Err(
-                "caduceus native loop is disabled; enable via set_native_loop_enabled(true) \
-                 (flag: caduceus.native_loop)"
-                    .into(),
-            );
+            return Err(BridgeError::NativeLoopDisabled);
         }
 
         let reducer_fwd = reducer.clone();
@@ -1441,7 +1434,7 @@ impl OrchestratorBridge {
         let run_result = harness
             .run(state, history, user_input)
             .await
-            .map_err(|e| e.to_string());
+            .map_err(BridgeError::from);
 
         let _ = drain_tx.send(());
         await_forwarder_with_timeout(forwarder, "translated forwarder").await;
@@ -1454,11 +1447,11 @@ impl OrchestratorBridge {
         harness: &AgentHarness,
         state: &mut SessionState,
         user_input: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, BridgeError> {
         harness
             .run_turn(state, user_input)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(BridgeError::from)
     }
 
     /// Run a single agent turn with streaming.
@@ -1466,11 +1459,11 @@ impl OrchestratorBridge {
         harness: &AgentHarness,
         state: &mut SessionState,
         user_input: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, BridgeError> {
         harness
             .stream_turn(state, user_input)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(BridgeError::from)
     }
 
     // ── PRD parsing ──────────────────────────────────────────────────────
@@ -3490,7 +3483,7 @@ mod tests {
     #[test]
     fn p5_2_load_malformed_json_fails_closed() {
         let err = load_bradley_terry_json("not json").unwrap_err();
-        assert!(!err.is_empty());
+        assert!(!err.to_string().is_empty());
     }
 
     // ── P5.3 — Learned selector bridge ───────────────────────────────────
@@ -3789,7 +3782,7 @@ mod tests {
         assert!(res.is_err());
         let msg = res.unwrap_err();
         assert!(
-            msg.contains("native loop is disabled"),
+            msg.to_string().contains("native loop is disabled"),
             "error MUST name the flag so operators can find it: got {msg:?}"
         );
     }
@@ -3912,7 +3905,7 @@ mod tests {
 
         let err = result.expect_err("pre-cancelled token MUST surface as Err");
         assert!(
-            err.contains("Cancelled"),
+            err.to_string().contains("Cancelled"),
             "error MUST preserve the underlying cancellation reason: got {err:?}"
         );
     }
@@ -4205,10 +4198,10 @@ pub struct SkillDescriptor {
 /// mutates on disk (file watcher). Not event-driven via `AgentEvent`
 /// today — add a `SkillCatalogChanged` event if UIs need live updates
 /// without polling.
-pub fn list_bundled_skills(workspace_root: &Path) -> Result<Vec<SkillDescriptor>, String> {
+pub fn list_bundled_skills(workspace_root: &Path) -> Result<Vec<SkillDescriptor>, BridgeError> {
     let set = InstructionLoader::new(workspace_root)
         .load()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| BridgeError::workspace(e.to_string()))?;
     let mut out: Vec<SkillDescriptor> = set
         .available_skills
         .into_iter()
