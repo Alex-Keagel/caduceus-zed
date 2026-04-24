@@ -341,7 +341,19 @@ pub(crate) fn translate_chat_request(req: &ChatRequest) -> LanguageModelRequest 
         stop: req.stop.clone(),
         temperature: req.temperature,
         thinking_allowed: req.thinking_mode,
+        thinking_effort: req.thinking_effort.clone(),
+        speed: req.speed.map(map_caduceus_speed_to_zed),
         ..Default::default()
+    }
+}
+
+/// A3 FU#2: map caduceus's [`caduceus_providers::Speed`] → Zed's
+/// [`language_model::Speed`]. Byte-for-byte identical serde shapes but the
+/// types live in separate crates, so we map explicitly.
+fn map_caduceus_speed_to_zed(speed: caduceus_providers::Speed) -> language_model::Speed {
+    match speed {
+        caduceus_providers::Speed::Standard => language_model::Speed::Standard,
+        caduceus_providers::Speed::Fast => language_model::Speed::Fast,
     }
 }
 
