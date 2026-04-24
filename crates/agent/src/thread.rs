@@ -7587,6 +7587,143 @@ mod native_dispatch_tests {
             other => panic!("expected EngineDiagnostic, got {other:?}"),
         });
     }
+
+    // ── R2-2 regression guards ────────────────────────────────────────
+    //
+    // The bridge `event_translator` preserves richer payloads on several
+    // variants (per the H2 comments at `event_translator.rs:37-140`) than
+    // the dispatcher currently surfaces to the UI. The arms below use
+    // `..` patterns that silently drop fields; translator tests pass,
+    // consumers see nothing, no compile-time signal.
+    //
+    // These tests pin the CURRENT drop behavior as documented drift.
+    // If one of these tests fails because the dispatcher now forwards
+    // the dropped field, update BOTH the test AND wire the field end-to-
+    // end (new `ThreadEvent` variant or expanded message). See R2-1
+    // (`turn_complete_forwards_usage_payload_before_stop`) for the
+    // wiring pattern.
+
+    /// Drift guard: `AgentThinkingComplete.duration_ms` is preserved by
+    /// the translator but dropped at `thread.rs:5895` via a `..` pattern.
+    /// If the dispatcher starts surfacing duration, wire it into the UI
+    /// (e.g. a ThinkingComplete variant with duration) rather than
+    /// merging it into the free-form content string.
+    #[test]
+    fn r2_2_thinking_complete_silently_drops_duration_ms() {
+        let evs = dispatch_one(T::AgentThinkingComplete {
+            content: "final".into(),
+            duration_ms: 4242,
+        });
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            ThreadEvent::AgentThinking(s) => {
+                assert_eq!(s, "final");
+                assert!(
+                    !s.contains("4242"),
+                    "duration_ms must not leak into content string verbatim; \
+                     if surfacing duration is desired, add a structured variant"
+                );
+            }
+            other => panic!("expected AgentThinking, got {other:?}"),
+        }
+    }
+
+    /// Drift guard: `PlanStep.{step_id, plan_revision, depends_on,
+    /// parent_step_id}` are preserved by the translator (for DAG
+    /// rendering) but dropped at `thread.rs:6026-6031` via `..`. Only
+    /// the positional `step`/`tool`/`description` reach the UI as a
+    /// ContextNotice. If DAG rendering lands, emit a structured
+    /// PlanStep variant instead of folding numbers into prose.
+    #[test]
+    fn r2_2_plan_step_silently_drops_dag_fields() {
+        let evs = dispatch_one(T::PlanStep {
+            step: 7,
+            step_id: 999_111,
+            plan_revision: 42,
+            tool: "grep".into(),
+            description: "find foo".into(),
+            depends_on: vec![100, 200, 300],
+            parent_step_id: Some(500),
+        });
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            ThreadEvent::ContextNotice(n) => {
+                assert_eq!(n.kind, "plan.step");
+                // Positional fields reach the UI.
+                assert!(n.message.contains("#7"));
+                assert!(n.message.contains("grep"));
+                assert!(n.message.contains("find foo"));
+                // DAG fields are silently dropped.
+                assert!(!n.message.contains("999111"));
+                assert!(!n.message.contains("100"));
+                assert!(!n.message.contains("500"));
+            }
+            other => panic!("expected ContextNotice, got {other:?}"),
+        }
+    }
+
+    /// Drift guard: `PlanAmended.plan_revision` is preserved by the
+    /// translator but dropped at `thread.rs:6032-6040` via `..`. If
+    /// revision tracking lands in the UI, emit it as a structured
+    /// field rather than interpolating into the notice body.
+    #[test]
+    fn r2_2_plan_amended_silently_drops_plan_revision() {
+        let evs = dispatch_one(T::PlanAmended {
+            plan_revision: 77_777,
+            kind: "replace".into(),
+            step: 3,
+            ok: true,
+            reason: "user asked".into(),
+        });
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            ThreadEvent::ContextNotice(n) => {
+                assert_eq!(n.kind, "plan.amended");
+                assert!(n.message.contains("#3"));
+                assert!(n.message.contains("replace"));
+                assert!(n.message.contains("user asked"));
+                // Revision silently dropped.
+                assert!(
+                    !n.message.contains("77777"),
+                    "plan_revision must not leak as a substring; surface it structurally"
+                );
+            }
+            other => panic!("expected ContextNotice, got {other:?}"),
+        }
+    }
+
+    /// Drift guard: `ModeChanged.{from_lens, to_lens}` are preserved by
+    /// the translator but dropped at `thread.rs:6000-6002` via `..`. If
+    /// lens transitions need to drive UI (e.g. Act.Review → Act.Debug
+    /// badge animations), emit them as structured fields in a
+    /// dedicated ModeChanged variant, not interpolated prose.
+    #[test]
+    fn r2_2_mode_changed_silently_drops_lens_fields() {
+        let evs = dispatch_one(T::ModeChanged {
+            from_mode: "Plan".into(),
+            to_mode: "Act".into(),
+            from_lens: Some("LensAlpha".into()),
+            to_lens: Some("LensBeta".into()),
+        });
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            ThreadEvent::ContextNotice(n) => {
+                assert_eq!(n.kind, "mode.changed");
+                assert!(n.message.contains("Plan"));
+                assert!(n.message.contains("Act"));
+                // Lens transitions silently dropped.
+                assert!(
+                    !n.message.contains("LensAlpha"),
+                    "from_lens must not leak into notice text; surface structurally"
+                );
+                assert!(
+                    !n.message.contains("LensBeta"),
+                    "to_lens must not leak into notice text; surface structurally"
+                );
+            }
+            other => panic!("expected ContextNotice, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
