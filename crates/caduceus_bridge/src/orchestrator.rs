@@ -4445,4 +4445,93 @@ mod p13c_catalog_tests {
     fn list_models_is_deterministic_across_calls() {
         assert_eq!(list_models(), list_models());
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // GPUI × tokio crash regression tests.
+    //
+    // Both crashes from NW-4 dogfood root-caused to the same class of
+    // bug: calling `tokio::spawn` / `tokio::time::*` on a thread that
+    // does not have a Tokio runtime installed (e.g. GPUI's foreground
+    // executor, which is smol-based). The default `#[tokio::test]`
+    // macro installs a runtime on the test thread and hides this bug.
+    //
+    // These tests deliberately run as plain `#[test]` so the caller
+    // thread has NO ambient runtime. They prove the contract:
+    //
+    //   * `spawn_forwarder` panics without a runtime (documents the
+    //     requirement).
+    //   * `spawn_forwarder` works when wrapped in
+    //     `tokio_rt::bridge_runtime_handle().enter()` (the pattern
+    //     thread.rs::try_run_turn_native uses).
+    //
+    // If someone deletes the `_bridge_rt_guard` line from thread.rs,
+    // the production code crashes at runtime the same way NW-4 did —
+    // but these tests still pass, because they test the bridge helpers
+    // directly. The matching "thread.rs calls this with the guard"
+    // contract is enforced by the doc comment on
+    // `tokio_rt::bridge_runtime_handle`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn spawn_forwarder_panics_without_ambient_runtime() {
+        use std::panic::AssertUnwindSafe;
+
+        let (_tx, rx) = tokio::sync::mpsc::channel::<AgentEvent>(1);
+        // No runtime on this thread; `tokio::spawn` inside
+        // `spawn_forwarder` must `TryCurrentError`-panic. We use
+        // catch_unwind so the test itself doesn't abort.
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = spawn_forwarder(rx, |_ev| {});
+        }));
+        assert!(
+            result.is_err(),
+            "spawn_forwarder must panic without an ambient Tokio runtime; \
+             if this ever starts passing, the bridge either no longer \
+             requires a runtime (re-audit thread.rs guard) OR silently \
+             spawns into a hidden runtime (leak risk)."
+        );
+    }
+
+    #[test]
+    fn spawn_forwarder_works_under_bridge_runtime_enter_guard() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        // Mirror what thread.rs::try_run_turn_native does: install the
+        // process-wide bridge runtime as the ambient runtime for this
+        // thread, then call into bridge helpers.
+        let handle = crate::tokio_rt::bridge_runtime_handle();
+        let _guard = handle.enter();
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_cb = Arc::clone(&seen);
+
+        // The forwarder task needs a runtime to `.block_on`-style
+        // drive it to completion. We reuse the same bridge runtime
+        // that the guard points at.
+        handle.block_on(async move {
+            let (tx, rx) = tokio::sync::mpsc::channel::<AgentEvent>(4);
+            let (jh, drain_tx) = spawn_forwarder(rx, move |_ev| {
+                seen_cb.fetch_add(1, Ordering::SeqCst);
+            });
+
+            tx.send(AgentEvent::Error {
+                message: "regression-test".into(),
+            })
+            .await
+            .unwrap();
+
+            drop(tx);
+            let _ = drain_tx.send(());
+            await_forwarder_with_timeout(jh, "regression_forwarder").await;
+        });
+
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "forwarder must drain exactly one event under the bridge runtime enter guard"
+        );
+    }
 }

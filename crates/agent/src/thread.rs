@@ -3552,6 +3552,23 @@ impl Thread {
         });
 
         // ── Phase 7: run the engine loop ───────────────────────────
+        //
+        // `run_caduceus_loop_translated` (and its `spawn_forwarder`
+        // helper) call `tokio::spawn` + `tokio::time::timeout`, both of
+        // which require a live Tokio runtime on the current thread.
+        // This async fn is polled by GPUI's foreground executor (NOT a
+        // Tokio runtime), so without this guard `Handle::current()`
+        // panics and the app aborts on the first native-loop turn.
+        //
+        // `tokio_rt::bridge_runtime_handle().enter()` installs the
+        // process-wide bridge runtime on the current thread; the guard
+        // stays live for the entire async scope below because GPUI
+        // foreground polls stay pinned to the main thread (task-local
+        // state persists across .await points on a single-threaded
+        // executor). Dropping the guard at scope end releases the
+        // thread-local back to its previous (none) state.
+        let _bridge_rt_guard = caduceus_bridge::tokio_rt::bridge_runtime_handle().enter();
+
         let reducer = setup.bridge.new_reducer_handle();
         let state_mut = &mut *state_guard;
         let run_result = setup
