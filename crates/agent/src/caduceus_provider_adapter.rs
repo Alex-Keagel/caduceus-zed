@@ -309,12 +309,12 @@ pub(crate) fn translate_chat_request(req: &ChatRequest) -> LanguageModelRequest 
     // `tool_name` for provenance + UI rendering.
     let mut tool_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    for m in &req.messages {
+    for m in req.messages.iter() {
         for tc in &m.tool_calls {
             tool_names.insert(tc.id.clone(), tc.name.clone());
         }
     }
-    for m in &req.messages {
+    for m in req.messages.iter() {
         messages.push(translate_message(m, &tool_names));
     }
 
@@ -710,7 +710,7 @@ mod tests {
     fn mk_req(messages: Vec<Message>) -> ProvReq {
         ProvReq {
             model: caduceus_core::ModelId("test".into()),
-            messages,
+            messages: messages.into(),
             system: None,
             max_tokens: 1024,
             temperature: Some(0.7),
@@ -830,7 +830,8 @@ mod tests {
                     cache_breakpoint: false,
                 },
                 mk_user_msg("go"),
-            ],
+            ]
+            .into(),
             system: None,
             max_tokens: 256,
             temperature: None,
