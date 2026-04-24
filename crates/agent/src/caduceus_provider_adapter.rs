@@ -44,8 +44,8 @@
 use async_trait::async_trait;
 use caduceus_core::{CaduceusError, ProviderId, StopReason, ToolUse};
 use caduceus_providers::{
-    ChatRequest, ChatResponse, LlmAdapter, Message, MessageContentBlock, StreamChunk, StreamResult,
-    ToolChoice,
+    ChatRequest, ChatResponse, CompletionIntent as CaduceusIntent, LlmAdapter, Message,
+    MessageContentBlock, StreamChunk, StreamResult, ToolChoice,
 };
 use futures::{
     Stream, StreamExt,
@@ -53,10 +53,10 @@ use futures::{
     stream::BoxStream,
 };
 use language_model::{
-    LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelRequest,
-    LanguageModelRequestMessage, LanguageModelRequestTool, LanguageModelToolChoice,
-    LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolUse, MessageContent,
-    Role, StopReason as LmStopReason,
+    CompletionIntent as LmIntent, LanguageModelCompletionError, LanguageModelCompletionEvent,
+    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
+    LanguageModelToolChoice, LanguageModelToolResult, LanguageModelToolResultContent,
+    LanguageModelToolUse, MessageContent, Role, StopReason as LmStopReason,
 };
 use std::sync::Arc;
 use std::task::{Context as TaskCtx, Poll};
@@ -320,17 +320,42 @@ pub(crate) fn translate_chat_request(req: &ChatRequest) -> LanguageModelRequest 
     let tool_choice = req.tool_choice.as_ref().and_then(translate_tool_choice);
 
     LanguageModelRequest {
-        thread_id: None,
-        prompt_id: None,
-        intent: None,
+        thread_id: req.thread_id.clone(),
+        prompt_id: req.prompt_id.clone(),
+        intent: req.intent.and_then(map_caduceus_intent_to_zed),
         messages,
         tools,
         tool_choice,
-        stop: Vec::new(),
+        stop: req.stop.clone(),
         temperature: req.temperature,
         thinking_allowed: req.thinking_mode,
         ..Default::default()
     }
+}
+
+/// A3 PR-C: map caduceus's [`CompletionIntent`] → Zed's
+/// [`language_model::CompletionIntent`]. The 10 shared variants map 1-to-1;
+/// caduceus-only variants (`VerificationRollout`, `SummarizationFallback`,
+/// `OneShot`) return `None` because Zed's enum has no representation for
+/// them — dropping the intent on the wire is safer than forcing a
+/// semantically-wrong variant.
+fn map_caduceus_intent_to_zed(intent: CaduceusIntent) -> Option<LmIntent> {
+    Some(match intent {
+        CaduceusIntent::UserPrompt => LmIntent::UserPrompt,
+        CaduceusIntent::Subagent => LmIntent::Subagent,
+        CaduceusIntent::ToolResults => LmIntent::ToolResults,
+        CaduceusIntent::ThreadSummarization => LmIntent::ThreadSummarization,
+        CaduceusIntent::ThreadContextSummarization => LmIntent::ThreadContextSummarization,
+        CaduceusIntent::CreateFile => LmIntent::CreateFile,
+        CaduceusIntent::EditFile => LmIntent::EditFile,
+        CaduceusIntent::InlineAssist => LmIntent::InlineAssist,
+        CaduceusIntent::TerminalInlineAssist => LmIntent::TerminalInlineAssist,
+        CaduceusIntent::GenerateGitCommitMessage => LmIntent::GenerateGitCommitMessage,
+        // Caduceus-only — no Zed equivalent. Drop the intent.
+        CaduceusIntent::VerificationRollout
+        | CaduceusIntent::SummarizationFallback
+        | CaduceusIntent::OneShot => return None,
+    })
 }
 
 fn translate_tool_choice(tc: &ToolChoice) -> Option<LanguageModelToolChoice> {
@@ -671,6 +696,74 @@ mod tests {
         assert_eq!(lm.messages[0].role, Role::System);
         assert_eq!(lm.messages[1].role, Role::User);
         assert_eq!(lm.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn a3_prc_forwards_thread_prompt_stop_fields() {
+        // PR-C: translate_chat_request must forward A3 fields from the
+        // caduceus ChatRequest verbatim (not drop them to None).
+        let mut req = mk_req(vec![mk_user_msg("x")]);
+        req.thread_id = Some("thread-42".into());
+        req.prompt_id = Some("prompt-7".into());
+        req.stop = vec!["\n\n".into(), "STOP".into()];
+        let lm = translate_chat_request(&req);
+        assert_eq!(lm.thread_id.as_deref(), Some("thread-42"));
+        assert_eq!(lm.prompt_id.as_deref(), Some("prompt-7"));
+        assert_eq!(lm.stop, vec!["\n\n".to_string(), "STOP".to_string()]);
+    }
+
+    #[test]
+    fn a3_prc_intent_shared_variants_map_1_to_1() {
+        // Zed's 10 variants round-trip through caduceus::CompletionIntent.
+        use CaduceusIntent as C;
+        use LmIntent as L;
+        let pairs = [
+            (C::UserPrompt, L::UserPrompt),
+            (C::Subagent, L::Subagent),
+            (C::ToolResults, L::ToolResults),
+            (C::ThreadSummarization, L::ThreadSummarization),
+            (C::ThreadContextSummarization, L::ThreadContextSummarization),
+            (C::CreateFile, L::CreateFile),
+            (C::EditFile, L::EditFile),
+            (C::InlineAssist, L::InlineAssist),
+            (C::TerminalInlineAssist, L::TerminalInlineAssist),
+            (C::GenerateGitCommitMessage, L::GenerateGitCommitMessage),
+        ];
+        for (c, l) in pairs {
+            assert_eq!(
+                map_caduceus_intent_to_zed(c),
+                Some(l),
+                "intent {c:?} must map to {l:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a3_prc_caduceus_only_intents_drop_to_none() {
+        // VerificationRollout / SummarizationFallback / OneShot have no Zed
+        // equivalent — the mapper drops them so Zed models don't receive
+        // a semantically-wrong fallback.
+        assert_eq!(
+            map_caduceus_intent_to_zed(CaduceusIntent::VerificationRollout),
+            None
+        );
+        assert_eq!(
+            map_caduceus_intent_to_zed(CaduceusIntent::SummarizationFallback),
+            None
+        );
+        assert_eq!(map_caduceus_intent_to_zed(CaduceusIntent::OneShot), None);
+    }
+
+    #[test]
+    fn a3_prc_translate_chat_request_forwards_intent() {
+        let mut req = mk_req(vec![mk_user_msg("x")]);
+        req.intent = Some(CaduceusIntent::UserPrompt);
+        let lm = translate_chat_request(&req);
+        assert_eq!(lm.intent, Some(LmIntent::UserPrompt));
+
+        req.intent = Some(CaduceusIntent::VerificationRollout);
+        let lm = translate_chat_request(&req);
+        assert_eq!(lm.intent, None, "caduceus-only intent must not leak");
     }
 
     #[test]
