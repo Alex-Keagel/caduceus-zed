@@ -644,6 +644,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         }
     }
 
@@ -698,6 +702,10 @@ mod tests {
             }]
             .into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let lm = translate_chat_request(&req);
         assert_eq!(lm.messages[0].role, Role::Assistant);
