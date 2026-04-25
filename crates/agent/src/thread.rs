@@ -12,7 +12,8 @@ use crate::{
     CaduceusTimeTrackingTool, CaduceusTreeSitterTool, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool,
     FetchTool, FindPathTool, GrepTool, ListDirectoryTool, MovePathTool, NowTool, OpenTool,
-    ProjectSnapshot, ReadFileTool, RestoreFileFromDiskTool, SaveFileTool, SpawnAgentTool,
+    ProjectSnapshot, ReadFileTool, ReadThreadTool, RestoreFileFromDiskTool, SaveFileTool,
+    CompactThreadTool, SpawnAgentTool,
     StreamingEditFileTool, SystemPromptTemplate, Template, Templates, TerminalTool,
     ToolPermissionDecision, UpdatePlanTool, WebSearchTool, decide_permission_from_settings,
 };
@@ -2608,6 +2609,8 @@ impl Thread {
         if self.depth() < MAX_SUBAGENT_DEPTH {
             self.add_tool(SpawnAgentTool::new(environment));
         }
+        self.add_tool(ReadThreadTool::new());
+        self.add_tool(CompactThreadTool::new());
     }
 
     pub fn add_tool<T: AgentTool>(&mut self, tool: T) {
