@@ -1057,6 +1057,13 @@ impl NativeAgent {
                 .input(acp::AvailableCommandInput::Unstructured(
                     acp::UnstructuredCommandInput::new("<session_id>"),
                 )),
+            acp::AvailableCommand::new(
+                "init",
+                "Create a new project directory under ~/Dev and bind it as the workspace",
+            )
+            .input(acp::AvailableCommandInput::Unstructured(
+                acp::UnstructuredCommandInput::new("<name>"),
+            )),
         ];
 
         let Some(state) = project_state else {
@@ -1401,6 +1408,15 @@ impl NativeAgentConnection {
         session_id: &acp::SessionId,
         cx: &mut App,
     ) -> Option<Task<Result<acp::PromptResponse>>> {
+        // Caduceus newproj-1: `/init <name>` — create a fresh project dir
+        // under ~/Dev and bind it as a visible worktree on the current
+        // session's project. Closes the "no workspace folder → degraded
+        // output" cascade by giving the agent a folder to write into
+        // without forcing the user through mkdir + Cmd-O.
+        if command.eq_ignore_ascii_case("init") {
+            return Some(self.handle_init_command(args, session_id.clone(), cx));
+        }
+
         let response_text = match command.to_lowercase().as_str() {
             "compact" => {
                 let outcome = if let Some(thread) = self.thread(session_id, cx) {
@@ -1838,6 +1854,152 @@ impl NativeAgentConnection {
         Some(Task::ready(Ok(acp::PromptResponse::new(
             acp::StopReason::EndTurn,
         ))))
+    }
+
+    /// Caduceus newproj-1: implementation of the `/init <name>` slash
+    /// command. Creates `~/Dev/<name>` (or `<cwd>/<name>` if pwd is set
+    /// to a parent dir) and binds it as a visible worktree on the
+    /// session's project so all caduceus features (native loop, auto-
+    /// index, CADUCEUS.md loaders, file writes) work from turn 1.
+    fn handle_init_command(
+        &self,
+        args: &str,
+        session_id: acp::SessionId,
+        cx: &mut App,
+    ) -> Task<Result<acp::PromptResponse>> {
+        let raw = args.trim().trim_matches(|c: char| c == '"' || c == '\'');
+        if raw.is_empty() {
+            return Self::push_init_response(
+                self,
+                &session_id,
+                "❌ Usage: `/init <name>` — creates `~/Dev/<name>` and binds it as the workspace.".to_string(),
+                cx,
+            );
+        }
+
+        // Sanitize: name must be a single path segment (no slashes,
+        // no traversal). Reject anything that isn't a sensible
+        // directory name to avoid surprises.
+        let name = raw.trim_matches('/');
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name == "."
+            || name == ".."
+            || name.starts_with('.')
+        {
+            return Self::push_init_response(
+                self,
+                &session_id,
+                format!(
+                    "❌ Invalid project name `{}`. Use a single directory segment with no slashes (e.g. `nanoreason`).",
+                    raw
+                ),
+                cx,
+            );
+        }
+
+        let parent = match std::env::var_os("HOME").map(PathBuf::from) {
+            Some(home) => home.join("Dev"),
+            None => {
+                return Self::push_init_response(
+                    self,
+                    &session_id,
+                    "❌ $HOME is not set; cannot resolve `~/Dev`.".to_string(),
+                    cx,
+                );
+            }
+        };
+        let target = parent.join(name);
+
+        if let Err(err) = std::fs::create_dir_all(&target) {
+            return Self::push_init_response(
+                self,
+                &session_id,
+                format!(
+                    "❌ Could not create `{}`: {err}",
+                    target.display()
+                ),
+                cx,
+            );
+        }
+
+        let inner = self.0.read(cx);
+        let Some(session) = inner.sessions.get(&session_id) else {
+            return Self::push_init_response(
+                self,
+                &session_id,
+                "❌ No active session.".to_string(),
+                cx,
+            );
+        };
+        let project_id = session.project_id;
+        let acp_thread = session.acp_thread.clone();
+        let Some(project_state) = inner.projects.get(&project_id) else {
+            return Self::push_init_response(
+                self,
+                &session_id,
+                "❌ Project state missing.".to_string(),
+                cx,
+            );
+        };
+        let project = project_state.project.clone();
+        drop(inner);
+
+        let target_for_msg = target.clone();
+        cx.spawn(async move |cx| {
+            let create_task = project.update(cx, |project, cx| {
+                project.create_worktree(target.as_path(), true, cx)
+            });
+            let create = create_task.await;
+            let message = match create {
+                Ok(_worktree) => format!(
+                    "✅ Initialized project `{}` and bound it as the workspace.\n\
+                     Caduceus features (auto-index, CADUCEUS.md, file writes) are now active.",
+                    target_for_msg.display()
+                ),
+                Err(err) => format!(
+                    "⚠ Created `{}` but could not bind it as a worktree: {err}\n\
+                     Open the folder manually with Cmd-O if features stay disabled.",
+                    target_for_msg.display()
+                ),
+            };
+            acp_thread.update(cx, |thread, cx| {
+                thread.push_assistant_content_block(
+                    acp::ContentBlock::Text(acp::TextContent::new(message)),
+                    false,
+                    cx,
+                );
+            });
+            Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+        })
+    }
+
+    /// Helper: push a synchronous text response into the ACP thread for
+    /// `/init` error/usage paths. Returns a ready Task so the caller
+    /// keeps a uniform return type.
+    fn push_init_response(
+        &self,
+        session_id: &acp::SessionId,
+        message: String,
+        cx: &mut App,
+    ) -> Task<Result<acp::PromptResponse>> {
+        let acp_thread = self
+            .0
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .map(|s| s.acp_thread.clone());
+        if let Some(acp_thread) = acp_thread {
+            acp_thread.update(cx, |thread, cx| {
+                thread.push_assistant_content_block(
+                    acp::ContentBlock::Text(acp::TextContent::new(message)),
+                    false,
+                    cx,
+                );
+            });
+        }
+        Task::ready(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
     }
 
     fn run_turn(
