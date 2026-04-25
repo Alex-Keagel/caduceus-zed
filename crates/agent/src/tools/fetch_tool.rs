@@ -225,6 +225,9 @@ fn clean_fetch_output(input: &str) -> String {
         "Toggle navigation",
         "Appearance settings",
         "Search or jump to",
+        "Search code, repositories",
+        "Search syntax tips",
+        "Provide feedback",
         "We read every piece of feedback",
         "We use cookies",
         "Accept all cookies",
@@ -252,7 +255,30 @@ fn clean_fetch_output(input: &str) -> String {
         "BibTeX formatted citation",
         "Saved searches",
         "Use saved searches",
-        "Provide feedback",
+        // GitHub repo navigation chrome that leaked through in dogfood:
+        "Navigation Menu",
+        "Notifications You must be signed in",
+        "to change notification settings",
+        "Folders and files",
+        "Latest commit",
+        "View all files",
+        "Repository files navigation",
+        "Open in github.dev",
+        "Open in a new github.dev tab",
+        "Open in codespace",
+        "Go to file",
+        "Code Issues Pull requests",
+        "Fork this repository",
+        "Star this repository",
+        "Watch this repository",
+        // Common page-footer rails:
+        "About Pricing Documentation",
+        "Status Docs Contact",
+        "Terms Privacy Security",
+        "Manage Preferences",
+        "Do Not Sell",
+        // Generic blank-link / image-only lines:
+        "[![",
     ];
 
     // 2. Walk lines, drop chrome and collapse 3+ blank lines to 2.
@@ -314,6 +340,34 @@ mod fetch_noise_tests {
         assert!(!out.contains("Bibliographic Tools"));
         assert!(!out.contains("Disable MathJax"));
         assert!(!out.contains("arXivLabs is a framework"));
+    }
+
+    #[test]
+    fn strips_github_repo_navigation_chrome() {
+        // Chrome strings that leaked through in dogfood.
+        let raw = "\
+Navigation Menu
+
+Notifications You must be signed in to change notification settings
+
+Folders and files
+Latest commit
+View all files
+
+Repository files navigation
+
+# README
+Real content here.
+";
+        let out = clean_fetch_output(raw);
+        assert!(!out.contains("Navigation Menu"));
+        assert!(!out.contains("Folders and files"));
+        assert!(!out.contains("Latest commit"));
+        assert!(!out.contains("View all files"));
+        assert!(!out.contains("Repository files navigation"));
+        assert!(!out.contains("change notification settings"));
+        assert!(out.contains("Real content here"));
+        assert!(out.contains("# README"));
     }
 
     #[test]

@@ -1108,7 +1108,8 @@
           "list_directory": true, "move_path": true, "now": true,
           "find_path": true, "read_file": true, "restore_file_from_disk": true,
           "save_file": true, "open": true, "grep": true, "spawn_agent": true,
-          "terminal": true, "thinking": true, "update_plan": true, "search_web": true
+          "terminal": true, "thinking": true, "update_plan": true, "search_web": true,
+          "read_thread": true, "compact_thread": true
         }
       },
       "plan": {
@@ -1117,7 +1118,8 @@
         "tools": {
           "diagnostics": true, "fetch": true, "list_directory": true,
           "now": true, "find_path": true, "read_file": true, "open": true,
-          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true
+          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true,
+          "read_thread": true, "compact_thread": true
         }
       },
       "autopilot": {
@@ -1129,7 +1131,8 @@
           "list_directory": true, "move_path": true, "now": true,
           "find_path": true, "read_file": true, "restore_file_from_disk": true,
           "save_file": true, "open": true, "grep": true, "spawn_agent": true,
-          "terminal": true, "thinking": true, "update_plan": true, "search_web": true
+          "terminal": true, "thinking": true, "update_plan": true, "search_web": true,
+          "read_thread": true, "compact_thread": true
         }
       }
     },

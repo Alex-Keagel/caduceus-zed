@@ -4505,6 +4505,16 @@ impl Thread {
             return;
         };
 
+        // PB5 enforcement (belt-and-suspenders): drop empty <thinking></thinking>
+        // blocks that some models still emit even when the preamble forbids them.
+        // An empty thinking block has no text, no signature payload — pure noise.
+        message.content.retain(|c| match c {
+            AgentMessageContent::Thinking { text, signature } => {
+                !text.trim().is_empty() || signature.is_some()
+            }
+            _ => true,
+        });
+
         if message.content.is_empty() {
             return;
         }
