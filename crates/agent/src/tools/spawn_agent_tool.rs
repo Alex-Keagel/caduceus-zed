@@ -30,6 +30,21 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 /// - When a plan has multiple independent steps, prefer delegating those steps in parallel rather than serializing them unnecessarily.
 /// - Reuse the returned session_id when you want to follow up on the same delegated subproblem instead of creating a duplicate session.
 ///
+/// ### Vendor-diverse DAG fan-out (RECOMMENDED for non-trivial tasks)
+/// - When delegating multiple independent subtasks, **diversify across model
+///   vendors** by setting `model` and `profile` per spawn. The runtime
+///   defaults are inheritance-from-parent, but a master orchestrator should
+///   route each subtask to the best-fit (vendor, model, profile) tuple.
+/// - Example pattern for a 3-way research / scan / test fan-out:
+///     spawn_agent({ label, message, profile: "plan",
+///                   model: "gpt-5.4",          mode: "plan" })
+///     spawn_agent({ label, message, profile: "act",
+///                   model: "claude-opus-4.7",  mode: "act"  })
+///     spawn_agent({ label, message, profile: "act",
+///                   model: "claude-sonnet-4.6",mode: "act"  })
+/// - Validation is strict: an unknown profile / model / mode fails the spawn
+///   with the available choices listed in the error.
+///
 /// ### Output
 /// - You will receive only the agent's final message as output.
 /// - Successful calls return a session_id that you can use for follow-up messages.
@@ -44,6 +59,19 @@ pub struct SpawnAgentToolInput {
     /// Session ID of an existing agent session to continue instead of creating a new one.
     #[serde(default)]
     pub session_id: Option<acp::SessionId>,
+    /// Optional override: profile id (e.g., "plan", "act", "autopilot", or a
+    /// custom profile from settings). Omit to inherit from the parent agent.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Optional override: language model id (e.g., "claude-opus-4.7",
+    /// "gpt-5.4", "claude-sonnet-4.6"). Omit to inherit from the parent.
+    /// Use this to fan out across vendor-diverse models in a DAG.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional override: caduceus mode ("plan", "act", "autopilot"). Omit
+    /// to inherit from the parent agent.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,7 +173,13 @@ impl AgentTool for SpawnAgentTool {
                 let subagent = if let Some(session_id) = input.session_id {
                     self.environment.resume_subagent(session_id, cx)
                 } else {
-                    self.environment.create_subagent(input.label, cx)
+                    let opts = crate::SubagentSpawnOptions {
+                        label: input.label.clone(),
+                        profile_override: input.profile.clone(),
+                        model_override: input.model.clone(),
+                        mode_override: input.mode.clone(),
+                    };
+                    self.environment.create_subagent(opts, cx)
                 };
                 let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,

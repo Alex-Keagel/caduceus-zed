@@ -666,6 +666,37 @@ pub trait SubagentHandle {
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
 }
 
+/// Options for spawning a sub-agent. Allows the master to override inherited
+/// settings on a per-spawn basis so a DAG can fan out across diverse
+/// (vendor, model, profile, mode) combinations.
+///
+/// All overrides are validated at spawn time. Unknown values fail the spawn
+/// with a clear error message returned to the caller (the master agent).
+#[derive(Debug, Clone, Default)]
+pub struct SubagentSpawnOptions {
+    /// Short label displayed in the UI while the agent runs.
+    pub label: String,
+    /// Override the inherited profile (e.g., `"plan"`, `"act"`, or a custom
+    /// profile id from `agent.profiles`). `None` = inherit from parent.
+    pub profile_override: Option<String>,
+    /// Override the inherited language model id (e.g., `"claude-opus-4.7"`,
+    /// `"gpt-5.4"`). `None` = inherit from parent.
+    pub model_override: Option<String>,
+    /// Override the inherited caduceus mode (`"plan"` / `"act"` / `"autopilot"`).
+    /// `None` = inherit from parent.
+    pub mode_override: Option<String>,
+}
+
+impl SubagentSpawnOptions {
+    /// Convenience constructor for the legacy "just a label" call site.
+    pub fn from_label(label: String) -> Self {
+        Self {
+            label,
+            ..Default::default()
+        }
+    }
+}
+
 pub trait ThreadEnvironment {
     fn create_terminal(
         &self,
@@ -675,7 +706,11 @@ pub trait ThreadEnvironment {
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>>;
 
-    fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>>;
+    fn create_subagent(
+        &self,
+        opts: SubagentSpawnOptions,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>>;
 
     fn resume_subagent(
         &self,
@@ -1449,6 +1484,74 @@ impl Thread {
         self.profile_id = parent.profile_id.clone();
         // Caduceus: inherit mode so subagents respect privilege rings
         self.caduceus_mode = parent.caduceus_mode.clone();
+    }
+
+    /// Apply per-spawn overrides on top of the inherited parent settings.
+    /// Validates each override against the live registry/catalog and returns
+    /// a descriptive error if any value is unknown — the error is surfaced
+    /// to the master agent so it can self-correct (DAG fan-out diversity).
+    pub fn apply_subagent_overrides(
+        &mut self,
+        opts: &SubagentSpawnOptions,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        // Profile override — must exist in the live AgentSettings.profiles map.
+        if let Some(profile) = opts.profile_override.as_ref() {
+            let settings = AgentSettings::get_global(cx);
+            let profile_id = AgentProfileId(profile.clone().into());
+            if !settings.profiles.contains_key(&profile_id) {
+                let available: Vec<String> = settings
+                    .profiles
+                    .keys()
+                    .map(|k| k.as_str().to_string())
+                    .collect();
+                anyhow::bail!(
+                    "Unknown profile '{}'. Available profiles: [{}]",
+                    profile,
+                    available.join(", ")
+                );
+            }
+            self.profile_id = profile_id;
+        }
+
+        // Mode override — must parse via AgentMode::from_str_loose.
+        if let Some(mode) = opts.mode_override.as_ref() {
+            use caduceus_orchestrator::modes::AgentMode;
+            if AgentMode::from_str_loose(mode).is_none() {
+                anyhow::bail!(
+                    "Unknown mode '{}'. Valid: plan, act, autopilot",
+                    mode
+                );
+            }
+            self.caduceus_mode = Some(mode.clone());
+        }
+
+        // Model override — must resolve via LanguageModelRegistry.
+        if let Some(model_id) = opts.model_override.as_ref() {
+            let registry = language_model::LanguageModelRegistry::read_global(cx);
+            let resolved = registry
+                .available_models(cx)
+                .find(|m| m.id().0.as_ref() == model_id.as_str());
+            match resolved {
+                Some(model) => self.model = Some(model),
+                None => {
+                    let mut available: Vec<String> = registry
+                        .available_models(cx)
+                        .map(|m| m.id().0.to_string())
+                        .collect();
+                    available.sort();
+                    available.dedup();
+                    anyhow::bail!(
+                        "Unknown model '{}'. {} models available; first 10: [{}]",
+                        model_id,
+                        available.len(),
+                        available.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn id(&self) -> &acp::SessionId {

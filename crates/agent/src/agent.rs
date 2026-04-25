@@ -2814,7 +2814,7 @@ pub struct NativeThreadEnvironment {
 impl NativeThreadEnvironment {
     pub(crate) fn create_subagent_thread(
         &self,
-        label: String,
+        opts: SubagentSpawnOptions,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
@@ -2831,11 +2831,17 @@ impl NativeThreadEnvironment {
             ));
         }
 
+        let label = opts.label.clone();
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
             let mut thread = Thread::new_subagent(&parent_thread_entity, cx);
             thread.set_title(label.into(), cx);
             thread
         });
+
+        // Apply per-spawn overrides AFTER inherit_parent_settings runs inside
+        // new_subagent. Any unknown profile/model/mode bubbles up as a hard
+        // error so the master can self-correct on its next turn.
+        subagent_thread.update(cx, |thread, cx| thread.apply_subagent_overrides(&opts, cx))?;
 
         let session_id = subagent_thread.read(cx).id().clone();
 
@@ -2943,8 +2949,12 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
-    fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_subagent_thread(label, cx)
+    fn create_subagent(
+        &self,
+        opts: SubagentSpawnOptions,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        self.create_subagent_thread(opts, cx)
     }
 
     fn resume_subagent(
