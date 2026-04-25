@@ -183,3 +183,66 @@ fn short_id(s: &str) -> String {
         format!("{}…", &s[..8])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbThread;
+    use crate::{AgentMessage, AgentMessageContent, Message, UserMessage, UserMessageContent};
+    use acp_thread::UserMessageId;
+    use chrono::Utc;
+    use gpui::SharedString;
+
+    fn fixture_thread(title: &str, n: usize) -> DbThread {
+        let mut messages = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            messages.push(Message::User(UserMessage {
+                id: UserMessageId::new(),
+                content: vec![UserMessageContent::Text(format!("user msg #{i}"))],
+            }));
+            messages.push(Message::Agent(AgentMessage {
+                content: vec![AgentMessageContent::Text(format!(
+                    "assistant reply to #{i}"
+                ))],
+                tool_results: Default::default(),
+                reasoning_details: None,
+            }));
+        }
+        DbThread {
+            title: SharedString::from(title.to_string()),
+            messages,
+            updated_at: Utc::now(),
+            detailed_summary: None,
+            initial_project_snapshot: None,
+            cumulative_token_usage: Default::default(),
+            request_token_usage: Default::default(),
+            model: None,
+            profile: None,
+            imported: false,
+            subagent_context: None,
+            speed: None,
+            thinking_enabled: false,
+            thinking_effort: None,
+            draft_prompt: None,
+            ui_scroll_position: None,
+        }
+    }
+
+    #[test]
+    fn render_includes_role_headings_and_content() {
+        let thread = fixture_thread("Demo", 2);
+        let md = render_thread_markdown(&thread);
+        assert!(md.contains("## User (#0)"), "{md}");
+        assert!(md.contains("## Assistant (#1)"), "{md}");
+        assert!(md.contains("## User (#2)"), "{md}");
+        assert!(md.contains("user msg #0"), "{md}");
+        assert!(md.contains("assistant reply to #1"), "{md}");
+    }
+
+    #[test]
+    fn render_empty_thread_returns_placeholder() {
+        let thread = fixture_thread("Empty", 0);
+        let md = render_thread_markdown(&thread);
+        assert_eq!(md, "(no messages)\n");
+    }
+}

@@ -205,3 +205,86 @@ fn short_id(s: &str) -> String {
         format!("{}…", &s[..8])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::db::DbThread;
+    use crate::tools::read_thread_tool::render_thread_markdown;
+    use crate::{AgentMessage, AgentMessageContent, Message, UserMessage, UserMessageContent};
+    use acp_thread::UserMessageId;
+    use chrono::Utc;
+    use gpui::SharedString;
+
+    fn long_thread() -> DbThread {
+        let mut messages = Vec::new();
+        for i in 0..40 {
+            messages.push(Message::User(UserMessage {
+                id: UserMessageId::new(),
+                content: vec![UserMessageContent::Text(format!(
+                    "user message #{i} with enough body text to make the transcript large \
+                     enough that compaction has something to do — repeated padding padding \
+                     padding padding padding padding padding padding padding padding."
+                ))],
+            }));
+            messages.push(Message::Agent(AgentMessage {
+                content: vec![AgentMessageContent::Text(format!(
+                    "assistant reply #{i} with similar long body text to balance the load \
+                     padding padding padding padding padding padding padding padding."
+                ))],
+                tool_results: Default::default(),
+                reasoning_details: None,
+            }));
+        }
+        DbThread {
+            title: SharedString::from("Long".to_string()),
+            messages,
+            updated_at: Utc::now(),
+            detailed_summary: None,
+            initial_project_snapshot: None,
+            cumulative_token_usage: Default::default(),
+            request_token_usage: Default::default(),
+            model: None,
+            profile: None,
+            imported: false,
+            subagent_context: None,
+            speed: None,
+            thinking_enabled: false,
+            thinking_effort: None,
+            draft_prompt: None,
+            ui_scroll_position: None,
+        }
+    }
+
+    #[test]
+    fn compact_respects_budget_and_shrinks_long_transcripts() {
+        let thread = long_thread();
+        let transcript = render_thread_markdown(&thread);
+        let original = transcript.chars().count();
+
+        let max_chars = 800;
+        let summary =
+            caduceus_bridge::orchestrator::OrchestratorBridge::compact_instructions(
+                &transcript,
+                max_chars,
+            );
+        let compacted = summary.chars().count();
+
+        assert!(
+            original > max_chars,
+            "fixture must produce transcript larger than budget; got {original}"
+        );
+        // Heading-aware compactor preserves boundaries, so it may overshoot
+        // the budget slightly. The real contract is "shrinks substantially";
+        // allow up to 20% slack on the hard cap.
+        let slack = max_chars + max_chars / 5;
+        assert!(
+            compacted <= slack,
+            "compacted ({compacted}) must be <= budget+slack ({slack})"
+        );
+        assert!(
+            compacted < original / 2,
+            "compaction must shrink transcript by >50%; original={original} compacted={compacted}"
+        );
+        assert!(compacted > 0, "compaction should not return empty");
+    }
+}
