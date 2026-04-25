@@ -291,6 +291,27 @@ impl NativeAgent {
                 subscriptions.push(cx.subscribe(prompt_store, Self::handle_prompts_updated_event))
             }
 
+            // Caduceus F1.2: flush pending thread saves on app quit so the
+            // last turn before Cmd-Q reaches sqlite before shutdown.
+            subscriptions.push(cx.on_app_quit(|this: &mut Self, _cx| {
+                let pending: Vec<_> = this
+                    .sessions
+                    .values_mut()
+                    .map(|s| {
+                        std::mem::replace(&mut s.pending_save, gpui::Task::ready(Ok(())))
+                    })
+                    .collect();
+                async move {
+                    log::info!(
+                        "[caduceus] flushing {} pending thread save(s) on app quit",
+                        pending.len()
+                    );
+                    for task in pending {
+                        let _ = task.await;
+                    }
+                }
+            }));
+
             Self {
                 sessions: HashMap::default(),
                 thread_store,
