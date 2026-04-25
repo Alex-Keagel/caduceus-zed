@@ -1053,6 +1053,10 @@ impl NativeAgent {
                 )),
             ),
             acp::AvailableCommand::new("index", "Index project for semantic search"),
+            acp::AvailableCommand::new("pull", "Pull another thread into this conversation by session id")
+                .input(acp::AvailableCommandInput::Unstructured(
+                    acp::UnstructuredCommandInput::new("<session_id>"),
+                )),
         ];
 
         let Some(state) = project_state else {
@@ -1416,6 +1420,25 @@ impl NativeAgentConnection {
             }
             "checkpoint" => {
                 "📌 Use the `caduceus_checkpoint` tool with operation `create` and a label to save a checkpoint.".to_string()
+            }
+            "pull" => {
+                // Caduceus F2: register an external thread on the current
+                // Thread so the next turn's system prompt mentions it and
+                // the orchestrator can use read_thread/compact_thread.
+                let id = args.trim().trim_start_matches('`').trim_end_matches('`').trim();
+                if id.is_empty() {
+                    "❌ Usage: `/pull <session_id>` — copy the id from history view.".to_string()
+                } else if let Some(thread) = self.thread(session_id, cx) {
+                    let id_owned = id.to_string();
+                    thread.update(cx, |thread, _cx| {
+                        thread.pull_session_id(id_owned.clone());
+                    });
+                    format!(
+                        "🔗 Pulled thread `{id}`. The next turn will see this id in its system prompt and can use `read_thread` or `compact_thread` to consult it."
+                    )
+                } else {
+                    "❌ No active thread.".to_string()
+                }
             }
             "dag" => {
                 // Render the current Index Access DAG so the user can see

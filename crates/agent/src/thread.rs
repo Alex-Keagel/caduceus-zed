@@ -1228,6 +1228,11 @@ pub struct Thread {
     /// with the next turn's `activeContext.md` writes) when the flush was
     /// triggered by a cancellation rather than a normal turn end.
     last_turn_cancelled: bool,
+    /// Caduceus F2: session ids pulled in via `/pull <id>` slash command.
+    /// When non-empty, `caduceus_assemble_context` appends a system block
+    /// listing them and reminding the orchestrator that `read_thread` and
+    /// `compact_thread` tools are available to consult those sessions.
+    pulled_session_ids: Vec<String>,
     /// Monotonic counter bumped on every cancel/new-turn boundary.
     /// `pub(crate)` accessor below for test visibility.
     /// Deferred async work captures the value at scheduling time and bails
@@ -1427,6 +1432,7 @@ impl Thread {
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
+            pulled_session_ids: Vec::new(),
         }
     }
 
@@ -1679,6 +1685,7 @@ impl Thread {
             cached_token_estimate: std::cell::Cell::new(None),
             turn_generation: 0,
             last_turn_cancelled: false,
+            pulled_session_ids: Vec::new(),
         }
     }
 
@@ -1772,6 +1779,20 @@ impl Thread {
 
     pub fn set_caduceus_mode(&mut self, mode: Option<String>) {
         self.caduceus_mode = mode;
+    }
+
+    /// Caduceus F2: append a session id to the pulled set so the next turn's
+    /// system prompt mentions it and the orchestrator knows to consult it
+    /// via `read_thread` / `compact_thread`. Idempotent; preserves order.
+    pub fn pull_session_id(&mut self, session_id: String) {
+        if !self.pulled_session_ids.iter().any(|s| s == &session_id) {
+            self.pulled_session_ids.push(session_id);
+        }
+    }
+
+    /// Caduceus F2: read-only view of pulled session ids.
+    pub fn pulled_session_ids(&self) -> &[String] {
+        &self.pulled_session_ids
     }
 
     /// Current guardrail alert message and severity (if any, within 10s TTL)
@@ -5091,6 +5112,23 @@ impl Thread {
                     }
                 }
             }
+        }
+
+        // Caduceus F2: announce pulled threads so the orchestrator knows
+        // it can use `read_thread` / `compact_thread` against them.
+        if !self.pulled_session_ids.is_empty() {
+            let mut block = String::from(
+                "## Pulled Threads\n\n\
+                 The following thread session ids have been attached to this \
+                 conversation via `/pull`. Use the `read_thread` tool to fetch \
+                 their full transcript, or `compact_thread` to get a summarized \
+                 view that fits in your context budget. Prefer `compact_thread` \
+                 with a `max_chars` budget when the transcript is large.\n\n",
+            );
+            for id in &self.pulled_session_ids {
+                block.push_str(&format!("- `{}`\n", id));
+            }
+            assembler.add_source(ContextSource::SystemPrompt(block));
         }
 
         // Tool guidance — structured guide for the LLM
