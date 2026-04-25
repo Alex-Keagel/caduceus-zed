@@ -3988,11 +3988,16 @@ pub fn list_modes() -> Vec<ModeDescriptor> {
             };
             ModeDescriptor {
                 name: mode.name().to_string(),
-                label: {
-                    let mut chars = mode.name().chars();
-                    match chars.next() {
-                        Some(c) => c.to_uppercase().chain(chars).collect(),
-                        None => String::new(),
+                label: match mode {
+                    // Caduceus: Plan now subsumes the former Research mode,
+                    // so surface that combined identity in the picker.
+                    AgentMode::Plan => "Plan & Research".to_string(),
+                    _ => {
+                        let mut chars = mode.name().chars();
+                        match chars.next() {
+                            Some(c) => c.to_uppercase().chain(chars).collect(),
+                            None => String::new(),
+                        }
                     }
                 },
                 description: mode.description().to_string(),
@@ -4043,8 +4048,11 @@ pub fn mode_prompt_for_profile(mode: &str, lens: Option<&str>) -> String {
 pub fn mode_allows_writes(mode: &str) -> bool {
     use caduceus_orchestrator::modes::AgentMode;
     match AgentMode::from_str_loose(mode).unwrap_or(AgentMode::Plan) {
-        AgentMode::Plan => false,
-        AgentMode::Research => true, // markdown only — engine enforces extension
+        // Plan (which now also covers former Research) allows markdown writes;
+        // engine extension filter blocks code writes. Returning true here so
+        // UI affordances permit the .md write attempt; envelope.preflight is
+        // the authoritative gate.
+        AgentMode::Plan => true,
         AgentMode::Act => true,
         AgentMode::Autopilot => true,
     }
@@ -4284,19 +4292,20 @@ mod p9_tests {
     use super::*;
 
     #[test]
-    fn list_modes_returns_4_canonical_modes_with_act_having_3_lenses() {
+    fn list_modes_returns_3_canonical_modes_with_act_having_3_lenses() {
         let modes = list_modes();
-        assert_eq!(modes.len(), 4);
+        assert_eq!(modes.len(), 3);
         let names: Vec<&str> = modes.iter().map(|m| m.name.as_str()).collect();
         assert!(names.contains(&"plan"));
         assert!(names.contains(&"act"));
-        assert!(names.contains(&"research"));
         assert!(names.contains(&"autopilot"));
+        // Research has been merged into Plan; it should NOT appear.
+        assert!(!names.contains(&"research"));
         let act = modes.iter().find(|m| m.name == "act").unwrap();
         assert_eq!(act.lenses.len(), 3);
         assert_eq!(act.label, "Act");
         // Other modes have no lenses.
-        for name in ["plan", "research", "autopilot"] {
+        for name in ["plan", "autopilot"] {
             let m = modes.iter().find(|m| m.name == name).unwrap();
             assert!(m.lenses.is_empty(), "{name} should have no lenses");
             assert!(!m.description.is_empty(), "{name} missing description");
