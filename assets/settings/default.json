@@ -1112,16 +1112,7 @@
         }
       },
       "plan": {
-        "name": "Plan",
-        "enable_all_context_servers": false,
-        "tools": {
-          "diagnostics": true, "fetch": true, "list_directory": true,
-          "now": true, "find_path": true, "read_file": true, "open": true,
-          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true
-        }
-      },
-      "research": {
-        "name": "Research",
+        "name": "Plan & Research",
         "enable_all_context_servers": false,
         "tools": {
           "diagnostics": true, "fetch": true, "list_directory": true,
