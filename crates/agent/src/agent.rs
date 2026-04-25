@@ -1809,13 +1809,9 @@ impl NativeAgentConnection {
                  - `/context unpin <label>` — remove a pinned item\n\
                  - `/context pins` — list all pinned items\n\n\
                  **Modes** (use `/mode <name>` to switch):\n\
-                 - `plan` — read-only analysis, write plans/docs only\n\
+                 - `plan` — read-only analysis & research, write plans/docs only\n\
                  - `act` — execute code changes with approval\n\
-                 - `research` — read-only exploration, summarize findings\n\
-                 - `autopilot` — fully autonomous (plan + act + test + commit)\n\
-                 - `architect` — high-level design, no code changes\n\
-                 - `debug` — investigate errors, trace bugs\n\
-                 - `review` — code review, find issues\n\n\
+                 - `autopilot` — fully autonomous (plan + act + test + commit)\n\n\
                  **Tools:**\n\
                  - `/status` — show unified dashboard with all metrics\n\
                  - `/map` — show project repo map (tree-sitter symbol outline)\n\
@@ -1825,7 +1821,7 @@ impl NativeAgentConnection {
                  - `/headless [prompt]` — generate CLI command for headless execution\n\n\
                  **Examples:**\n\
                  - `/status` → see security, health, context, safety at a glance\n\
-                 - `/mode research` → switch to read-only research mode\n\
+                 - `/mode plan` → switch to read-only plan & research mode\n\
                  - `/context pin arch Use microservices pattern` → pin architecture decision\n\
                  - `/map` → see all symbols in the project\n\
                  - `/compact` → free up context when conversation gets long"
