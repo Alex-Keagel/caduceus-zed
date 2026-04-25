@@ -1,4 +1,5 @@
 mod caduceus_native_state;
+pub mod dag_diversity;
 mod caduceus_provider_adapter;
 mod caduceus_tool_adapter;
 mod db;

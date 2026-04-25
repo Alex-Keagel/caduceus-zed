@@ -4083,6 +4083,7 @@ fn is_read_only_tool(tool_name: &str) -> bool {
         // Thread introspection — pure reads of past sessions, no mutation.
         "read_thread",
         "compact_thread",
+        "suggest_models",
         // ── Caduceus read-only tools ───────────────────────────────────
         "caduceus_semantic_search",
         "caduceus_index",

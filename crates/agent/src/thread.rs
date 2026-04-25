@@ -12,7 +12,7 @@ use crate::{
     CaduceusTimeTrackingTool, CaduceusTreeSitterTool, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool,
     FetchTool, FindPathTool, GrepTool, ListDirectoryTool, MovePathTool, NowTool, OpenTool,
-    ProjectSnapshot, ReadFileTool, ReadThreadTool, RestoreFileFromDiskTool, SaveFileTool,
+    ProjectSnapshot, ReadFileTool, ReadThreadTool, RestoreFileFromDiskTool, SaveFileTool, SuggestModelsTool,
     CompactThreadTool, SpawnAgentTool,
     StreamingEditFileTool, SystemPromptTemplate, Template, Templates, TerminalTool,
     ToolPermissionDecision, UpdatePlanTool, WebSearchTool, decide_permission_from_settings,
@@ -2735,6 +2735,7 @@ impl Thread {
         }
         self.add_tool(ReadThreadTool::new());
         self.add_tool(CompactThreadTool::new());
+        self.add_tool(SuggestModelsTool::new());
     }
 
     pub fn add_tool<T: AgentTool>(&mut self, tool: T) {
