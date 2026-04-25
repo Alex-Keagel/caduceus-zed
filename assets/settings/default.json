@@ -1131,36 +1131,6 @@
           "save_file": true, "open": true, "grep": true, "spawn_agent": true,
           "terminal": true, "thinking": true, "update_plan": true, "search_web": true
         }
-      },
-      "architect": {
-        "name": "Architect",
-        "enable_all_context_servers": false,
-        "tools": {
-          "diagnostics": true, "fetch": true, "list_directory": true,
-          "now": true, "find_path": true, "read_file": true, "open": true,
-          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true
-        }
-      },
-      "debug": {
-        "name": "Debug",
-        "enable_all_context_servers": false,
-        "tools": {
-          "copy_path": true, "create_directory": true, "delete_path": true,
-          "diagnostics": true, "edit_file": true, "fetch": true,
-          "list_directory": true, "move_path": true, "now": true,
-          "find_path": true, "read_file": true, "restore_file_from_disk": true,
-          "save_file": true, "open": true, "grep": true, "spawn_agent": true,
-          "terminal": true, "thinking": true, "search_web": true
-        }
-      },
-      "review": {
-        "name": "Review",
-        "enable_all_context_servers": false,
-        "tools": {
-          "diagnostics": true, "fetch": true, "list_directory": true,
-          "now": true, "find_path": true, "read_file": true, "open": true,
-          "grep": true, "thinking": true, "search_web": true, "spawn_agent": true
-        }
       }
     },
     // Whether to start a new thread in the current local project or in a new Git worktree.

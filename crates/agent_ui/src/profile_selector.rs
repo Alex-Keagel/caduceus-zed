@@ -208,7 +208,7 @@ impl Render for ProfileSelector {
                             .child(KeyBinding::for_action(&CycleModeSelector, cx)),
                     )
                     .child(
-                        Label::new("Modes: plan · act · autopilot · architect · debug · review")
+                        Label::new("Modes: plan · act · autopilot")
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     )

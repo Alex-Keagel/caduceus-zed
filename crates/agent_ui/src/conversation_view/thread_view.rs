@@ -3518,8 +3518,8 @@ impl ThreadView {
             .unwrap_or_default();
 
         match mode_id.as_str() {
-            "plan" | "research" | "architect" | "review" => cx.theme().status().success,
-            "act" | "debug" => cx.theme().status().warning,
+            "plan" => cx.theme().status().success,
+            "act" => cx.theme().status().warning,
             "autopilot" => cx.theme().status().error,
             _ => cx.theme().status().info,
         }
@@ -3533,8 +3533,8 @@ impl ThreadView {
             .unwrap_or_default();
 
         match mode_id.as_str() {
-            "plan" | "research" | "architect" | "review" => "Safe: read-only mode",
-            "act" | "debug" => "Careful: requires approval",
+            "plan" => "Safe: read-only mode",
+            "act" => "Careful: requires approval",
             "autopilot" => "Danger: autonomous mode",
             _ => "Mode safety level",
         }
