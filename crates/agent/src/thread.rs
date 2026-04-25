@@ -1975,6 +1975,13 @@ impl Thread {
             .unwrap_or(64_000)
     }
 
+    /// Test-only accessor for `model_max_tokens` so the
+    /// provider-vs-local zone test can compute its 90%-full target.
+    #[cfg(test)]
+    pub(crate) fn model_max_tokens_for_test(&self) -> u32 {
+        self.model_max_tokens()
+    }
+
     /// Caduceus: estimate total tokens across all messages (DRY helper).
     /// `pub(crate)` for test visibility — bug C5 tests verify the cache
     /// is invalidated when messages change. Populates the cache on read
@@ -2031,15 +2038,43 @@ impl Thread {
         self.cached_token_estimate.get()
     }
 
+    /// Test-only: expose `current_context_zone` so the
+    /// provider-vs-local divergence regression test can pin behavior.
+    #[cfg(test)]
+    pub(crate) fn current_context_zone_for_test(
+        &self,
+    ) -> caduceus_bridge::orchestrator::ContextZone {
+        self.current_context_zone()
+    }
+
     /// Caduceus: estimate current context zone based on token usage.
+    ///
+    /// Prefers the **provider's** actual reported token usage (from the
+    /// last completed request) over our local heuristic
+    /// `estimate_total_tokens()`. The local estimate undercounts —
+    /// non-text user content and tool results are folded in at a flat
+    /// `10` tokens — so a thread can sit at "Green" by our heuristic
+    /// while the provider has already declared the context full and the
+    /// UI is showing the red "Thread reached the token limit" banner.
+    ///
+    /// Falling back to the local estimate before the first response is
+    /// the only way we can early-detect a runaway first turn that hasn't
+    /// reported usage yet.
     fn current_context_zone(&self) -> caduceus_bridge::orchestrator::ContextZone {
         use caduceus_bridge::orchestrator::ContextZone;
-        let total = self.estimate_total_tokens();
         let max = self.model_max_tokens();
         if max == 0 {
             return ContextZone::Green;
         }
-        ContextZone::from_percentage((total as f64 / max as f64) * 100.0)
+        let used = if let Some(provider) = self.latest_request_token_usage() {
+            // Provider knows: input + (cached input not double-counted)
+            // + output. `total_tokens()` is the same number the UI
+            // banner uses, so our zone now tracks the banner exactly.
+            provider.total_tokens() as u32
+        } else {
+            self.estimate_total_tokens()
+        };
+        ContextZone::from_percentage((used as f64 / max as f64) * 100.0)
     }
 
     /// Caduceus: smart context management using engine compaction pipeline.
@@ -2082,8 +2117,16 @@ impl Thread {
             return false;
         }
 
-        let total_tokens = self.estimate_total_tokens();
+        let local_estimate = self.estimate_total_tokens();
+        let provider_used = self
+            .latest_request_token_usage()
+            .map(|u| u.total_tokens() as u32);
         let max_context = self.model_max_tokens();
+        // Mirror `current_context_zone()`: prefer provider tokens, fall
+        // back to local estimate. The two used to disagree (provider
+        // banner red, local heuristic green) and auto-compact silently
+        // no-op'd. See [`current_context_zone`] for the rationale.
+        let total_tokens = provider_used.unwrap_or(local_estimate);
         let fill_pct = if max_context == 0 {
             0.0
         } else {
@@ -2091,6 +2134,17 @@ impl Thread {
         };
 
         let msg_count = self.messages.len();
+        // Per-turn breadcrumb so any future provider/local divergence
+        // shows up in the log even when zone is Green.
+        log::debug!(
+            "[caduceus] context check: zone={:?} fill={:.1}% provider={:?} local={} max={} msgs={}",
+            zone,
+            fill_pct,
+            provider_used,
+            local_estimate,
+            max_context,
+            msg_count
+        );
         // Decide whether to compact based on zone + message count
         let (should_compact, keep_recent) = match zone {
             ContextZone::Green => {

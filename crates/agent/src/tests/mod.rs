@@ -6925,6 +6925,67 @@ async fn test_caduceus_c5_token_cache_invalidates_on_send(cx: &mut TestAppContex
     );
 }
 
+/// Auto-compact / banner divergence regression: `current_context_zone()`
+/// MUST track the provider's reported token usage (the same number the
+/// red "Thread reached the token limit" UI banner uses) — not just our
+/// local heuristic. Before this fix the heuristic undercounted (non-text
+/// user content + tool results were folded in at flat 10 tokens), so
+/// threads sat at zone Green while the banner was red and auto-compact
+/// silently no-op'd.
+#[gpui::test]
+async fn test_context_zone_uses_provider_token_usage_not_local_estimate(
+    cx: &mut TestAppContext,
+) {
+    use language_model::TokenUsage as LmTokenUsage;
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    // Drive a turn so request_token_usage gets populated against a
+    // real UserMessageId.
+    let events = thread
+        .update(cx, |t, cx| {
+            t.send(UserMessageId::new(), ["short prompt"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake_model.send_last_completion_stream_text_chunk("ok");
+    // Inject provider usage that puts us deep in the Red zone (≈90% of
+    // FakeLanguageModel's max_token_count, currently 1_000_000 — pick a
+    // number large enough relative to whatever default the fake exposes).
+    let max = thread.read_with(cx, |t, _| t.model_max_tokens_for_test());
+    let provider_used = (max as u64).saturating_mul(90).saturating_div(100);
+    fake_model.send_last_completion_stream_event(
+        LanguageModelCompletionEvent::UsageUpdate(LmTokenUsage {
+            input_tokens: provider_used,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        }),
+    );
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::EndTurn));
+    fake_model.end_last_completion_stream();
+    let _ = events.collect::<Vec<_>>().await;
+
+    // Local heuristic is tiny ("short prompt" + "ok").
+    let local = thread.update(cx, |t, _| t.estimate_total_tokens());
+    assert!(
+        local < (max / 10),
+        "local estimate must be small ({local}) compared to max ({max})"
+    );
+
+    // Provider says ~90% used → zone must be Red (or worse), not Green.
+    let zone = thread.read_with(cx, |t, _| t.current_context_zone_for_test());
+    use caduceus_bridge::orchestrator::ContextZone;
+    assert!(
+        matches!(zone, ContextZone::Red | ContextZone::Critical),
+        "current_context_zone must reflect provider tokens (~90% full), \
+         got {zone:?}. If this regresses to Green, auto-compact will \
+         silently no-op while the UI banner shows 'Thread reached the \
+         token limit' — exactly the divergence this test pins."
+    );
+}
+
 /// Bug #14: After cancellation, auto-extract memories MUST NOT race the next
 /// turn's `activeContext.md` writer. The gate is `!last_turn_cancelled`.
 /// Verifies the flag is set on cancel and cleared on the next run_turn().
