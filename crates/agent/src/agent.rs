@@ -521,6 +521,10 @@ impl NativeAgent {
                 });
 
                 if let Some(root) = project_root {
+                    if !root.is_dir() {
+                        crate::thread::log_no_folder_workspace_once();
+                        return;
+                    }
                     // Skip if already indexed
                     let already_indexed = engine_clone.index_chunk_count().await > 0;
                     if already_indexed {

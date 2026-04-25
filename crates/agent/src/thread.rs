@@ -843,6 +843,44 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Res
 
 static ATOMIC_WRITE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Returns the absolute path of the first project worktree IFF that path
+/// exists on disk and is a directory. Returns `None` when the user has
+/// opened a single file (e.g. `settings.json`) instead of a folder, or when
+/// the project has no worktrees yet.
+///
+/// Several Caduceus subsystems — native loop, auto-index, CADUCEUS.md
+/// loader — only make sense against a folder workspace. Gating them on
+/// this helper turns "user opened a file" from a cascade of confusing
+/// ENOTDIR errors into a single one-time info log.
+pub(crate) fn caduceus_workspace_folder(
+    project: &Entity<Project>,
+    cx: &App,
+) -> Option<PathBuf> {
+    let root = project
+        .read(cx)
+        .worktrees(cx)
+        .next()?
+        .read(cx)
+        .abs_path()
+        .to_path_buf();
+    if root.is_dir() { Some(root) } else { None }
+}
+
+/// Emits exactly one `info!` per process explaining that Caduceus features
+/// require a folder workspace. Subsequent calls are no-ops. Use from any
+/// site where `caduceus_workspace_folder` returned `None`.
+pub(crate) fn log_no_folder_workspace_once() {
+    static LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::info!(
+            "[caduceus] Workspace is not a folder. Caduceus features (native \
+             loop, auto-index, CADUCEUS.md, instructions) are disabled. Open \
+             a folder (Cmd-O → choose a directory) to enable them."
+        );
+    }
+}
+
 #[derive(Debug)]
 pub struct NewTerminal {
     pub command: String,
@@ -1865,13 +1903,10 @@ impl Thread {
             return Ok(false);
         }
 
-        let worktree = self
-            .project
-            .read(cx)
-            .worktrees(cx)
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("caduceus native loop requires a worktree"))?;
-        let root = worktree.read(cx).abs_path().to_path_buf();
+        let Some(root) = caduceus_workspace_folder(&self.project, cx) else {
+            log_no_folder_workspace_once();
+            return Ok(false);
+        };
 
         let bridge = std::sync::Arc::new(
             caduceus_bridge::orchestrator::OrchestratorBridge::new(&root)
@@ -2315,8 +2350,7 @@ impl Thread {
         );
 
         // Save context summary to project in background
-        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
-            let root = worktree.read(cx).abs_path().to_path_buf();
+        if let Some(root) = caduceus_workspace_folder(&self.project, cx) {
             let session_id = self.id.0.to_string();
             let summary_clone = summary.clone();
             cx.background_executor()
@@ -3270,8 +3304,9 @@ impl Thread {
                 // is visible in logs / bug reports.
                 log::error!(
                     "[native-loop] ensure_caduceus_harness failed with flag ON: {err}. \
-                     Falling back to legacy turn path. User expected native loop; \
-                     investigate missing worktree / bridge build failure."
+                     Falling back to legacy turn path. The no-folder-workspace case is \
+                     now silent (info-level); reaching this branch indicates a real \
+                     bridge build failure or initialization bug — investigate."
                 );
                 return None;
             }
@@ -4522,8 +4557,7 @@ impl Thread {
         });
 
         if let (Some(user_text), Some(agent_text)) = (last_user, last_agent) {
-            if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
-                let root = worktree.read(cx).abs_path().to_path_buf();
+            if let Some(root) = caduceus_workspace_folder(&self.project, cx) {
                 // Move extraction + disk I/O to background
                 cx.background_executor()
                     .spawn(async move {
@@ -4557,8 +4591,7 @@ impl Thread {
     /// Update the living active context file (.caduceus/activeContext.md)
     /// Ephemeral session state — tracks current goal, decisions, modified files.
     fn update_active_context(&self, cx: &Context<Self>) {
-        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
-            let root = worktree.read(cx).abs_path().to_path_buf();
+        if let Some(root) = caduceus_workspace_folder(&self.project, cx) {
             let mode = self.caduceus_mode_from_profile().to_string();
             let msg_count = self.messages.len();
 
@@ -4958,8 +4991,7 @@ impl Thread {
         let budget = (model_limit / 8).min(4000);
         let mut assembler = ContextAssembler::new(budget);
 
-        if let Some(worktree) = self.project.read(cx).worktrees(cx).next() {
-            let root = worktree.read(cx).abs_path().to_path_buf();
+        if let Some(root) = caduceus_workspace_folder(&self.project, cx) {
 
             // Project instructions (cached after first load)
             let instr = if let Some(cached) = &self.cached_project_instructions {
