@@ -292,14 +292,16 @@ pub struct ResumeIndex(pub u32);
 
 /// Identity of a pinned message. `Message::User` carries a stable
 /// `UserMessageId`; `Message::Resume` carries a `ResumeId(Uuid)`
-/// (generated at push-time — see ST2 fix-loop #2). Both are invariant
-/// under truncation and compaction, so a Resume pin can never silently
-/// retarget to a different Resume marker after an earlier Resume is
-/// removed.
+/// (generated at push-time — see ST2 fix-loop #2); `Message::Agent`
+/// carries an `AgentMessageId(Uuid)` (added in ST2 fix-loop #3 to
+/// support `PlanUpdate` pinning the most-recent agent message per
+/// plan v3.1 Fix 1). All three are invariant under truncation and
+/// compaction.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PinnedMessageKey {
     User(UserMessageId),
     Resume(ResumeId),
+    Agent(AgentMessageId),
 }
 
 /// A single pin entry. Insertion-order is preserved and is part of the contract.
@@ -751,12 +753,50 @@ impl AgentMessage {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Stable identity of an `AgentMessage`. Generated at message construction;
+/// invariant under truncation/compaction. Added in ST2 fix-loop #3 so
+/// `PinReason::PlanUpdate` can pin the most-recent agent message (per
+/// plan v3.1 Fix 1) without retargeting under message-list mutations.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentMessageId(pub Uuid);
+
+impl AgentMessageId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for AgentMessageId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct AgentMessage {
+    /// Stable identity. `#[serde(default)]` auto-generates one on load
+    /// for legacy DbThread JSON written before this field existed —
+    /// pre-ST2 threads have no PlanUpdate pins so the synthetic id is
+    /// harmless. Excluded from `PartialEq` so tests that construct
+    /// expected `AgentMessage` values without specifying an id (or
+    /// using a fresh random one) still compare on semantic content.
+    #[serde(default)]
+    pub id: AgentMessageId,
     pub content: Vec<AgentMessageContent>,
     pub tool_results: IndexMap<LanguageModelToolUseId, LanguageModelToolResult>,
     pub reasoning_details: Option<serde_json::Value>,
 }
+
+impl PartialEq for AgentMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.content == other.content
+            && self.tool_results == other.tool_results
+            && self.reasoning_details == other.reasoning_details
+    }
+}
+
+impl Eq for AgentMessage {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentMessageContent {
@@ -2366,10 +2406,19 @@ impl Thread {
                 _ => None,
             })
             .collect();
+        let agent_ids: HashSet<AgentMessageId> = self
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Agent(a) => Some(a.id),
+                _ => None,
+            })
+            .collect();
         let before = self.pinned.len();
         self.pinned.retain(|p| match &p.key {
             PinnedMessageKey::User(id) => user_ids.contains(id),
             PinnedMessageKey::Resume(rid) => resume_ids.contains(rid),
+            PinnedMessageKey::Agent(aid) => agent_ids.contains(aid),
         });
         let dropped = before - self.pinned.len();
         if dropped > 0 {
@@ -2394,6 +2443,10 @@ impl Thread {
             }),
             PinnedMessageKey::Resume(target) => self.messages.iter().position(|m| match m {
                 Message::Resume(rid) => rid == target,
+                _ => false,
+            }),
+            PinnedMessageKey::Agent(target) => self.messages.iter().position(|m| match m {
+                Message::Agent(a) => &a.id == target,
                 _ => false,
             }),
         }
@@ -2458,21 +2511,29 @@ impl Thread {
     }
 
     /// PlanUpdate hook: called from `agent.rs` (legacy ACP dispatcher) when
-    /// `ThreadEvent::Plan` is observed. Pins the most-recent user message
-    /// with `PinReason::PlanUpdate`. If no user message exists yet, drops
-    /// the pin and emits a `WARN` log (per AC6).
+    /// `ThreadEvent::Plan` is observed, and from the native-loop consumer
+    /// task on `T::PlanStep` / `T::PlanAmended`. Pins the most-recent
+    /// **agent** message (by stable `AgentMessageId`) with
+    /// `PinReason::PlanUpdate`. If no agent message exists yet, drops the
+    /// pin and emits a `WARN` log (per AC6).
+    ///
+    /// ST2 fix-loop #3: plan v3.1 Fix 1 specifies the most-recent
+    /// **agent** message — the plan describes work the agent has just
+    /// announced, so the agent message is the natural anchor. Earlier
+    /// code targeted the most-recent user message, which diverged from
+    /// the published contract.
     pub fn on_plan_event_emitted(&mut self, _cx: &mut Context<Self>) {
         let target = self.messages.iter().rev().find_map(|m| match m {
-            Message::User(u) => Some(u.id.clone()),
+            Message::Agent(a) => Some(a.id),
             _ => None,
         });
         let Some(id) = target else {
             log::warn!(
-                "[st2] plan event emitted before any user message; PlanUpdate pin dropped"
+                "[st2] plan event emitted before any agent message; PlanUpdate pin dropped"
             );
             return;
         };
-        self.pin_replace(PinnedMessageKey::User(id), PinReason::PlanUpdate);
+        self.pin_replace(PinnedMessageKey::Agent(id), PinReason::PlanUpdate);
     }
 
     /// ScopeExpansionActive auto-pin trigger: invoked from the native-loop
@@ -9885,39 +9946,53 @@ mod st2_pinned_tests {
     }
 
     #[gpui::test]
-    async fn t_plan_update_pins_most_recent_user_message(cx: &mut TestAppContext) {
+    async fn t_plan_update_pins_most_recent_agent_message(cx: &mut TestAppContext) {
         let (thread, _ev) = setup_thread_for_test(cx).await;
-        let id1 = UserMessageId::new();
-        let id2 = UserMessageId::new();
+        let user_id = UserMessageId::new();
+        let agent_id_1 = AgentMessageId::new();
+        let agent_id_2 = AgentMessageId::new();
         thread.update(cx, |t, cx| {
             t.push_acp_user_block(
-                id1.clone(),
+                user_id,
                 std::iter::empty::<acp::ContentBlock>(),
                 util::paths::PathStyle::local(),
                 cx,
             );
-            t.push_acp_user_block(
-                id2.clone(),
-                std::iter::empty::<acp::ContentBlock>(),
-                util::paths::PathStyle::local(),
-                cx,
-            );
+            t.messages.push(Message::Agent(AgentMessage {
+                id: agent_id_1,
+                content: vec![AgentMessageContent::Text("first reply".into())],
+                ..Default::default()
+            }));
+            t.messages.push(Message::Agent(AgentMessage {
+                id: agent_id_2,
+                content: vec![AgentMessageContent::Text("second reply".into())],
+                ..Default::default()
+            }));
             t.on_plan_event_emitted(cx);
         });
         thread.update(cx, |t, _| {
             assert!(t
-                .is_pinned(&PinnedMessageKey::User(id2))
+                .is_pinned(&PinnedMessageKey::Agent(agent_id_2))
                 .contains(&PinReason::PlanUpdate));
             assert!(!t
-                .is_pinned(&PinnedMessageKey::User(id1))
+                .is_pinned(&PinnedMessageKey::Agent(agent_id_1))
                 .contains(&PinReason::PlanUpdate));
         });
     }
 
     #[gpui::test]
-    async fn t_plan_update_with_no_user_message_drops(cx: &mut TestAppContext) {
+    async fn t_plan_update_with_no_agent_message_drops(cx: &mut TestAppContext) {
         let (thread, _ev) = setup_thread_for_test(cx).await;
+        let user_id = UserMessageId::new();
         thread.update(cx, |t, cx| {
+            // Only a user message — no agent reply yet. PlanUpdate should
+            // drop the pin and emit a WARN log per AC6.
+            t.push_acp_user_block(
+                user_id,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
             t.on_plan_event_emitted(cx);
             assert!(t
                 .pinned_refs()

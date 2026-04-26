@@ -227,6 +227,7 @@ mod tests {
                 ))],
             }));
             messages.push(Message::Agent(AgentMessage {
+                id: crate::AgentMessageId::new(),
                 content: vec![AgentMessageContent::Text(format!(
                     "assistant reply #{i} with similar long body text to balance the load \
                      padding padding padding padding padding padding padding padding."

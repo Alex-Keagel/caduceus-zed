@@ -201,6 +201,7 @@ mod tests {
                 content: vec![UserMessageContent::Text(format!("user msg #{i}"))],
             }));
             messages.push(Message::Agent(AgentMessage {
+                id: crate::AgentMessageId::new(),
                 content: vec![AgentMessageContent::Text(format!(
                     "assistant reply to #{i}"
                 ))],
