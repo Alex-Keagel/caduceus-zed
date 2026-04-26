@@ -29,6 +29,7 @@ use gpui::{
 use gpui_tokio::Tokio;
 use http_client::HttpClient;
 use language_model::{
+    AuthAction, ProviderAuthState,
     AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCacheConfiguration,
     LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelId, LanguageModelName,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
@@ -497,8 +498,14 @@ impl LanguageModelProvider for BedrockLanguageModelProvider {
             .collect()
     }
 
-    fn is_authenticated(&self, cx: &App) -> bool {
-        self.state.read(cx).is_authenticated()
+    fn auth_state(&self, cx: &App) -> ProviderAuthState {
+        if self.state.read(cx).is_authenticated() {
+            ProviderAuthState::Authenticated
+        } else {
+            ProviderAuthState::NotAuthenticated {
+                action: AuthAction::EnterApiKeyInSettings,
+            }
+        }
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {

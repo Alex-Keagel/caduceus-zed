@@ -5,6 +5,7 @@ use futures::{FutureExt, StreamExt, future::BoxFuture};
 use gpui::{AnyView, App, AsyncApp, Context, Entity, Task, Window};
 use http_client::HttpClient;
 use language_model::{
+    AuthAction, ProviderAuthState,
     ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
     LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
     LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
@@ -185,8 +186,14 @@ impl LanguageModelProvider for XAiLanguageModelProvider {
             .collect()
     }
 
-    fn is_authenticated(&self, cx: &App) -> bool {
-        self.state.read(cx).is_authenticated()
+    fn auth_state(&self, cx: &App) -> ProviderAuthState {
+        if self.state.read(cx).is_authenticated() {
+            ProviderAuthState::Authenticated
+        } else {
+            ProviderAuthState::NotAuthenticated {
+                action: AuthAction::EnterApiKeyInSettings,
+            }
+        }
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
