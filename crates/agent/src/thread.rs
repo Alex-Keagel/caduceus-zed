@@ -957,6 +957,12 @@ pub struct NativeTokenUsage {
     pub output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_write_tokens: u32,
+    /// ST7-followup-A: model's max context window when known. Lets
+    /// downstream consumers compare `input_tokens / context_limit` to
+    /// distinguish prompt-side context exhaustion from output-cap
+    /// `MaxTokens`. None if the orchestrator did not surface it
+    /// (older engine, abnormal exit, non-caduceus path).
+    pub context_limit: Option<u32>,
 }
 
 impl From<caduceus_bridge::event_translator::TokenUsageMirror> for NativeTokenUsage {
@@ -966,6 +972,7 @@ impl From<caduceus_bridge::event_translator::TokenUsageMirror> for NativeTokenUs
             output_tokens: m.output_tokens,
             cache_read_tokens: m.cache_read_tokens,
             cache_write_tokens: m.cache_write_tokens,
+            context_limit: m.context_limit,
         }
     }
 }
@@ -7059,6 +7066,37 @@ fn dispatch_translated_event(
                 .0
                 .unbounded_send(Ok(ThreadEvent::UsageUpdated((*usage).into())))
                 .ok();
+            // ST7-followup-A: detect prompt-side context exhaustion and
+            // surface a richer diagnostic. acp::StopReason has no
+            // dedicated ContextExhausted variant, so we keep mapping to
+            // MaxTokens for compat but emit a parallel
+            // EngineDiagnostic with severity Warn so the UI can render a
+            // "context exhausted, X / Y tokens used — compact and
+            // continue" affordance instead of a generic "max tokens"
+            // error. The signal: BudgetExceeded (orchestrator-side cap)
+            // OR MaxTokens with input_tokens at/near context_limit
+            // (provider hit the prompt window).
+            let prompt_saturation_pct = usage
+                .context_limit
+                .filter(|&lim| lim > 0)
+                .map(|lim| (usage.input_tokens as f64 / lim as f64) * 100.0);
+            let context_exhausted = matches!(stop, K::BudgetExceeded)
+                || (matches!(stop, K::MaxTokens)
+                    && prompt_saturation_pct.is_some_and(|p| p >= 95.0));
+            if context_exhausted {
+                let detail = match (usage.context_limit, prompt_saturation_pct) {
+                    (Some(lim), Some(pct)) => format!(
+                        "context exhausted: {} / {} prompt tokens used ({:.0}%); compact or start a new thread",
+                        usage.input_tokens, lim, pct,
+                    ),
+                    _ => "context exhausted: turn cut off because the prompt saturated the model's context window; compact or start a new thread".into(),
+                };
+                stream.send_engine_diagnostic(
+                    "context.exhausted",
+                    detail,
+                    EngineDiagnosticSeverity::Warning,
+                );
+            }
             let reason = match stop {
                 K::EndTurn => acp::StopReason::EndTurn,
                 K::ToolUse => acp::StopReason::EndTurn,
@@ -8607,6 +8645,7 @@ mod native_dispatch_tests {
             output_tokens: 567,
             cache_read_tokens: 100,
             cache_write_tokens: 42,
+            context_limit: None,
         };
         let evs = dispatch_one(T::TurnComplete {
             stop: TStop::EndTurn,
@@ -8645,6 +8684,120 @@ mod native_dispatch_tests {
             ThreadEvent::Stop(acp::StopReason::Cancelled) => {}
             other => panic!("expected Stop(Cancelled), got {other:?}"),
         }
+    }
+
+    // ── ST7-followup-A: prompt-side context exhaustion is surfaced as a
+    //    "context.exhausted" Warning diagnostic in addition to the usual
+    //    Stop(MaxTokens). Without the diagnostic, the UI can't tell
+    //    "output cap" from "prompt window saturated" — both arrive as
+    //    StopReason::MaxTokens. ──────────────────────────────────────
+    #[test]
+    fn budget_exceeded_emits_context_exhausted_diagnostic() {
+        let usage = TokenUsageMirror {
+            input_tokens: 199_500,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            context_limit: Some(200_000),
+        };
+        let evs = dispatch_one(T::TurnComplete {
+            stop: TStop::BudgetExceeded,
+            usage,
+        });
+        // Expected: UsageUpdated → EngineDiagnostic(context.exhausted) → Stop(MaxTokens).
+        assert!(evs.len() >= 3, "expected ≥ 3 events, got {evs:?}");
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                ThreadEvent::EngineDiagnostic(d)
+                    if d.kind == "context.exhausted"
+                        && d.severity == EngineDiagnosticSeverity::Warning
+                        && (d.detail.contains("199500")
+                            || d.detail.contains("199,500")
+                            || d.detail.contains("context")
+                            || d.detail.contains("exhausted"))
+            )),
+            "BudgetExceeded must emit context.exhausted Warning, got {evs:?}"
+        );
+        assert!(
+            matches!(evs.last(), Some(ThreadEvent::Stop(acp::StopReason::MaxTokens))),
+            "terminal Stop must remain MaxTokens for acp compat, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn max_tokens_with_high_prompt_saturation_emits_context_exhausted() {
+        // Provider reported MaxTokens (output cap) but prompt is at 96%
+        // of context_limit — likely the real cause is prompt-side
+        // exhaustion. Surface the diagnostic so the UI knows.
+        let usage = TokenUsageMirror {
+            input_tokens: 192_000,
+            output_tokens: 1_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            context_limit: Some(200_000),
+        };
+        let evs = dispatch_one(T::TurnComplete {
+            stop: TStop::MaxTokens,
+            usage,
+        });
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                ThreadEvent::EngineDiagnostic(d) if d.kind == "context.exhausted"
+            )),
+            "MaxTokens at ≥95% context fill must emit context.exhausted, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn max_tokens_with_low_prompt_saturation_does_not_emit_diagnostic() {
+        // Provider reported MaxTokens but the prompt is at 30% — this is
+        // a genuine output-cap hit, not context exhaustion. Don't muddy
+        // the UI with a misleading diagnostic.
+        let usage = TokenUsageMirror {
+            input_tokens: 60_000,
+            output_tokens: 4_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            context_limit: Some(200_000),
+        };
+        let evs = dispatch_one(T::TurnComplete {
+            stop: TStop::MaxTokens,
+            usage,
+        });
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                ThreadEvent::EngineDiagnostic(d) if d.kind == "context.exhausted"
+            )),
+            "MaxTokens with low prompt saturation must NOT emit context.exhausted, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn max_tokens_with_no_context_limit_does_not_emit_diagnostic() {
+        // Older orchestrator / non-caduceus path with context_limit=None.
+        // We can't compute saturation, so don't speculate — leave the
+        // generic MaxTokens stop alone.
+        let usage = TokenUsageMirror {
+            input_tokens: 1_000_000,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            context_limit: None,
+        };
+        let evs = dispatch_one(T::TurnComplete {
+            stop: TStop::MaxTokens,
+            usage,
+        });
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                ThreadEvent::EngineDiagnostic(d) if d.kind == "context.exhausted"
+            )),
+            "MaxTokens without context_limit must NOT emit context.exhausted, got {evs:?}"
+        );
     }
 
     #[test]
@@ -8893,6 +9046,7 @@ mod native_turn_e2e_tests {
                     output_tokens: 85,
                     cache_read_tokens: 400,
                     cache_write_tokens: 10,
+                    context_limit: None,
                 },
             },
         ];

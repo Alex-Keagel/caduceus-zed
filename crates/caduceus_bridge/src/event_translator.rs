@@ -176,6 +176,12 @@ pub struct TokenUsageMirror {
     pub output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_write_tokens: u32,
+    /// ST7-followup-A: model's max context window, populated by the
+    /// orchestrator at TurnComplete. None when unknown (older
+    /// orchestrator, abnormal exit). Consumers compare
+    /// `input_tokens / context_limit` to distinguish prompt-side
+    /// context exhaustion from output-cap `MaxTokens`.
+    pub context_limit: Option<u32>,
 }
 
 impl From<&caduceus_core::TokenUsage> for TokenUsageMirror {
@@ -185,6 +191,7 @@ impl From<&caduceus_core::TokenUsage> for TokenUsageMirror {
             output_tokens: u.output_tokens,
             cache_read_tokens: u.cache_read_tokens,
             cache_write_tokens: u.cache_write_tokens,
+            context_limit: u.context_limit,
         }
     }
 }
@@ -1009,6 +1016,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_write_tokens: 5,
+            context_limit: Some(200_000),
         };
         let cases = [
             (StopReason::EndTurn, StopReasonKind::EndTurn),
@@ -1023,7 +1031,7 @@ mod tests {
         for (sr, expected) in cases {
             let got = one(&AgentEvent::TurnComplete {
                 stop_reason: sr,
-                usage: usage.clone(),
+                usage,
             });
             assert_eq!(
                 got,
@@ -1034,6 +1042,11 @@ mod tests {
                         output_tokens: 50,
                         cache_read_tokens: 30,
                         cache_write_tokens: 5,
+                        // ST7-followup-A: context_limit is mirrored from
+                        // caduceus_core::TokenUsage so the bridge can
+                        // distinguish prompt-side exhaustion from
+                        // output-cap MaxTokens at the stop-mapping site.
+                        context_limit: Some(200_000),
                     }
                 }
             );
