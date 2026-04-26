@@ -1245,4 +1245,223 @@ mod tests {
             other => panic!("expected Timeout, got {other:?}"),
         }
     }
+
+    // ─── ST7 r3 #6: end-to-end gpui test driving SpawnAgentTool::run ───
+    //
+    // The unit tests above (#3 / #4) lock in the math and the
+    // pump-state snapshot in isolation. This test fakes the full
+    // surface — `ThreadEnvironment` + `SubagentHandle` — and drives
+    // `SpawnAgentTool::run` through the gpui executor with a mock
+    // clock advance so all three reviewer must-fix items are
+    // observed *together* on the actual run() path, not on a
+    // hand-rolled approximation:
+    //
+    //   #3: pump observes events emitted by the fake `send()` BEFORE
+    //       the timeout fires, so `TimeoutFailure.last_phase` is
+    //       `ToolExecution` and `tools_started == true`.
+    //   #4: timeout with `num_entries == 0` produces
+    //       `message_end_index == None` (checked_sub vs the prior
+    //       saturating_sub bug claimed entry 0 existed).
+    //   ACP/no-events parallel: when `events()` returns `None` the
+    //       phase stays `(ModelSelection, false)` — locks in the
+    //       graceful-degradation contract for non-caduceus paths.
+    mod e2e_timeout {
+        use super::super::*;
+        use anyhow::anyhow;
+        use caduceus_core::{AgentEvent, ToolCallId};
+        use caduceus_orchestrator::AgentEventEmitter;
+        use gpui::{App, AppContext as _, AsyncApp, BackgroundExecutor, Task, TestAppContext};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FakeSubagent {
+            session_id: acp::SessionId,
+            num_entries: AtomicUsize,
+            emitter: Option<AgentEventEmitter>,
+            executor: BackgroundExecutor,
+        }
+
+        impl crate::SubagentHandle for FakeSubagent {
+            fn id(&self) -> acp::SessionId {
+                self.session_id.clone()
+            }
+            fn num_entries(&self, _cx: &App) -> usize {
+                self.num_entries.load(Ordering::SeqCst)
+            }
+            fn send(&self, _message: String, cx: &AsyncApp) -> Task<anyhow::Result<String>> {
+                let emitter = self.emitter.clone();
+                let executor = self.executor.clone();
+                cx.spawn(async move |_| {
+                    if let Some(em) = emitter {
+                        em.emit(AgentEvent::ThinkingStarted { iteration: 0 }).await;
+                        em.emit(AgentEvent::ToolCallStart {
+                            id: ToolCallId::new("t1"),
+                            name: "read_file".into(),
+                        })
+                        .await;
+                    }
+                    // Simulate "subagent stuck doing tool work forever".
+                    // `Task::ready(pending)` would deadlock the executor;
+                    // wait on a multi-decade timer instead so the
+                    // executor's mock clock is the only thing that can
+                    // advance us — and the spawn-side select_biased!
+                    // races this against the spawn timeout.
+                    executor.timer(Duration::from_secs(10 * 365 * 24 * 3600)).await;
+                    unreachable!("the spawn timeout must fire first")
+                })
+            }
+            fn events(
+                &self,
+                _cx: &mut AsyncApp,
+            ) -> Option<tokio::sync::broadcast::Receiver<AgentEvent>> {
+                self.emitter.as_ref().map(|e| e.subscribe())
+            }
+        }
+
+        struct FakeEnv {
+            subagent: std::cell::RefCell<Option<Rc<dyn crate::SubagentHandle>>>,
+        }
+
+        impl crate::ThreadEnvironment for FakeEnv {
+            fn create_terminal(
+                &self,
+                _command: String,
+                _cwd: Option<PathBuf>,
+                _output_byte_limit: Option<u64>,
+                _cx: &mut AsyncApp,
+            ) -> Task<anyhow::Result<Rc<dyn crate::TerminalHandle>>> {
+                Task::ready(Err(anyhow!("create_terminal not used in this test")))
+            }
+            fn create_subagent(
+                &self,
+                _opts: crate::SubagentSpawnOptions,
+                _cx: &mut App,
+            ) -> anyhow::Result<Rc<dyn crate::SubagentHandle>> {
+                self.subagent
+                    .borrow_mut()
+                    .take()
+                    .ok_or_else(|| anyhow!("FakeEnv consumed twice"))
+            }
+        }
+
+        async fn drive_run_to_timeout(
+            cx: &mut TestAppContext,
+            with_emitter: bool,
+        ) -> SpawnAgentToolOutput {
+            let executor = cx.executor();
+            let emitter = if with_emitter {
+                let (em, mut rx) = AgentEventEmitter::channel(256);
+                executor
+                    .spawn(async move { while rx.recv().await.is_some() {} })
+                    .detach();
+                Some(em)
+            } else {
+                None
+            };
+
+            let fake_subagent = Rc::new(FakeSubagent {
+                session_id: acp::SessionId::new(std::sync::Arc::<str>::from("fake-session")),
+                num_entries: AtomicUsize::new(0),
+                emitter,
+                executor: executor.clone(),
+            });
+            let env = Rc::new(FakeEnv {
+                subagent: std::cell::RefCell::new(Some(
+                    fake_subagent.clone() as Rc<dyn crate::SubagentHandle>
+                )),
+            });
+            let tool = Arc::new(SpawnAgentTool::new(env));
+
+            let (event_stream, _event_rx) = ToolCallEventStream::test();
+            let task = cx.update(|cx| {
+                tool.run(
+                    ToolInput::resolved(SpawnAgentToolInput {
+                        label: "fake".into(),
+                        message: "do work".into(),
+                        timeout_secs: Some(10),
+                        session_id: None,
+                        profile: None,
+                        model: None,
+                        mode: None,
+                    }),
+                    event_stream,
+                    cx,
+                )
+            });
+
+            cx.executor().run_until_parked();
+            cx.executor().advance_clock(Duration::from_secs(11));
+            cx.executor().run_until_parked();
+
+            match task.await {
+                Ok(out) => out,
+                Err(out) => out,
+            }
+        }
+
+        #[gpui::test]
+        async fn e2e_timeout_with_emitter_observes_tool_execution_and_no_message_end_index(
+            cx: &mut TestAppContext,
+        ) {
+            let out = drive_run_to_timeout(cx, true).await;
+            match out {
+                SpawnAgentToolOutput::Error {
+                    failure_type,
+                    failure_details,
+                    session_info,
+                    ..
+                } => {
+                    assert_eq!(
+                        failure_type.as_deref(),
+                        Some("Timeout"),
+                        "expected Timeout failure, got {failure_type:?}"
+                    );
+                    let fd = failure_details.expect("failure_details required");
+                    // ST7 r3 #3: pump reflected the event trajectory.
+                    assert_eq!(fd["last_phase"], "ToolExecution");
+                    assert_eq!(fd["tools_started"], true);
+                    assert!(
+                        fd["elapsed_secs"].as_u64().unwrap_or(0) >= 10,
+                        "elapsed_secs must reflect the mock-clock advance, got {fd}"
+                    );
+                    // ST7 r3 #4: no entries → message_end_index is absent / null.
+                    let info = session_info.expect("session_info required");
+                    assert!(
+                        info.message_end_index.is_none(),
+                        "message_end_index must be None on zero-entry timeout, got {info:?}"
+                    );
+                    assert_eq!(info.message_start_index, 0);
+                }
+                other => panic!("expected SpawnAgentToolOutput::Error, got {other:?}"),
+            }
+        }
+
+        #[gpui::test]
+        async fn e2e_timeout_without_emitter_keeps_phase_at_model_selection(
+            cx: &mut TestAppContext,
+        ) {
+            // ACP / non-caduceus path: events() returns None, so the
+            // pump never starts and (last_phase, tools_started) stays
+            // at the (ModelSelection, false) defaults. Timeout still
+            // fires correctly; classification is just less specific.
+            let out = drive_run_to_timeout(cx, false).await;
+            match out {
+                SpawnAgentToolOutput::Error {
+                    failure_type,
+                    failure_details,
+                    ..
+                } => {
+                    assert_eq!(failure_type.as_deref(), Some("Timeout"));
+                    let fd = failure_details.expect("failure_details required");
+                    assert_eq!(
+                        fd["last_phase"], "ModelSelection",
+                        "without an emitter, phase remains at the default ModelSelection"
+                    );
+                    assert_eq!(fd["tools_started"], false);
+                }
+                other => panic!("expected SpawnAgentToolOutput::Error, got {other:?}"),
+            }
+        }
+    }
 }
