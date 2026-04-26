@@ -4463,6 +4463,8 @@ impl Thread {
         let _bridge_rt_guard = caduceus_bridge::tokio_rt::bridge_runtime_handle().enter();
 
         let reducer = setup.bridge.new_reducer_handle();
+        let translated_channel_closed =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let state_mut = &mut *state_guard;
         let run_result = setup
             .bridge
@@ -4474,6 +4476,7 @@ impl Thread {
                 reducer,
                 turn_event_rx,
                 trans_tx,
+                translated_channel_closed.clone(),
             )
             .await;
 
@@ -4489,6 +4492,15 @@ impl Thread {
         // run_turn caller will send its own Stop on Ok(()). That's a
         // harmless double-stop (receiver takes the first) — accepted
         // cost of not plumbing a "native handled stop" signal yet.
+        if translated_channel_closed.load(std::sync::atomic::Ordering::Relaxed) {
+            // ST7-prereq: surface consumer-dropped-early as a distinct
+            // signal from no-progress. The translated stream is best-effort
+            // (the reducer is authoritative), so this is informational only.
+            log::warn!(
+                "[caduceus] translated event channel closed mid-turn — \
+                 consumer task likely dropped or panicked early"
+            );
+        }
         if let Err(e) = run_result {
             event_stream.send_engine_diagnostic(
                 "native.run_failed",

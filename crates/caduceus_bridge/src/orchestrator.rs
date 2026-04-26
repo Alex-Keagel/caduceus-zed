@@ -1369,9 +1369,14 @@ impl OrchestratorBridge {
     /// * Forwarder drain is bounded (5s) and honours both channel-close
     ///   and an explicit drain signal.
     /// * The caller owns the `translated_tx` / `translated_rx` split;
-    ///   dropping the receiver early causes `try_send` to fail silently
-    ///   (translated events are best-effort — the reducer pipeline is
-    ///   authoritative).
+    ///   dropping the receiver early causes `try_send` to fail. The
+    ///   forwarder records the **first** such failure into
+    ///   `translated_channel_closed` (an `Arc<AtomicBool>`) so the
+    ///   caller can differentiate *the consumer cancelled / panicked*
+    ///   from *no events were emitted*. Subsequent send failures are
+    ///   silently dropped — translated events remain best-effort, the
+    ///   reducer pipeline is authoritative, and the flag is purely
+    ///   diagnostic.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_caduceus_loop_translated(
         &self,
@@ -1384,17 +1389,24 @@ impl OrchestratorBridge {
         translated_tx: tokio::sync::mpsc::UnboundedSender<
             crate::event_translator::TranslatedThreadEvent,
         >,
+        translated_channel_closed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<String, BridgeError> {
         if !self.native_loop_enabled() {
             return Err(BridgeError::NativeLoopDisabled);
         }
 
         let reducer_fwd = reducer.clone();
+        let closed_flag = translated_channel_closed.clone();
         let (forwarder, drain_tx) = spawn_forwarder(event_rx, move |ev| {
             reducer_fwd.ingest_event(ev);
             for out in crate::event_translator::translate(ev) {
-                // Best-effort: drop silently if the receiver is gone.
-                let _ = translated_tx.send(out);
+                if translated_tx.send(out).is_err() {
+                    // ST7-prereq: record the first channel-closed event so
+                    // the caller can differentiate *consumer dropped early*
+                    // from *no progress was made*. Subsequent failures are
+                    // best-effort and silently dropped.
+                    closed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         });
 
