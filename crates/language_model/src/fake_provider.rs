@@ -1,8 +1,8 @@
 use crate::{
-    AuthenticateError, ConfigurationViewTargetAgent, LanguageModel, LanguageModelCompletionError,
-    LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
-    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
-    LanguageModelRequest, LanguageModelToolChoice,
+    AuthenticateError, ConfigurationViewTargetAgent, LanguageModel,
+    LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelId,
+    LanguageModelName, LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
+    LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice, ProviderAuthState,
 };
 use anyhow::anyhow;
 use futures::{FutureExt, channel::mpsc, future::BoxFuture, stream::BoxStream, stream::StreamExt};
@@ -19,6 +19,10 @@ pub struct FakeLanguageModelProvider {
     id: LanguageModelProviderId,
     name: LanguageModelProviderName,
     models: Vec<Arc<dyn LanguageModel>>,
+    /// Override `auth_state()` for tests that need a non-`Authenticated` value. Wrapped in
+    /// `Arc<Mutex<>>` so `&self`-only `auth_state(cx)` can read it and tests can mutate via
+    /// `set_auth_state`.
+    auth_state_override: Arc<Mutex<Option<ProviderAuthState>>>,
 }
 
 impl Default for FakeLanguageModelProvider {
@@ -27,6 +31,7 @@ impl Default for FakeLanguageModelProvider {
             id: LanguageModelProviderId::from("fake".to_string()),
             name: LanguageModelProviderName::from("Fake".to_string()),
             models: vec![Arc::new(FakeLanguageModel::default())],
+            auth_state_override: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -60,8 +65,11 @@ impl LanguageModelProvider for FakeLanguageModelProvider {
         self.models.clone()
     }
 
-    fn is_authenticated(&self, _: &App) -> bool {
-        true
+    fn auth_state(&self, _: &App) -> ProviderAuthState {
+        self.auth_state_override
+            .lock()
+            .clone()
+            .unwrap_or(ProviderAuthState::Authenticated)
     }
 
     fn authenticate(&self, _: &mut App) -> Task<Result<(), AuthenticateError>> {
@@ -88,12 +96,19 @@ impl FakeLanguageModelProvider {
             id,
             name,
             models: vec![Arc::new(FakeLanguageModel::default())],
+            auth_state_override: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn with_models(mut self, models: Vec<Arc<dyn LanguageModel>>) -> Self {
         self.models = models;
         self
+    }
+
+    /// Override the value returned by `auth_state(cx)`. Pass `None` to revert to the
+    /// `Authenticated` default. Used by tests that exercise the non-authenticated paths.
+    pub fn set_auth_state(&self, state: Option<ProviderAuthState>) {
+        *self.auth_state_override.lock() = state;
     }
 
     pub fn test_model(&self) -> FakeLanguageModel {
