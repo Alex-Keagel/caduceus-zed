@@ -2551,28 +2551,70 @@ impl Thread {
 
     /// PlanUpdate hook: called from `agent.rs` (legacy ACP dispatcher) when
     /// `ThreadEvent::Plan` is observed, and from the native-loop consumer
-    /// task on `T::PlanStep` / `T::PlanAmended`. Pins the most-recent
-    /// **agent** message (by stable `AgentMessageId`) with
-    /// `PinReason::PlanUpdate`. If no agent message exists yet, drops the
-    /// pin and emits a `WARN` log (per AC6).
+    /// task on `T::PlanStep` / `T::PlanAmended`. Pins the **current-turn**
+    /// agent message (by stable `AgentMessageId`) with `PinReason::PlanUpdate`.
     ///
-    /// ST2 fix-loop #3: plan v3.1 Fix 1 specifies the most-recent
-    /// **agent** message — the plan describes work the agent has just
-    /// announced, so the agent message is the natural anchor. Earlier
-    /// code targeted the most-recent user message, which diverged from
-    /// the published contract.
+    /// Target selection (ST2 r3 Fix 1) — order matters because plan events
+    /// fire mid-stream, before `flush_pending_message` has moved the
+    /// in-flight assistant content into `self.messages`:
+    ///   1. If `self.pending_message` is `Some`, use its `id` — that is
+    ///      the live current-turn assistant message.
+    ///   2. Otherwise, walk `self.messages` from the end backwards, stopping
+    ///      at the most recent `Message::User` or `Message::Resume` (the
+    ///      current-turn boundary). Pin the latest `Message::Agent` seen
+    ///      after that boundary (the trailing agent in the current turn).
+    ///   3. If neither exists (plan event emitted before any current-turn
+    ///      agent target), drop any stale `PinReason::PlanUpdate` pin so
+    ///      we don't leave a dangling reference to a prior turn, and emit
+    ///      a `WARN` log (per AC6).
+    ///
+    /// Earlier code (ST2 fix-loop #3) only scanned `self.messages` for the
+    /// last `Message::Agent`, which during a streamed turn either pinned a
+    /// HISTORICAL agent message (wrong target) or silently no-op'd. v3.1
+    /// Fix 1 mandates the **current-turn** agent message as the anchor.
     pub fn on_plan_event_emitted(&mut self, _cx: &mut Context<Self>) {
-        let target = self.messages.iter().rev().find_map(|m| match m {
-            Message::Agent(a) => Some(a.id),
-            _ => None,
-        });
+        let target = if let Some(pending) = self.pending_message.as_ref() {
+            Some(pending.id)
+        } else {
+            self.current_turn_trailing_agent_id()
+        };
         let Some(id) = target else {
-            log::warn!(
-                "[st2] plan event emitted before any agent message; PlanUpdate pin dropped"
-            );
+            // No current-turn agent target available. Proactively drop any
+            // stale PlanUpdate pin so we don't carry a pin from a prior
+            // turn forward.
+            let stale_idx = self
+                .pinned
+                .iter()
+                .position(|p| p.reason == PinReason::PlanUpdate);
+            if let Some(i) = stale_idx {
+                self.pinned.remove(i);
+                log::warn!(
+                    "[st2] plan event emitted with no current-turn agent target; \
+                     stale PlanUpdate pin removed"
+                );
+            } else {
+                log::warn!(
+                    "[st2] plan event emitted before any current-turn agent message; \
+                     PlanUpdate pin dropped"
+                );
+            }
             return;
         };
         self.pin_replace(PinnedMessageKey::Agent(id), PinReason::PlanUpdate);
+    }
+
+    /// Returns the id of the latest `Message::Agent` in the trailing
+    /// contiguous agent segment after the most recent `Message::User` /
+    /// `Message::Resume` boundary. `None` if no agent appears in the
+    /// current turn (e.g. user just sent, no reply yet).
+    fn current_turn_trailing_agent_id(&self) -> Option<AgentMessageId> {
+        for m in self.messages.iter().rev() {
+            match m {
+                Message::Agent(a) => return Some(a.id),
+                Message::User(_) | Message::Resume(_) => return None,
+            }
+        }
+        None
     }
 
     /// ScopeExpansionActive auto-pin trigger: invoked from the native-loop
