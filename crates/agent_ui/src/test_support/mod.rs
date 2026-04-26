@@ -11,6 +11,9 @@ use std::rc::Rc;
 use crate::AgentPanel;
 use crate::agent_panel;
 
+pub mod render_snapshot;
+pub use render_snapshot::{RenderSnapshot, click_selector};
+
 pub struct StubAgentServer<C> {
     connection: C,
     agent_id: AgentId,
