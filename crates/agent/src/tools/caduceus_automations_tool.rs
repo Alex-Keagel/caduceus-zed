@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 
 use caduceus_bridge::orchestrator::{
-    Automation, AutomationAgentConfig, AutomationTrigger, AgentMode, ModelId,
+    AgentMode, Automation, AutomationAgentConfig, AutomationTrigger, ModelId,
 };
 
 use crate::tools::caduceus_file_lock::acquire_file_lock;

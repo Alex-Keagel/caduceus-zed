@@ -1266,9 +1266,7 @@ impl AgentPanel {
         // as a first-frame primer.
         panel._caduceus_stats_poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_secs(5))
-                    .await;
+                cx.background_executor().timer(Duration::from_secs(5)).await;
                 if this
                     .update(cx, |panel, cx| {
                         // Force-refresh: invalidate the TTL guard so the
@@ -4563,7 +4561,7 @@ impl AgentPanel {
                             background_agent_count,
                             evolved_skill_count,
                             security_score,
-                            project_name.clone(),
+                            project_name,
                             project_repo_count,
                             api_count,
                             health_score,
@@ -8523,7 +8521,10 @@ mod tests {
         assert_eq!(cache.api_count, 12);
         assert_eq!(cache.health_score, Some(10.5));
         assert_eq!(cache.memory_count, 13);
-        assert_eq!(cache.memory_entries, vec![("k-7".to_string(), "v-7".to_string())]);
+        assert_eq!(
+            cache.memory_entries,
+            vec![("k-7".to_string(), "v-7".to_string())]
+        );
         assert_eq!(cache.memory_tooltip, "mem-tip-7");
         assert_eq!(cache.bg_agent_tooltip, "bg-tip-7");
         assert_eq!(cache.security_tooltip, "sec-tip-7");
@@ -8553,7 +8554,10 @@ mod tests {
         assert_eq!(cache.project_name.as_deref(), Some("project-2"));
         assert_eq!(cache.api_count, 7);
         assert_eq!(cache.health_score, Some(3.0));
-        assert_eq!(cache.memory_entries, vec![("k-2".to_string(), "v-2".to_string())]);
+        assert_eq!(
+            cache.memory_entries,
+            vec![("k-2".to_string(), "v-2".to_string())]
+        );
         assert_eq!(cache.memory_tooltip, "mem-tip-2");
         assert_eq!(cache.bg_agent_tooltip, "bg-tip-2");
         assert_eq!(cache.security_tooltip, "sec-tip-2");

@@ -1,14 +1,132 @@
 use acp_thread::{SUBAGENT_SESSION_INFO_META_KEY, SubagentSessionInfo};
 use agent_client_protocol as acp;
 use anyhow::Result;
-use gpui::{App, SharedString, Task};
+use caduceus_core::{SubAgentFailure, SubAgentPhase, TimeoutFailure};
+use gpui::{App, AppContext, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
+
+/// ST7: per-spawn timeout bounds for `spawn_agent` (input override).
+/// Defaults to 15 minutes when `timeout_secs` is `None`.
+pub const DEFAULT_SPAWN_TIMEOUT_SECS: u64 = 900;
+pub const MIN_SPAWN_TIMEOUT_SECS: u64 = 1;
+pub const MAX_SPAWN_TIMEOUT_SECS: u64 = 3600;
+
+/// Validate a per-spawn timeout. `None` → 15min default. Out-of-range values
+/// produce `SubAgentFailure::InternalError { kind: "invalid_timeout" }` per
+/// plan v3.1 T-VAL1 (NOT a `ProviderError` — domain mismatch fix).
+pub fn validate_timeout(t: Option<u64>) -> std::result::Result<Duration, SubAgentFailure> {
+    match t {
+        None => Ok(Duration::from_secs(DEFAULT_SPAWN_TIMEOUT_SECS)),
+        Some(v) if (MIN_SPAWN_TIMEOUT_SECS..=MAX_SPAWN_TIMEOUT_SECS).contains(&v) => {
+            Ok(Duration::from_secs(v))
+        }
+        Some(v) => Err(SubAgentFailure::InternalError {
+            kind: "invalid_timeout".into(),
+            message: format!(
+                "timeout_secs={v} out of range [{MIN_SPAWN_TIMEOUT_SECS}..={MAX_SPAWN_TIMEOUT_SECS}]"
+            ),
+        }),
+    }
+}
+
+/// ST7: classify an `anyhow::Error` returned by `subagent.send()` into a
+/// structured [`SubAgentFailure`]. Order:
+///
+/// 1. Downcast to a typed `SubAgentFailure` (already classified upstream
+///    — e.g. `RecursionLimitExceeded` at `agent.rs:2832`,
+///    `ModelRefusal` at `agent.rs:3073`, or any failure wrapped by the
+///    new `Err` arm at `agent.rs:3078`).
+/// 2. Downcast to a typed [`caduceus_core::CaduceusError`] (live-path fix
+///    — must-fix #1, plan v3 §A: 429 / 503 / timeout / cancel from the
+///    provider stack reach this site as `anyhow!(CaduceusError::*)`; the
+///    classifier maps them to `RetryClass` correctly).
+/// 3. String-pattern fallback for the small set of canned `anyhow!(...)`
+///    messages emitted directly by `agent.rs` (`MaxTokens` /
+///    `MaxTurnRequests` / `User canceled` / refusal text /
+///    no-response).
+/// 4. Otherwise → `InternalError { kind: "subagent_send_failed" }`.
+pub fn classify_subagent_error(
+    err: &anyhow::Error,
+    classify_ctx: &caduceus_core::ClassifyContext,
+    last_phase: SubAgentPhase,
+    tools_started: bool,
+    elapsed_secs: Option<u64>,
+    timeout_secs: Option<u64>,
+) -> SubAgentFailure {
+    if let Some(typed) = err.downcast_ref::<SubAgentFailure>() {
+        return typed.clone();
+    }
+    if let Some(cd_err) = err.downcast_ref::<caduceus_core::CaduceusError>() {
+        // ST7 r3 followup-B: caller plumbs `classify_ctx` from the subagent
+        // (`SubagentHandle::classify_context`) at the post-send boundary,
+        // or `ClassifyContext::empty()` at the create boundary where no
+        // subagent exists yet.
+        return caduceus_core::classify_caduceus_error(
+            cd_err,
+            classify_ctx,
+            last_phase,
+            tools_started,
+            elapsed_secs,
+            timeout_secs,
+        );
+    }
+    let msg = err.to_string();
+    if msg == "User canceled" {
+        return SubAgentFailure::UserCancel;
+    }
+    // ST7 fix-loop #6: removed the legacy
+    // `if msg.contains("Maximum subagent depth")` branch. It returned
+    // `InternalError { kind: "recursion_limit", ... }`, which is the
+    // WRONG shape — `SubAgentFailure::RecursionLimitExceeded { current_depth,
+    // max_depth }` is the canonical typed variant. Since `agent.rs:2832`
+    // now emits the typed value via `anyhow!(SubAgentFailure::RecursionLimit
+    // Exceeded {...})`, the SubAgentFailure downcast above is the
+    // correct (and only) path. Keeping the string fallback would silently
+    // mis-shape the failure if the typed wrap ever regressed.
+    if msg.contains("refused to process") {
+        return SubAgentFailure::ModelRefusal { refusal_text: msg };
+    }
+    if msg == "No response from the agent. You can try messaging again." {
+        return SubAgentFailure::InternalError {
+            kind: "no_response".into(),
+            message: msg,
+        };
+    }
+    SubAgentFailure::InternalError {
+        kind: "subagent_send_failed".into(),
+        message: msg,
+    }
+}
+
+/// ST7 fix-loop #3: apply one observed `AgentEvent` to the per-spawn
+/// `(last_phase, tools_started)` state. Pure & sync — extracted from
+/// the `run()` event-pump task so it can be unit-tested without the
+/// gpui executor or a full subagent.
+///
+/// Contract:
+/// - Phase transitions via [`SubAgentPhase::next_phase`] (the v3.1 Fix 2
+///   table — ToolResultEnd does NOT exit ToolExecution).
+/// - `tools_started` is monotonic: set to `true` on the first
+///   `ToolCallStart` and never reset (matches `TimeoutFailure`'s
+///   semantics — "did this subagent ever start a tool?").
+pub(crate) fn apply_event_to_phase_state(
+    state: &std::sync::Mutex<(SubAgentPhase, bool)>,
+    event: &caduceus_core::AgentEvent,
+) {
+    let mut guard = state.lock().unwrap();
+    let (phase, tools) = &mut *guard;
+    *phase = phase.next_phase(event);
+    if matches!(event, caduceus_core::AgentEvent::ToolCallStart { .. }) {
+        *tools = true;
+    }
+}
 
 /// Spawn a sub-agent for a well-scoped task.
 ///
@@ -72,6 +190,11 @@ pub struct SpawnAgentToolInput {
     /// to inherit from the parent agent.
     #[serde(default)]
     pub mode: Option<String>,
+    /// ST7: per-spawn wall-clock timeout in seconds. `None` → 15-minute
+    /// default. Clamped to `[1, 3600]`; out-of-range values fail the spawn
+    /// with `failure_type = "InternalError"` (`kind = "invalid_timeout"`).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,8 +211,59 @@ pub enum SpawnAgentToolOutput {
         #[serde(default)]
         session_id: Option<acp::SessionId>,
         error: String,
+        /// ST7: stable discriminant string mirroring
+        /// [`SubAgentFailure::kind_str`]. `None` for legacy / unclassified
+        /// errors so existing consumers keep round-tripping.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        failure_type: Option<String>,
+        /// ST7: the full `SubAgentFailure` payload (the `details` field of
+        /// the tagged enum, opaque to non-LLM consumers). `None` when the
+        /// failure could not be classified.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        failure_details: Option<serde_json::Value>,
         session_info: Option<SubagentSessionInfo>,
     },
+}
+
+impl SpawnAgentToolOutput {
+    /// Build an `Error` variant from a structured [`SubAgentFailure`],
+    /// populating `failure_type` and `failure_details` from the typed
+    /// payload while preserving `error` as a human-readable string for
+    /// backward compat.
+    ///
+    /// **Fix-loop #5 (legacy refusal compat):** for
+    /// [`SubAgentFailure::ModelRefusal`], the legacy `error` string is
+    /// the bare refusal text (matching pre-ST7 behavior:
+    /// `anyhow!("The agent refused...").to_string()`), NOT
+    /// `failure.to_string()` which prepends `"model refusal: "`. This
+    /// preserves byte-equivalence for any pre-ST7 consumer that
+    /// substring-matched the refusal sentence in the `error` field.
+    /// The typed discriminant (`failure_type=ModelRefusal` plus
+    /// `failure_details.refusal_text`) is the new canonical surface;
+    /// the legacy string is purely additive backward-compat.
+    pub fn from_failure(
+        session_id: Option<acp::SessionId>,
+        failure: &SubAgentFailure,
+        session_info: Option<SubagentSessionInfo>,
+    ) -> Self {
+        let failure_type = Some(failure.kind_str().to_string());
+        let failure_details = serde_json::to_value(failure)
+            .ok()
+            .and_then(|v| v.get("details").cloned());
+        let error = match failure {
+            SubAgentFailure::ModelRefusal { refusal_text } => refusal_text.clone(),
+            other => other.to_string(),
+        };
+        SpawnAgentToolOutput::Error {
+            session_id,
+            error,
+            failure_type,
+            failure_details,
+            session_info,
+        }
+    }
 }
 
 impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
@@ -107,12 +281,35 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
             SpawnAgentToolOutput::Error {
                 session_id,
                 error,
+                failure_type,
+                failure_details,
                 session_info: _, // Don't show this to the model
-            } => serde_json::to_string(
-                &serde_json::json!({ "session_id": session_id, "error": error }),
-            )
-            .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
-            .into(),
+            } => {
+                // ST7 / v3.1 Fix 3: ALWAYS emit `session_id` (even
+                // `null`) for byte-equivalent backward compat with the
+                // pre-ST7 `json!({ "session_id": ..., "error": ... })`
+                // shape. New keys (`failure_type`, `failure_details`)
+                // are gated on `Option` so the no-classification path
+                // is byte-equivalent too.
+                let mut o = serde_json::Map::new();
+                o.insert(
+                    "session_id".into(),
+                    match session_id {
+                        Some(sid) => serde_json::to_value(sid).unwrap_or(serde_json::Value::Null),
+                        None => serde_json::Value::Null,
+                    },
+                );
+                o.insert("error".into(), serde_json::Value::String(error));
+                if let Some(ft) = failure_type {
+                    o.insert("failure_type".into(), serde_json::Value::String(ft));
+                }
+                if let Some(fd) = failure_details {
+                    o.insert("failure_details".into(), fd);
+                }
+                serde_json::to_string(&serde_json::Value::Object(o))
+                    .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
+                    .into()
+            }
         }
     }
 }
@@ -153,6 +350,7 @@ impl AgentTool for SpawnAgentTool {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
@@ -166,8 +364,20 @@ impl AgentTool for SpawnAgentTool {
                 .map_err(|e| SpawnAgentToolOutput::Error {
                     session_id: None,
                     error: format!("Failed to receive tool input: {e}"),
+                    failure_type: None,
+                    failure_details: None,
                     session_info: None,
                 })?;
+
+            // ST7: validate timeout before any side-effects (subagent
+            // creation, telemetry). Out-of-range → InternalError, not
+            // ProviderError (T-VAL1, plan v3.1 critic B9 fix).
+            let spawn_timeout = match validate_timeout(input.timeout_secs) {
+                Ok(d) => d,
+                Err(failure) => {
+                    return Err(SpawnAgentToolOutput::from_failure(None, &failure, None));
+                }
+            };
 
             let (subagent, mut session_info) = cx.update(|cx| {
                 let subagent = if let Some(session_id) = input.session_id {
@@ -181,10 +391,21 @@ impl AgentTool for SpawnAgentTool {
                     };
                     self.environment.create_subagent(opts, cx)
                 };
-                let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
-                    session_id: None,
-                    error: err.to_string(),
-                    session_info: None,
+                let subagent = subagent.map_err(|err| {
+                    // Best-effort classification at the create boundary.
+                    // ClassifyContext::empty() is honest here — the subagent
+                    // doesn't exist yet so we cannot query its (provider,
+                    // model). Post-create, the wrapper receives a populated
+                    // context via `subagent.classify_context(cx)`.
+                    let failure = classify_subagent_error(
+                        &err,
+                        &caduceus_core::ClassifyContext::empty(),
+                        SubAgentPhase::ModelSelection,
+                        false,
+                        None,
+                        Some(spawn_timeout.as_secs()),
+                    );
+                    SpawnAgentToolOutput::from_failure(None, &failure, None)
                 })?;
                 let session_info = SubagentSessionInfo {
                     session_id: subagent.id(),
@@ -204,7 +425,98 @@ impl AgentTool for SpawnAgentTool {
                 Ok((subagent, session_info))
             })?;
 
-            let send_result = subagent.send(input.message, cx).await;
+            // ST7 fix-loop #4: per-spawn local closure state (NOT a
+            // shared map).
+            //
+            // ST7 fix-loop #3: wire AgentEvent → phase mutation. The
+            // `SubagentHandle::events()` trait method (added in this
+            // commit) returns a fresh broadcast::Receiver scoped to
+            // this subagent. We pump events on a background task that
+            // updates `phase_state` via `SubAgentPhase::next_phase`,
+            // and sets `tools_started` on `ToolCallStart`. Both are
+            // read at the timeout / classify-error sites below so
+            // `TimeoutFailure.last_phase` and `tools_started` reflect
+            // observed events instead of the static `ModelSelection /
+            // false` defaults that pre-fix tests revealed.
+            //
+            // Threading: `Arc<Mutex<...>>` (not Rc) so the pump can
+            // run on `background_spawn` (Send) — the broadcast Receiver
+            // is itself Send + 'static. Mutex contention is negligible
+            // (one writer, one reader, both at low frequency).
+            //
+            // CLOCK: use gpui's BackgroundExecutor::now() so mock-clock
+            // tests (`executor.advance_clock(900s)`) see the elapsed
+            // wall-time. `std::time::Instant::now()` ignored the mock
+            // clock entirely, leaving elapsed_secs ≈ 0 in
+            // mock-clock timeout tests (reviewer must-fix #4).
+            let started_at = cx.background_executor().now();
+            let phase_state: Arc<std::sync::Mutex<(SubAgentPhase, bool)>> = Arc::new(
+                std::sync::Mutex::new((SubAgentPhase::ModelSelection, false)),
+            );
+
+            // Drop guard: when this task is dropped (timeout / completion / cancel),
+            // the receiver is dropped, the pump's `recv()` returns `Closed`, and
+            // the pump exits. We hold it in `_pump_task` so it lives for the spawn.
+            let _pump_task = if let Some(mut events) = subagent.events(cx) {
+                let phase_state = phase_state.clone();
+                Some(cx.background_spawn(async move {
+                    use tokio::sync::broadcast::error::RecvError;
+                    loop {
+                        match events.recv().await {
+                            Ok(event) => apply_event_to_phase_state(&phase_state, &event),
+                            Err(RecvError::Lagged(_)) => {
+                                // Lagged events would not retroactively
+                                // change the phase trajectory in a way
+                                // that's worth replaying for timeout
+                                // diagnostics. Skip and keep pumping.
+                                continue;
+                            }
+                            Err(RecvError::Closed) => break,
+                        }
+                    }
+                }))
+            } else {
+                None
+            };
+
+            // ST7: race the `subagent.send()` future against the
+            // configured spawn timeout via biased `select!` — timeout
+            // arm wins ties (timer-vs-future poll order is
+            // platform-stable). When an explicit cancel token reaches
+            // this site (ST7-prereq), prepend it as the first arm so
+            // cancel beats both timeout and completion.
+            let timer = cx.background_executor().timer(spawn_timeout);
+            let send_fut = subagent.send(input.message, cx);
+            let send_result = {
+                use futures::FutureExt;
+                let mut timer = timer.fuse();
+                let mut send_fut = send_fut.fuse();
+                futures::select_biased! {
+                    () = timer => {
+                        // ST7 fix-loop #4: read mock-clock-aware "now"
+                        // again (NOT started_at.elapsed(), which goes to
+                        // real wallclock via web_time::Instant::now()).
+                        let elapsed = cx
+                            .background_executor()
+                            .now()
+                            .saturating_duration_since(started_at)
+                            .as_secs();
+                        // ST7 fix-loop #3: snapshot pump-mutated state.
+                        let (last_phase, tools_started) = {
+                            let g = phase_state.lock().unwrap();
+                            (g.0, g.1)
+                        };
+                        let timeout_failure = SubAgentFailure::Timeout(TimeoutFailure::new(
+                            elapsed,
+                            spawn_timeout.as_secs(),
+                            last_phase,
+                            tools_started,
+                        ));
+                        Err(anyhow::Error::new(timeout_failure))
+                    }
+                    r = send_fut => r,
+                }
+            };
 
             let status = if send_result.is_ok() {
                 "completed"
@@ -217,8 +529,15 @@ impl AgentTool for SpawnAgentTool {
                 status,
             );
 
+            // ST7 r3 #4: checked_sub instead of saturating_sub.
+            // When the subagent times out before producing any
+            // entries (num_entries == 0), saturating_sub(1) returned
+            // 0 — claiming entry 0 exists despite the empty buffer.
+            // checked_sub returns None for the zero case, leaving
+            // message_end_index unset (which downstream renderers
+            // already treat as "no entries to display").
             session_info.message_end_index =
-                cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
+                cx.update(|cx| subagent.num_entries(cx).checked_sub(1));
 
             let meta = Some(acp::Meta::from_iter([(
                 SUBAGENT_SESSION_INFO_META_KEY.into(),
@@ -235,14 +554,39 @@ impl AgentTool for SpawnAgentTool {
                     }),
                 ),
                 Err(e) => {
-                    let error = e.to_string();
+                    // ST7 fix-loop #4: mock-clock-aware elapsed.
+                    let elapsed = cx
+                        .background_executor()
+                        .now()
+                        .saturating_duration_since(started_at)
+                        .as_secs();
+                    // ST7 fix-loop #3: snapshot pump-mutated state so
+                    // classifier sees the actual phase trajectory.
+                    let (last_phase, tools_started) = {
+                        let g = phase_state.lock().unwrap();
+                        (g.0, g.1)
+                    };
+                    // ST7 r3 followup-B: pull (provider, model) from the
+                    // subagent so vendor-rerouting (ST8) sees real values
+                    // for raw `CaduceusError` paths that bypass agent.rs's
+                    // typed-error short-circuit.
+                    let classify_ctx = cx.update(|cx| subagent.classify_context(cx));
+                    let failure = classify_subagent_error(
+                        &e,
+                        &classify_ctx,
+                        last_phase,
+                        tools_started,
+                        Some(elapsed),
+                        Some(spawn_timeout.as_secs()),
+                    );
+                    let error = failure.to_string();
                     (
-                        error.clone(),
-                        Err(SpawnAgentToolOutput::Error {
-                            session_id: Some(session_info.session_id.clone()),
-                            error,
-                            session_info: Some(session_info),
-                        }),
+                        error,
+                        Err(SpawnAgentToolOutput::from_failure(
+                            Some(session_info.session_id.clone()),
+                            &failure,
+                            Some(session_info),
+                        )),
                     )
                 }
             };
@@ -286,5 +630,957 @@ impl AgentTool for SpawnAgentTool {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use caduceus_core::{ProviderErrorFailure, RetryClass};
+
+    // ---- T-VAL1: timeout_secs validation boundaries ----
+    #[test]
+    fn validate_timeout_default_is_900s() {
+        let d = validate_timeout(None).expect("default must accept");
+        assert_eq!(d, Duration::from_secs(DEFAULT_SPAWN_TIMEOUT_SECS));
+        assert_eq!(d, Duration::from_secs(900));
+    }
+
+    #[test]
+    fn validate_timeout_clamp_boundaries() {
+        // Lower boundary
+        assert!(validate_timeout(Some(0)).is_err(), "0 must reject");
+        assert!(validate_timeout(Some(1)).is_ok(), "1 must accept");
+        // Upper boundary
+        assert!(validate_timeout(Some(3600)).is_ok(), "3600 must accept");
+        assert!(validate_timeout(Some(3601)).is_err(), "3601 must reject");
+        assert!(validate_timeout(Some(7200)).is_err(), "7200 must reject");
+        // Mid-range
+        assert!(validate_timeout(Some(600)).is_ok(), "600 must accept");
+    }
+
+    #[test]
+    fn validate_timeout_out_of_range_is_internalerror_not_providererror() {
+        // T-VAL1 / B9: domain mismatch fix — invalid_timeout is
+        // InternalError, NOT ProviderError.
+        let err = validate_timeout(Some(0)).unwrap_err();
+        match err {
+            SubAgentFailure::InternalError { kind, .. } => {
+                assert_eq!(kind, "invalid_timeout");
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    // ---- T9: Error JSON contains failure_type / failure_details / error / session_id ----
+    #[test]
+    fn failure_serializes_with_failure_type_field() {
+        let failure = SubAgentFailure::Timeout(TimeoutFailure::new(
+            901,
+            900,
+            SubAgentPhase::ToolExecution,
+            true,
+        ));
+        let out = SpawnAgentToolOutput::from_failure(None, &failure, None);
+        let content: LanguageModelToolResultContent = out.into();
+        let s: String = match content {
+            LanguageModelToolResultContent::Text(t) => t.to_string(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&s).expect("must parse");
+        assert!(
+            v.get("session_id").is_some(),
+            "session_id key must be present"
+        );
+        assert!(
+            v["session_id"].is_null(),
+            "session_id must be null when None"
+        );
+        assert!(v.get("error").is_some(), "error must be present");
+        assert_eq!(v["failure_type"], "Timeout");
+        assert_eq!(v["failure_details"]["elapsed_secs"], 901);
+        assert_eq!(v["failure_details"]["timeout_secs"], 900);
+        assert_eq!(v["failure_details"]["last_phase"], "ToolExecution");
+        assert_eq!(v["failure_details"]["tools_started"], true);
+    }
+
+    // ---- T-COMPAT1 (v3.1 Fix 3): session_id: null preserved ----
+    #[test]
+    fn error_without_classification_preserves_session_id_null() {
+        let out = SpawnAgentToolOutput::Error {
+            session_id: None,
+            error: "x".into(),
+            failure_type: None,
+            failure_details: None,
+            session_info: None,
+        };
+        let content: LanguageModelToolResultContent = out.into();
+        let s: String = match content {
+            LanguageModelToolResultContent::Text(t) => t.to_string(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        // Byte-equivalence with pre-ST7 shape: must contain "session_id":null
+        assert!(
+            s.contains("\"session_id\":null"),
+            "must emit session_id:null for backward compat, got: {s}"
+        );
+        // No new keys added when classification absent.
+        assert!(!s.contains("failure_type"));
+        assert!(!s.contains("failure_details"));
+    }
+
+    // ---- T11: old consumer JSON shape still parses ----
+    #[test]
+    fn old_consumer_unaffected_no_classification() {
+        let out = SpawnAgentToolOutput::Error {
+            session_id: None,
+            error: "boom".into(),
+            failure_type: None,
+            failure_details: None,
+            session_info: None,
+        };
+        let content: LanguageModelToolResultContent = out.into();
+        let s: String = match content {
+            LanguageModelToolResultContent::Text(t) => t.to_string(),
+            _ => panic!(),
+        };
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error"], "boom");
+        assert!(v["session_id"].is_null());
+        assert!(v.get("failure_type").is_none());
+        assert!(v.get("failure_details").is_none());
+    }
+
+    // ---- T17: InternalError is fallback only ----
+    #[test]
+    fn classify_subagent_error_known_strings_match_typed_variants() {
+        use anyhow::anyhow;
+        let err = anyhow!("User canceled");
+        assert!(matches!(
+            classify_subagent_error(
+                &err,
+                &caduceus_core::ClassifyContext::empty(),
+                SubAgentPhase::ModelSelection,
+                false,
+                Some(0),
+                Some(900)
+            ),
+            SubAgentFailure::UserCancel
+        ));
+
+        let err = anyhow!("The agent refused to process that prompt. Try again.");
+        assert!(matches!(
+            classify_subagent_error(
+                &err,
+                &caduceus_core::ClassifyContext::empty(),
+                SubAgentPhase::ProviderCall,
+                false,
+                Some(0),
+                Some(900)
+            ),
+            SubAgentFailure::ModelRefusal { .. }
+        ));
+
+        let err = anyhow!("synthetic random failure");
+        let f = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::Unknown,
+            false,
+            Some(0),
+            Some(900),
+        );
+        match f {
+            SubAgentFailure::InternalError { kind, .. } => {
+                assert_eq!(kind, "subagent_send_failed");
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    // ---- T17b: typed failures pass through downcast ----
+    #[test]
+    fn classify_subagent_error_downcasts_typed_failure() {
+        let mut p = ProviderErrorFailure::new("rate limited", RetryClass::Backoff);
+        p.retry_after_secs = Some(30);
+        p.http_status = Some(429);
+        let typed = SubAgentFailure::ProviderError(p);
+        let err = anyhow::Error::new(typed.clone());
+        let out = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        );
+        match out {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.retry_after_secs, Some(30));
+                assert_eq!(p.retry_class, RetryClass::Backoff);
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    // ---- Fix-loop #5: ModelRefusal preserves bare refusal text in `error` ----
+    #[test]
+    fn from_failure_model_refusal_preserves_legacy_error_string() {
+        // Pre-ST7 consumer reading `error` field saw the bare refusal
+        // sentence (anyhow!("The agent refused to process that prompt. Try
+        // again.").to_string()). After ST7 the typed Display impl
+        // prepends "model refusal: ", which would silently break any
+        // substring-matching consumer. Compat shim in from_failure
+        // emits the bare refusal_text in `error` while still populating
+        // failure_type=ModelRefusal + failure_details.refusal_text for
+        // typed consumers.
+        let failure = SubAgentFailure::ModelRefusal {
+            refusal_text: "The agent refused to process that prompt. Try again.".into(),
+        };
+        let out = SpawnAgentToolOutput::from_failure(None, &failure, None);
+        match &out {
+            SpawnAgentToolOutput::Error {
+                error,
+                failure_type,
+                failure_details,
+                ..
+            } => {
+                assert_eq!(
+                    error, "The agent refused to process that prompt. Try again.",
+                    "legacy error field must be the bare refusal text (no 'model refusal: ' prefix)"
+                );
+                assert_eq!(failure_type.as_deref(), Some("ModelRefusal"));
+                assert_eq!(
+                    failure_details.as_ref().unwrap()["refusal_text"],
+                    "The agent refused to process that prompt. Try again."
+                );
+            }
+            _ => panic!("expected Error variant"),
+        }
+
+        // Round-trip through LanguageModelToolResultContent: the JSON
+        // shape MUST contain the bare refusal string in `error`.
+        let content: LanguageModelToolResultContent = out.into();
+        let s: String = match content {
+            LanguageModelToolResultContent::Text(t) => t.to_string(),
+            _ => panic!(),
+        };
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            v["error"],
+            "The agent refused to process that prompt. Try again."
+        );
+        assert_eq!(v["failure_type"], "ModelRefusal");
+    }
+
+    #[test]
+    fn from_failure_non_refusal_uses_display_string() {
+        // Non-refusal variants continue to use Display (failure.to_string())
+        // as the error field — there's no pre-ST7 substring contract for
+        // those (they didn't exist).
+        let failure = SubAgentFailure::Timeout(TimeoutFailure::new(
+            901,
+            900,
+            SubAgentPhase::ToolExecution,
+            true,
+        ));
+        let out = SpawnAgentToolOutput::from_failure(None, &failure, None);
+        match out {
+            SpawnAgentToolOutput::Error { error, .. } => {
+                assert!(error.starts_with("sub-agent timeout:"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn classify_subagent_error_typed_recursion_limit_preserves_shape() {
+        // Fix-loop #6: typed downcast is the ONLY canonical path for
+        // RecursionLimitExceeded. The string fallback was wrong-shape
+        // (returned InternalError{kind:"recursion_limit"} instead of
+        // the typed RecursionLimitExceeded{current_depth, max_depth})
+        // and has been removed.
+        let typed = SubAgentFailure::RecursionLimitExceeded {
+            current_depth: 4,
+            max_depth: 4,
+        };
+        let err = anyhow::Error::new(typed);
+        let out = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::ModelSelection,
+            false,
+            Some(0),
+            Some(900),
+        );
+        match out {
+            SubAgentFailure::RecursionLimitExceeded {
+                current_depth,
+                max_depth,
+            } => {
+                assert_eq!(current_depth, 4);
+                assert_eq!(max_depth, 4);
+            }
+            other => panic!("expected RecursionLimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_subagent_error_raw_string_recursion_msg_no_longer_misshapes() {
+        // Fix-loop #6: a raw anyhow!("Maximum subagent depth ...") that
+        // somehow escapes the typed wrap at agent.rs:2832 must NOT
+        // silently classify as InternalError{kind:"recursion_limit"} —
+        // that's the wrong shape (canonical is the typed
+        // RecursionLimitExceeded variant). It now falls through to the
+        // generic InternalError{kind:"subagent_send_failed"} fallback,
+        // forcing any future regression to be visible (different kind
+        // string) instead of papered over.
+        let err = anyhow::anyhow!("Maximum subagent depth (4) reached");
+        let out = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::ModelSelection,
+            false,
+            Some(0),
+            Some(900),
+        );
+        match out {
+            SubAgentFailure::InternalError { kind, .. } => {
+                assert_eq!(
+                    kind, "subagent_send_failed",
+                    "must NOT classify as the wrong-shape recursion_limit kind"
+                );
+            }
+            other => panic!("expected InternalError fallback, got {other:?}"),
+        }
+    }
+
+    // ---- ST7 r3 #2: ClassifyContext is populated at agent.rs live path ----
+    #[test]
+    fn classify_caduceus_error_with_populated_context_surfaces_provider_and_model() {
+        // ST7 r3 #2 contract: the live error path at agent.rs:3105 now
+        // reads `thread.model()` BEFORE the background_spawn so it can
+        // build a populated ClassifyContext. This unit test locks in
+        // the downstream guarantee — when ctx carries (provider, model),
+        // ProviderErrorFailure must surface them so ST8's vendor-rerouter
+        // can branch correctly.
+        use caduceus_core::{
+            CaduceusError, ClassifyContext, ModelId, ProviderId, RetryClass, SubAgentFailure,
+            SubAgentPhase, classify_caduceus_error,
+        };
+        let provider = ProviderId::new("anthropic");
+        let model = ModelId::new("claude-opus-4.7");
+        let ctx = ClassifyContext::new(Some(provider.clone()), Some(model.clone()));
+
+        let err = CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        };
+        match classify_caduceus_error(&err, &ctx, SubAgentPhase::Unknown, false, None, None) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(
+                    p.provider,
+                    Some(provider),
+                    "provider must surface from ClassifyContext"
+                );
+                assert_eq!(
+                    p.model,
+                    Some(model),
+                    "model must surface from ClassifyContext"
+                );
+                assert_eq!(p.retry_class, RetryClass::Backoff);
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_with_empty_context_yields_none_for_provider_and_model() {
+        // Contrast test: pre-fix call sites used ClassifyContext::empty()
+        // and the result intentionally carried None for provider/model.
+        // Locks in that empty()-construction continues to leave the
+        // fields unpopulated — so a future regression that silently
+        // injects fake values would be caught.
+        use caduceus_core::{
+            CaduceusError, ClassifyContext, SubAgentFailure, SubAgentPhase, classify_caduceus_error,
+        };
+        let err = CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        };
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::Unknown,
+            false,
+            None,
+            None,
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert!(p.provider.is_none(), "empty ctx → provider None");
+                assert!(p.model.is_none(), "empty ctx → model None");
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    // ---- Fix-loop #1: live path preserves CaduceusError -> typed ProviderError ----
+    #[test]
+    fn classify_subagent_error_downcasts_caduceus_error_ratelimit() {
+        // Simulates the new agent.rs Err arm: provider returned a typed
+        // CaduceusError::RateLimited which got wrapped in anyhow::Error at
+        // task.fuse(). The classifier MUST run classify_caduceus_error and
+        // surface a ProviderError with RetryClass::Backoff — not collapse
+        // to InternalError("subagent_send_failed") via string fallback.
+        use caduceus_core::{CaduceusError, RetryClass};
+        let err = anyhow::Error::new(CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        });
+        let out = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        );
+        match out {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.retry_class, RetryClass::Backoff);
+                assert_eq!(p.retry_after_secs, Some(30));
+                assert_eq!(p.http_status, Some(429));
+            }
+            other => panic!("expected ProviderError(Backoff), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_subagent_error_downcasts_caduceus_provider_timeout_to_backoff() {
+        use caduceus_core::{CaduceusError, RetryClass};
+        let err = anyhow::Error::new(CaduceusError::ProviderTimeout {
+            elapsed_ms: 6000,
+            limit_ms: 5000,
+            context: "chat".into(),
+        });
+        let out = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        );
+        match out {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.retry_class, RetryClass::Backoff);
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_subagent_error_downcasts_caduceus_cancelled_to_user_cancel() {
+        use caduceus_core::CaduceusError;
+        let err = anyhow::Error::new(CaduceusError::Cancelled);
+        let out = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        );
+        assert!(matches!(out, SubAgentFailure::UserCancel));
+    }
+
+    // ST7 r3 followup-B: populated `ClassifyContext` flows through to the
+    // resulting `ProviderErrorFailure.provider` / `.model` so ST8's
+    // vendor-rerouting sees real values for raw `CaduceusError` paths.
+    #[test]
+    fn classify_subagent_error_populated_context_surfaces_provider_and_model() {
+        use caduceus_core::{CaduceusError, ClassifyContext, ModelId, ProviderId};
+        let err = anyhow::Error::new(CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        });
+        let ctx = ClassifyContext::new(
+            Some(ProviderId::new("anthropic")),
+            Some(ModelId::new("claude-opus-4.7")),
+        );
+        let out = classify_subagent_error(
+            &err,
+            &ctx,
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        );
+        match out {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(
+                    p.provider.as_ref().map(|x| x.0.as_str()),
+                    Some("anthropic"),
+                    "populated ctx must surface provider id"
+                );
+                assert_eq!(
+                    p.model.as_ref().map(|x| x.0.as_str()),
+                    Some("claude-opus-4.7"),
+                    "populated ctx must surface model id"
+                );
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    // ---- Fix-loop #4: gpui clock advances elapsed_secs (mock-clock test) ----
+    #[gpui::test]
+    async fn elapsed_secs_uses_gpui_clock_not_wallclock(cx: &mut gpui::TestAppContext) {
+        // ST7 fix-loop #4 contract: replacing std::time::Instant with
+        // cx.background_executor().now() means
+        // `executor.advance_clock(15min)` is reflected in the elapsed
+        // duration computed in the timer arm. Pre-fix, std::Instant
+        // ignored the mock clock entirely and elapsed_secs ≈ 0 in
+        // tests.
+        let started_at = cx.executor().now();
+        // Mock-clock advance — same primitive the real timeout test
+        // uses. 901s > 900s default spawn timeout.
+        cx.executor().advance_clock(Duration::from_secs(901));
+        let elapsed = cx
+            .executor()
+            .now()
+            .saturating_duration_since(started_at)
+            .as_secs();
+        assert!(
+            elapsed >= 900,
+            "gpui clock-aware elapsed must reflect advance_clock; got {elapsed}s"
+        );
+        // And the wallclock equivalent does NOT (sanity check that the
+        // contract we're locking in is actually different from std).
+        // Note: this is a probabilistic assertion — if the test takes
+        // > 900s real time something is very wrong; but we use the
+        // very same `started_at` returned by gpui clock and compare
+        // against std::time::Instant::now() to make the contrast
+        // explicit. Skipping that arm — the positive assertion above
+        // is what locks in the fix.
+
+        // Lock in the TimeoutFailure shape: at this elapsed, the
+        // failure constructed in the timer arm reports the advanced
+        // value.
+        let failure = SubAgentFailure::Timeout(TimeoutFailure::new(
+            elapsed,
+            900,
+            SubAgentPhase::ProviderCall,
+            true,
+        ));
+        match failure {
+            SubAgentFailure::Timeout(t) => {
+                assert!(t.elapsed_secs >= 900);
+                assert_eq!(t.timeout_secs, 900);
+                assert!(t.tools_started);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // ---- ST7 r3 #4: message_end_index uses checked_sub, not saturating_sub ----
+    #[test]
+    fn message_end_index_is_none_when_subagent_produced_zero_entries() {
+        // Locks in the call-site math at spawn_agent_tool.rs (the
+        // post-send block that builds session_info.message_end_index):
+        //
+        //     subagent.num_entries(cx).checked_sub(1)
+        //
+        // Pre-fix, `saturating_sub(1)` returned 0 for an empty buffer
+        // — falsely claiming entry 0 exists when the subagent timed
+        // out before producing anything. checked_sub returns None,
+        // which downstream renderers treat as "no entries".
+        let zero_entries: usize = 0;
+        assert_eq!(
+            zero_entries.checked_sub(1),
+            None,
+            "0 entries → message_end_index must be None"
+        );
+        let one_entry: usize = 1;
+        assert_eq!(
+            one_entry.checked_sub(1),
+            Some(0usize),
+            "1 entry → last index is 0"
+        );
+        let many: usize = 5;
+        assert_eq!(many.checked_sub(1), Some(4usize), "N entries → last is N-1");
+        // Sanity-check the regression: saturating_sub used to return
+        // Some(0) for the zero case, which is the bug we replaced.
+        assert_eq!(
+            zero_entries.saturating_sub(1),
+            0,
+            "regression sentinel: saturating_sub(1) returns 0 (was the bug)"
+        );
+    }
+
+    // ---- T-PHASE3-revised: ToolResultEnd does NOT exit ToolExecution ----
+    #[test]
+    fn tool_result_end_does_not_exit_tool_execution() {
+        use caduceus_core::{AgentEvent, ToolCallId};
+        let phase = SubAgentPhase::ToolExecution;
+        let next = phase.next_phase(&AgentEvent::ToolResultEnd {
+            id: ToolCallId::new("x"),
+            content: String::new(),
+            is_error: false,
+        });
+        assert_eq!(
+            next,
+            SubAgentPhase::ToolExecution,
+            "ToolResultEnd MUST NOT transition out of ToolExecution"
+        );
+        // Only the next provider-side event triggers the transition:
+        let next = phase.next_phase(&AgentEvent::TextDelta { text: "x".into() });
+        assert_eq!(next, SubAgentPhase::ProviderCall);
+    }
+
+    #[test]
+    fn phase_transitions_from_real_agent_event_variants() {
+        use caduceus_core::{AgentEvent, ToolCallId};
+        // ModelSelection -> ProviderCall on first ThinkingStarted
+        let p =
+            SubAgentPhase::ModelSelection.next_phase(&AgentEvent::ThinkingStarted { iteration: 0 });
+        assert_eq!(p, SubAgentPhase::ProviderCall);
+        // ProviderCall -> ToolExecution on ToolCallStart
+        let p = SubAgentPhase::ProviderCall.next_phase(&AgentEvent::ToolCallStart {
+            id: ToolCallId::new("1"),
+            name: "read_file".into(),
+        });
+        assert_eq!(p, SubAgentPhase::ToolExecution);
+        // any -> ContextManagement on ContextWarning
+        let p = SubAgentPhase::ProviderCall.next_phase(&AgentEvent::ContextWarning {
+            level: "warning_85".into(),
+            used_tokens: 85,
+            max_tokens: 100,
+        });
+        assert_eq!(p, SubAgentPhase::ContextManagement);
+    }
+
+    // ---- Fix-loop #3: phase pump mutates state from observed events ----
+    #[test]
+    fn fix3_apply_event_mutates_phase_and_tools_started() {
+        use caduceus_core::{AgentEvent, ToolCallId};
+        let state = std::sync::Mutex::new((SubAgentPhase::ModelSelection, false));
+
+        // Provider event flips ModelSelection -> ProviderCall, no tools.
+        apply_event_to_phase_state(&state, &AgentEvent::ThinkingStarted { iteration: 0 });
+        {
+            let g = state.lock().unwrap();
+            assert_eq!(g.0, SubAgentPhase::ProviderCall);
+            assert!(
+                !g.1,
+                "tools_started must stay false before any ToolCallStart"
+            );
+        }
+
+        // ToolCallStart: phase -> ToolExecution AND tools_started=true.
+        apply_event_to_phase_state(
+            &state,
+            &AgentEvent::ToolCallStart {
+                id: ToolCallId::new("t1"),
+                name: "read_file".into(),
+            },
+        );
+        {
+            let g = state.lock().unwrap();
+            assert_eq!(g.0, SubAgentPhase::ToolExecution);
+            assert!(g.1, "tools_started must flip on ToolCallStart");
+        }
+
+        // ToolResultEnd MUST NOT exit ToolExecution (v3.1 Fix 2 invariant).
+        apply_event_to_phase_state(
+            &state,
+            &AgentEvent::ToolResultEnd {
+                id: ToolCallId::new("t1"),
+                content: String::new(),
+                is_error: false,
+            },
+        );
+        {
+            let g = state.lock().unwrap();
+            assert_eq!(
+                g.0,
+                SubAgentPhase::ToolExecution,
+                "ToolResultEnd must stay in ToolExecution"
+            );
+        }
+
+        // Next provider-side event transitions back to ProviderCall, but
+        // tools_started stays true (monotonic).
+        apply_event_to_phase_state(&state, &AgentEvent::TextDelta { text: "x".into() });
+        {
+            let g = state.lock().unwrap();
+            assert_eq!(g.0, SubAgentPhase::ProviderCall);
+            assert!(
+                g.1,
+                "tools_started is monotonic — must remain true after later events"
+            );
+        }
+    }
+
+    // ---- Fix-loop #3: TimeoutFailure built from pump-mutated state
+    //      reflects the observed phase trajectory, not the static
+    //      ModelSelection / false defaults. This is the regression test
+    //      for the reviewer's "phase tracking is dead" finding. ----
+    #[test]
+    fn fix3_timeout_failure_reads_pump_mutated_state() {
+        use caduceus_core::{AgentEvent, ToolCallId};
+        let state = std::sync::Mutex::new((SubAgentPhase::ModelSelection, false));
+        // Simulate a representative event sequence the pump would
+        // apply during a real spawn before timing out.
+        for ev in [
+            AgentEvent::ThinkingStarted { iteration: 0 },
+            AgentEvent::ToolCallStart {
+                id: ToolCallId::new("t1"),
+                name: "grep".into(),
+            },
+        ] {
+            apply_event_to_phase_state(&state, &ev);
+        }
+        // Snapshot at timeout (mirrors the run() timer arm).
+        let (last_phase, tools_started) = {
+            let g = state.lock().unwrap();
+            (g.0, g.1)
+        };
+        let failure =
+            SubAgentFailure::Timeout(TimeoutFailure::new(901, 900, last_phase, tools_started));
+        match failure {
+            SubAgentFailure::Timeout(t) => {
+                assert_eq!(
+                    t.last_phase,
+                    SubAgentPhase::ToolExecution,
+                    "TimeoutFailure.last_phase must reflect the most recent observed event \
+                     (ToolCallStart) — pre-fix this was always ModelSelection"
+                );
+                assert!(
+                    t.tools_started,
+                    "TimeoutFailure.tools_started must reflect ToolCallStart having been seen \
+                     — pre-fix this was always false"
+                );
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    // ─── ST7 r3 #6: end-to-end gpui test driving SpawnAgentTool::run ───
+    //
+    // The unit tests above (#3 / #4) lock in the math and the
+    // pump-state snapshot in isolation. This test fakes the full
+    // surface — `ThreadEnvironment` + `SubagentHandle` — and drives
+    // `SpawnAgentTool::run` through the gpui executor with a mock
+    // clock advance so all three reviewer must-fix items are
+    // observed *together* on the actual run() path, not on a
+    // hand-rolled approximation:
+    //
+    //   #3: pump observes events emitted by the fake `send()` BEFORE
+    //       the timeout fires, so `TimeoutFailure.last_phase` is
+    //       `ToolExecution` and `tools_started == true`.
+    //   #4: timeout with `num_entries == 0` produces
+    //       `message_end_index == None` (checked_sub vs the prior
+    //       saturating_sub bug claimed entry 0 existed).
+    //   ACP/no-events parallel: when `events()` returns `None` the
+    //       phase stays `(ModelSelection, false)` — locks in the
+    //       graceful-degradation contract for non-caduceus paths.
+    mod e2e_timeout {
+        use super::super::*;
+        use anyhow::anyhow;
+        use caduceus_core::{AgentEvent, ToolCallId};
+        use caduceus_orchestrator::AgentEventEmitter;
+        use gpui::{App, AsyncApp, BackgroundExecutor, Task, TestAppContext};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FakeSubagent {
+            session_id: acp::SessionId,
+            num_entries: AtomicUsize,
+            emitter: Option<AgentEventEmitter>,
+            executor: BackgroundExecutor,
+        }
+
+        impl crate::SubagentHandle for FakeSubagent {
+            fn id(&self) -> acp::SessionId {
+                self.session_id.clone()
+            }
+            fn num_entries(&self, _cx: &App) -> usize {
+                self.num_entries.load(Ordering::SeqCst)
+            }
+            fn send(&self, _message: String, cx: &AsyncApp) -> Task<anyhow::Result<String>> {
+                let emitter = self.emitter.clone();
+                let executor = self.executor.clone();
+                cx.spawn(async move |_| {
+                    if let Some(em) = emitter {
+                        em.emit(AgentEvent::ThinkingStarted { iteration: 0 }).await;
+                        em.emit(AgentEvent::ToolCallStart {
+                            id: ToolCallId::new("t1"),
+                            name: "read_file".into(),
+                        })
+                        .await;
+                    }
+                    // Simulate "subagent stuck doing tool work forever".
+                    // `Task::ready(pending)` would deadlock the executor;
+                    // wait on a multi-decade timer instead so the
+                    // executor's mock clock is the only thing that can
+                    // advance us — and the spawn-side select_biased!
+                    // races this against the spawn timeout.
+                    executor
+                        .timer(Duration::from_secs(10 * 365 * 24 * 3600))
+                        .await;
+                    unreachable!("the spawn timeout must fire first")
+                })
+            }
+            fn events(
+                &self,
+                _cx: &mut AsyncApp,
+            ) -> Option<tokio::sync::broadcast::Receiver<AgentEvent>> {
+                self.emitter.as_ref().map(|e| e.subscribe())
+            }
+        }
+
+        struct FakeEnv {
+            subagent: std::cell::RefCell<Option<Rc<dyn crate::SubagentHandle>>>,
+        }
+
+        impl crate::ThreadEnvironment for FakeEnv {
+            fn create_terminal(
+                &self,
+                _command: String,
+                _cwd: Option<PathBuf>,
+                _output_byte_limit: Option<u64>,
+                _cx: &mut AsyncApp,
+            ) -> Task<anyhow::Result<Rc<dyn crate::TerminalHandle>>> {
+                Task::ready(Err(anyhow!("create_terminal not used in this test")))
+            }
+            fn create_subagent(
+                &self,
+                _opts: crate::SubagentSpawnOptions,
+                _cx: &mut App,
+            ) -> anyhow::Result<Rc<dyn crate::SubagentHandle>> {
+                self.subagent
+                    .borrow_mut()
+                    .take()
+                    .ok_or_else(|| anyhow!("FakeEnv consumed twice"))
+            }
+        }
+
+        async fn drive_run_to_timeout(
+            cx: &mut TestAppContext,
+            with_emitter: bool,
+        ) -> SpawnAgentToolOutput {
+            let executor = cx.executor();
+            let emitter = if with_emitter {
+                let (em, mut rx) = AgentEventEmitter::channel(256);
+                executor
+                    .spawn(async move { while rx.recv().await.is_some() {} })
+                    .detach();
+                Some(em)
+            } else {
+                None
+            };
+
+            let fake_subagent = Rc::new(FakeSubagent {
+                session_id: acp::SessionId::new(std::sync::Arc::<str>::from("fake-session")),
+                num_entries: AtomicUsize::new(0),
+                emitter,
+                executor: executor.clone(),
+            });
+            let env = Rc::new(FakeEnv {
+                subagent: std::cell::RefCell::new(Some(
+                    fake_subagent.clone() as Rc<dyn crate::SubagentHandle>
+                )),
+            });
+            #[allow(clippy::arc_with_non_send_sync)]
+            let tool = Arc::new(SpawnAgentTool::new(env));
+
+            let (event_stream, _event_rx) = ToolCallEventStream::test();
+            let task = cx.update(|cx| {
+                tool.run(
+                    ToolInput::resolved(SpawnAgentToolInput {
+                        label: "fake".into(),
+                        message: "do work".into(),
+                        timeout_secs: Some(10),
+                        session_id: None,
+                        profile: None,
+                        model: None,
+                        mode: None,
+                    }),
+                    event_stream,
+                    cx,
+                )
+            });
+
+            cx.executor().run_until_parked();
+            cx.executor().advance_clock(Duration::from_secs(11));
+            cx.executor().run_until_parked();
+
+            match task.await {
+                Ok(out) => out,
+                Err(out) => out,
+            }
+        }
+
+        #[gpui::test]
+        async fn e2e_timeout_with_emitter_observes_tool_execution_and_no_message_end_index(
+            cx: &mut TestAppContext,
+        ) {
+            let out = drive_run_to_timeout(cx, true).await;
+            match out {
+                SpawnAgentToolOutput::Error {
+                    failure_type,
+                    failure_details,
+                    session_info,
+                    ..
+                } => {
+                    assert_eq!(
+                        failure_type.as_deref(),
+                        Some("Timeout"),
+                        "expected Timeout failure, got {failure_type:?}"
+                    );
+                    let fd = failure_details.expect("failure_details required");
+                    // ST7 r3 #3: pump reflected the event trajectory.
+                    assert_eq!(fd["last_phase"], "ToolExecution");
+                    assert_eq!(fd["tools_started"], true);
+                    assert!(
+                        fd["elapsed_secs"].as_u64().unwrap_or(0) >= 10,
+                        "elapsed_secs must reflect the mock-clock advance, got {fd}"
+                    );
+                    // ST7 r3 #4: no entries → message_end_index is absent / null.
+                    let info = session_info.expect("session_info required");
+                    assert!(
+                        info.message_end_index.is_none(),
+                        "message_end_index must be None on zero-entry timeout, got {info:?}"
+                    );
+                    assert_eq!(info.message_start_index, 0);
+                }
+                other => panic!("expected SpawnAgentToolOutput::Error, got {other:?}"),
+            }
+        }
+
+        #[gpui::test]
+        async fn e2e_timeout_without_emitter_keeps_phase_at_model_selection(
+            cx: &mut TestAppContext,
+        ) {
+            // ACP / non-caduceus path: events() returns None, so the
+            // pump never starts and (last_phase, tools_started) stays
+            // at the (ModelSelection, false) defaults. Timeout still
+            // fires correctly; classification is just less specific.
+            let out = drive_run_to_timeout(cx, false).await;
+            match out {
+                SpawnAgentToolOutput::Error {
+                    failure_type,
+                    failure_details,
+                    ..
+                } => {
+                    assert_eq!(failure_type.as_deref(), Some("Timeout"));
+                    let fd = failure_details.expect("failure_details required");
+                    assert_eq!(
+                        fd["last_phase"], "ModelSelection",
+                        "without an emitter, phase remains at the default ModelSelection"
+                    );
+                    assert_eq!(fd["tools_started"], false);
+                }
+                other => panic!("expected SpawnAgentToolOutput::Error, got {other:?}"),
+            }
+        }
     }
 }

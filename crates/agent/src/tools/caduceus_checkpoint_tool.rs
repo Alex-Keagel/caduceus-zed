@@ -144,6 +144,7 @@ fn checkpoints_dir(project_root: &std::path::Path) -> PathBuf {
     project_root.join(".caduceus").join("checkpoints")
 }
 
+#[allow(clippy::disallowed_methods)]
 fn create_checkpoint(project_root: &std::path::Path, label: &str) -> Result<String, String> {
     // Get modified files via `git diff --name-only`
     let output = std::process::Command::new("git")

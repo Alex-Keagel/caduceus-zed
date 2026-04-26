@@ -62,8 +62,8 @@ use workspace::{
 };
 use zed::{
     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
-    derive_paths_with_position, edit_prediction_registry, handle_cli_connection,
-    handle_keymap_file_changes, initialize_workspace, open_paths_with_positions,
+    derive_paths_with_position, handle_cli_connection, handle_keymap_file_changes,
+    initialize_workspace, open_paths_with_positions,
 };
 
 use crate::zed::{OpenRequestKind, eager_load_active_theme_and_icon_theme};
@@ -336,7 +336,7 @@ fn main() {
         .spawn(installation_id(KeyValueStore::from_app_db(&app_db)));
     let session_id = Uuid::new_v4().to_string();
     let session = app.background_executor().spawn(Session::new(
-        session_id.clone(),
+        session_id,
         KeyValueStore::from_app_db(&app_db),
     ));
 
@@ -572,7 +572,7 @@ fn main() {
             cx,
         );
         cx.subscribe(&user_store, {
-            let telemetry = telemetry.clone();
+            let _telemetry = telemetry.clone();
             move |_, evt: &client::user::Event, _| match evt {
                 client::user::Event::PrivateUserInfoUpdated => {
                     // CADUCEUS: crashes crate removed

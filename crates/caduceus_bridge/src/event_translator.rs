@@ -387,9 +387,11 @@ pub fn translate(ev: &AgentEvent) -> TranslatedEvents {
         AgentEvent::Introspection(_) => smallvec![T::Swallow {
             reason: "introspection — consumed by dag_state reducer",
         }],
-        AgentEvent::StepStarted { .. } | AgentEvent::StepCompleted { .. } => smallvec![T::Swallow {
-            reason: "step boundary — reducer/telemetry only",
-        }],
+        AgentEvent::StepStarted { .. } | AgentEvent::StepCompleted { .. } => {
+            smallvec![T::Swallow {
+                reason: "step boundary — reducer/telemetry only",
+            }]
+        }
         AgentEvent::ExecutionTreeNode { .. } | AgentEvent::ExecutionTreeUpdate { .. } => {
             smallvec![T::Swallow {
                 reason: "execution-tree — rendered by a dedicated panel via reducer",
@@ -615,10 +617,7 @@ mod aggregator_tests {
         let out = agg.observe_input_end("t1");
         assert_eq!(out.tool_name.as_deref(), Some("grep"));
         assert_eq!(out.raw_json, "{\"pattern\":\"foo\"}");
-        assert_eq!(
-            out.parsed,
-            Some(serde_json::json!({"pattern": "foo"}))
-        );
+        assert_eq!(out.parsed, Some(serde_json::json!({"pattern": "foo"})));
     }
 
     #[test]

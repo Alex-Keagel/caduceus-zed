@@ -143,12 +143,10 @@ impl AgentTool for SuggestModelsTool {
                 cx.update(|cx| assign_diverse_models(parsed.n, parsed.exclude.as_deref(), cx));
             if models.is_empty() {
                 return Err(SuggestModelsToolOutput::Error {
-                    error: "no authenticated models available — please configure a provider"
-                        .into(),
+                    error: "no authenticated models available — please configure a provider".into(),
                 });
             }
-            let mut families_seen: Vec<String> =
-                models.iter().map(|m| m.family.clone()).collect();
+            let mut families_seen: Vec<String> = models.iter().map(|m| m.family.clone()).collect();
             families_seen.sort();
             families_seen.dedup();
             let note = if families_seen.len() == 1 {

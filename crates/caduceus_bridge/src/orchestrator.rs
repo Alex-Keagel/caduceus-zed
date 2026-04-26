@@ -23,11 +23,8 @@ use crate::{BuiltinScopedContextInjector, ContextInjector};
 
 // Re-export orchestrator types for consumers.
 pub use caduceus_orchestrator::{
-    ExecutionTreeViz, HierarchicalTask,
-    InferredProgress, PrdTask,
-    TaskRecommendation, TaskTree,
-    TimeEntry, TimeTracker,
-    VizTreeNode,
+    ExecutionTreeViz, HierarchicalTask, InferredProgress, PrdTask, TaskRecommendation, TaskTree,
+    TimeEntry, TimeTracker, VizTreeNode,
     automations::{Automation, AutomationAgentConfig, AutomationRegistry, AutomationTrigger},
     background::{BackgroundAgent, BackgroundStatus},
     compaction::{self, CompactMessage, CompactionPipeline, CompactionTrigger, ContextStats},
@@ -45,43 +42,31 @@ pub use caduceus_orchestrator::{
 pub use caduceus_core::ModelId;
 pub use caduceus_core::TokenBudget;
 pub use caduceus_orchestrator::automations::AutomationResult;
-pub use caduceus_orchestrator::broadcast_bus::{
-    BroadcastBus, BusError, BusMessage,
-};
+pub use caduceus_orchestrator::broadcast_bus::{BroadcastBus, BusError, BusMessage};
 pub use caduceus_orchestrator::checkpoint::{
-    BatchState, CheckpointError,
-    CheckpointId, CheckpointStore,
-    FileSnapshot, ToolBatchCheckpoint,
+    BatchState, CheckpointError, CheckpointId, CheckpointStore, FileSnapshot, ToolBatchCheckpoint,
 };
 pub use caduceus_orchestrator::compaction_scorer::{
-    self as bridge_compaction_scorer, BradleyTerryModel,
-    Pair,
+    self as bridge_compaction_scorer, BradleyTerryModel, Pair,
 };
 pub use caduceus_orchestrator::compaction_telemetry::{
-    CompactionEvent, CompactionTelemetry,
-    StrategyName,
+    CompactionEvent, CompactionTelemetry, StrategyName,
 };
 pub use caduceus_orchestrator::context_fold::{
-    ExpandError, FoldedTranscript,
-    TranscriptId, TranscriptStore,
+    ExpandError, FoldedTranscript, TranscriptId, TranscriptStore,
 };
-pub use caduceus_orchestrator::learned_selector::{
-    LearnedSelector, SelectionMode,
-};
+pub use caduceus_orchestrator::learned_selector::{LearnedSelector, SelectionMode};
 pub use caduceus_orchestrator::memory_blocks::{
-    ArchivalSummary, BlockLimits,
-    CompactionReport as MemoryCompactionReport, MemoryBlocks,
+    ArchivalSummary, BlockLimits, CompactionReport as MemoryCompactionReport, MemoryBlocks,
     WorkingMessage,
 };
 pub use caduceus_orchestrator::modes::AgentMode;
 pub use caduceus_orchestrator::modes::{
-    ActionPlan, AmendError,
-    AppliedAmendment, PlanAmendment,
-    PlannedAction,
+    ActionPlan, AmendError, AppliedAmendment, PlanAmendment, PlannedAction,
 };
 pub use caduceus_orchestrator::notifications::{
-    self as bridge_notifications, NOTIFICATIONS_CHANNEL,
-    Notification, Severity as NotificationSeverity,
+    self as bridge_notifications, NOTIFICATIONS_CHANNEL, Notification,
+    Severity as NotificationSeverity,
 };
 
 // ── P7.1 — StepId on SessionState (G26) ─────────────────────────────────
@@ -89,23 +74,18 @@ pub use caduceus_core::StepId;
 
 // ── P7.2 — OpenTelemetry GenAI mapper (G23) ─────────────────────────────
 pub use caduceus_telemetry::genai::{
-    GenAiContext, GenAiMapper,
-    GenAiSpan, GenAiSpanExporter,
-    GenAiValue, JsonlGenAiExporter,
+    GenAiContext, GenAiMapper, GenAiSpan, GenAiSpanExporter, GenAiValue, JsonlGenAiExporter,
 };
 
 // ── P7.3 — Trajectory recorder / replayer (G22) ─────────────────────────
 pub use caduceus_eval::{
-    RecordingLlmAdapter,
-    ReplayingLlmAdapter, Trajectory,
-    TrajectoryEntry, TrajectoryRecorder,
+    RecordingLlmAdapter, ReplayingLlmAdapter, Trajectory, TrajectoryEntry, TrajectoryRecorder,
 };
 
 // ── P8.1 / P8.2 / P8.4 — Step verification & process-reward ─────────────
 pub use caduceus_core::{
-    EnsembleCombiner, EnsembleStepVerifier,
-    ObservedToolCall, OffStepVerifier,
-    StepScore, StepVerifier, StepView,
+    EnsembleCombiner, EnsembleStepVerifier, ObservedToolCall, OffStepVerifier, StepScore,
+    StepVerifier, StepView,
 };
 pub use caduceus_orchestrator::rollout_prm::RolloutPrmVerifier;
 
@@ -227,18 +207,13 @@ pub fn list_checkpoints_json(store: &CheckpointStore) -> Result<String, BridgeEr
 // to a channel with zero subscribers is a silent drop, not an error.
 
 /// Subscribe to the notifications channel. Always succeeds.
-pub fn subscribe_notifications(
-    bus: &BroadcastBus,
-) -> tokio::sync::broadcast::Receiver<BusMessage> {
+pub fn subscribe_notifications(bus: &BroadcastBus) -> tokio::sync::broadcast::Receiver<BusMessage> {
     bridge_notifications::subscribe(bus)
 }
 
 /// Publish a typed notification. Returns the number of receivers, or
 /// `BusError::NoSubscribers` if nobody is listening.
-pub fn publish_notification(
-    bus: &BroadcastBus,
-    n: Notification,
-) -> Result<usize, BusError> {
+pub fn publish_notification(bus: &BroadcastBus, n: Notification) -> Result<usize, BusError> {
     bridge_notifications::publish(bus, n)
 }
 
@@ -280,10 +255,7 @@ pub fn set_memory_persona(blocks: &mut MemoryBlocks, text: impl Into<String>) ->
 }
 
 /// Set the project-context block. Returns chars dropped.
-pub fn set_memory_project_context(
-    blocks: &mut MemoryBlocks,
-    text: impl Into<String>,
-) -> usize {
+pub fn set_memory_project_context(blocks: &mut MemoryBlocks, text: impl Into<String>) -> usize {
     blocks.set_project_context(text)
 }
 
@@ -331,10 +303,7 @@ pub fn fold_transcript(
 /// Expand a previously-folded transcript by id. Returns
 /// `ExpandError::Unknown` when the id has been evicted (FIFO)
 /// and `Expired` when the entry is past TTL.
-pub fn expand_transcript(
-    store: &TranscriptStore,
-    id: TranscriptId,
-) -> Result<String, ExpandError> {
+pub fn expand_transcript(store: &TranscriptStore, id: TranscriptId) -> Result<String, ExpandError> {
     store.expand(id).map(str::to_owned)
 }
 
@@ -482,19 +451,13 @@ pub fn new_learned_selector(model: BradleyTerryModel) -> LearnedSelector {
 
 /// Override the selection mode (Heuristic / Learned / Auto). Used
 /// by the IDE settings panel.
-pub fn set_selector_mode(
-    selector: LearnedSelector,
-    mode: SelectionMode,
-) -> LearnedSelector {
+pub fn set_selector_mode(selector: LearnedSelector, mode: SelectionMode) -> LearnedSelector {
     selector.with_mode(mode)
 }
 
 /// Re-order `candidates` from best to worst per the selector. Equal
 /// scores preserve input order (deterministic).
-pub fn rank_candidates<'a>(
-    selector: &LearnedSelector,
-    candidates: &[&'a str],
-) -> Vec<&'a str> {
+pub fn rank_candidates<'a>(selector: &LearnedSelector, candidates: &[&'a str]) -> Vec<&'a str> {
     selector.rank(candidates)
 }
 
@@ -651,8 +614,7 @@ pub async fn shared_context_had_collisions(ctx: &SharedContext) -> bool {
 
 // ── P6.9 — Schema-versioned AgentEvent envelope (G33) ───────────────────
 pub use caduceus_core::{
-    AGENT_EVENT_SCHEMA_VERSION as BRIDGE_AGENT_EVENT_SCHEMA_VERSION,
-    VersionedAgentEvent,
+    AGENT_EVENT_SCHEMA_VERSION as BRIDGE_AGENT_EVENT_SCHEMA_VERSION, VersionedAgentEvent,
 };
 
 /// P6.9 / G33 — Wrap an `AgentEvent` in the current schema envelope and
@@ -814,7 +776,7 @@ impl OrchestratorBridge {
         if let Some(mem) = self.reflexion.clone() {
             h = h.with_reflexion(mem);
         }
-        if let Some(cfg) = self.tot_config.clone() {
+        if let Some(cfg) = self.tot_config {
             h = h.with_tot_config(cfg);
         }
         h
@@ -927,7 +889,9 @@ impl OrchestratorBridge {
     /// Load workspace instructions from .caduceus/ hierarchy.
     pub fn load_instructions(&self) -> Result<InstructionSet, BridgeError> {
         let loader = InstructionLoader::new(&self.project_root);
-        loader.load().map_err(|e| BridgeError::workspace(e.to_string()))
+        loader
+            .load()
+            .map_err(|e| BridgeError::workspace(e.to_string()))
     }
 
     /// Create a new conversation history.
@@ -963,7 +927,9 @@ impl OrchestratorBridge {
 
     /// Serialize conversation history to JSON.
     pub fn conversation_serialize(history: &ConversationHistory) -> Result<String, BridgeError> {
-        history.serialize().map_err(|e| BridgeError::workspace(e.to_string()))
+        history
+            .serialize()
+            .map_err(|e| BridgeError::workspace(e.to_string()))
     }
 
     /// Deserialize conversation history from JSON.
@@ -1406,6 +1372,7 @@ impl OrchestratorBridge {
     ///   dropping the receiver early causes `try_send` to fail silently
     ///   (translated events are best-effort — the reducer pipeline is
     ///   authoritative).
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_caduceus_loop_translated(
         &self,
         harness: &AgentHarness,
@@ -1698,6 +1665,17 @@ enum SinkChoice {
 enum EmitterChoice {
     None,
     AutoDefault,
+    /// ST7 r3 #1: reuse a pre-existing emitter that callers built
+    /// outside the harness builder. Used by zed's subagent path,
+    /// where `Thread::new_subagent` seeds the emitter at construction
+    /// time so `SubagentHandle::events()` can return a live receiver
+    /// BEFORE `prompt()` runs the harness builder. Without this
+    /// variant, `AutoDefault` would create a second emitter and the
+    /// pump (subscribed to the seeded one) would observe nothing.
+    ///
+    /// Caller is responsible for draining the mpsc rx that pairs with
+    /// the seeded emitter (otherwise emit() trips Closed).
+    Reuse(caduceus_orchestrator::AgentEventEmitter),
 }
 
 enum InjectorChoice {
@@ -1773,6 +1751,23 @@ impl<'a> HarnessBuilder<'a> {
         self
     }
 
+    /// ST7 r3 #1: reuse a pre-existing AgentEventEmitter rather than
+    /// having the builder mint a fresh one. Used by zed's subagent
+    /// path, where the emitter must be live BEFORE the harness is
+    /// built so spawn_agent_tool can attach its phase-tracking pump
+    /// at `subagent.events(cx)` time (otherwise the pump task never
+    /// starts, leaving last_phase pinned at ModelSelection through
+    /// every timeout — a silent telemetry regression).
+    ///
+    /// The returned BuiltHarness carries this same emitter in
+    /// `emitter` and leaves `event_rx` as None — caller must have
+    /// already arranged a drain on the mpsc receiver paired with the
+    /// seeded emitter at construction time.
+    pub fn with_emitter_reuse(mut self, emitter: caduceus_orchestrator::AgentEventEmitter) -> Self {
+        self.emitter = EmitterChoice::Reuse(emitter);
+        self
+    }
+
     pub fn injector(mut self, injector: Arc<dyn ContextInjector>) -> Self {
         self.injector = InjectorChoice::Custom(injector);
         self
@@ -1835,6 +1830,15 @@ impl<'a> HarnessBuilder<'a> {
                 base = base.with_emitter(em);
                 (Some(rx), Some(replay), Some(em_for_subscribe))
             }
+            EmitterChoice::Reuse(em) => {
+                // ST7 r3 #1: caller already drains the mpsc rx that
+                // pairs with this emitter — return None for event_rx
+                // so we don't double-drain.
+                let replay = ReplayHandle::new(em.clone());
+                let em_for_subscribe = em.clone();
+                base = base.with_emitter(em);
+                (None, Some(replay), Some(em_for_subscribe))
+            }
         };
 
         if let InjectorChoice::Custom(inj) = injector {
@@ -1853,7 +1857,7 @@ impl<'a> HarnessBuilder<'a> {
                 (h, Some(tx))
             }
             ApprovalChoice::Custom(set) => {
-                let (h, tx) = base.with_approval_flow(set.into_iter());
+                let (h, tx) = base.with_approval_flow(set);
                 (h, Some(tx))
             }
             ApprovalChoice::None => (base, None),
@@ -3353,12 +3357,7 @@ mod tests {
 
     // ── P5.1 — CompactionTelemetry bridge ────────────────────────────────
 
-    fn dummy_event(
-        strategy: &str,
-        t_before: u32,
-        t_after: u32,
-        turn: u32,
-    ) -> CompactionEvent {
+    fn dummy_event(strategy: &str, t_before: u32, t_after: u32, turn: u32) -> CompactionEvent {
         CompactionEvent {
             strategy: strategy.into(),
             tokens_before: t_before,
@@ -3559,23 +3558,11 @@ mod tests {
 
     #[test]
     fn p6_7_mcp_error_kind_label_is_stable() {
-        assert_eq!(
-            mcp_error_kind_label(McpErrorKind::Transient),
-            "transient"
-        );
+        assert_eq!(mcp_error_kind_label(McpErrorKind::Transient), "transient");
         assert_eq!(mcp_error_kind_label(McpErrorKind::Auth), "auth");
-        assert_eq!(
-            mcp_error_kind_label(McpErrorKind::NotFound),
-            "not_found"
-        );
-        assert_eq!(
-            mcp_error_kind_label(McpErrorKind::Permission),
-            "permission"
-        );
-        assert_eq!(
-            mcp_error_kind_label(McpErrorKind::Permanent),
-            "permanent"
-        );
+        assert_eq!(mcp_error_kind_label(McpErrorKind::NotFound), "not_found");
+        assert_eq!(mcp_error_kind_label(McpErrorKind::Permission), "permission");
+        assert_eq!(mcp_error_kind_label(McpErrorKind::Permanent), "permanent");
         assert_eq!(mcp_error_kind_label(McpErrorKind::Config), "config");
     }
 
@@ -3810,7 +3797,7 @@ mod tests {
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
                 logprobs: None,
-            thinking: String::new(),
+                thinking: String::new(),
             }
         }
 

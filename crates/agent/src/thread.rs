@@ -9,13 +9,13 @@ use crate::{
     CaduceusProgressTool, CaduceusProjectTool, CaduceusProjectWikiTool, CaduceusScaffoldTool,
     CaduceusSecurityScanTool, CaduceusSemanticSearchTool, CaduceusStorageTool,
     CaduceusTaskDecomposeTool, CaduceusTaskTreeTool, CaduceusTelemetryTool,
-    CaduceusTimeTrackingTool, CaduceusTreeSitterTool, ContextServerRegistry, CopyPathTool,
-    CreateDirectoryTool, DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool,
-    FetchTool, FindPathTool, GrepTool, ListDirectoryTool, MovePathTool, NowTool, OpenTool,
-    ProjectSnapshot, ReadFileTool, ReadThreadTool, RestoreFileFromDiskTool, SaveFileTool, SuggestModelsTool,
-    CompactThreadTool, SpawnAgentTool,
-    StreamingEditFileTool, SystemPromptTemplate, Template, Templates, TerminalTool,
-    ToolPermissionDecision, UpdatePlanTool, WebSearchTool, decide_permission_from_settings,
+    CaduceusTimeTrackingTool, CaduceusTreeSitterTool, CompactThreadTool, ContextServerRegistry,
+    CopyPathTool, CreateDirectoryTool, DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool,
+    EditFileTool, FetchTool, FindPathTool, GrepTool, ListDirectoryTool, MovePathTool, NowTool,
+    OpenTool, ProjectSnapshot, ReadFileTool, ReadThreadTool, RestoreFileFromDiskTool, SaveFileTool,
+    SpawnAgentTool, StreamingEditFileTool, SuggestModelsTool, SystemPromptTemplate, Template,
+    Templates, TerminalTool, ToolPermissionDecision, UpdatePlanTool, WebSearchTool,
+    decide_permission_from_settings,
 };
 use acp_thread::{MentionUri, UserMessageId};
 use action_log::ActionLog;
@@ -664,6 +664,28 @@ pub trait SubagentHandle {
     fn num_entries(&self, cx: &App) -> usize;
     /// Runs a turn for a given message and returns both the response and the index of that output message.
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
+    /// ST7 fix #3: subscribe to the spawned subagent's `AgentEvent` stream
+    /// so `spawn_agent_tool` can drive phase tracking
+    /// (`SubAgentPhase::next_phase` + `tools_started`). Returns `None`
+    /// when no emitter is wired (e.g. legacy/non-caduceus paths). Each
+    /// call returns a fresh broadcast receiver that observes only events
+    /// emitted *after* this call. Default impl returns `None` so adding
+    /// this method is non-breaking for downstream `SubagentHandle` impls.
+    fn events(
+        &self,
+        _cx: &mut AsyncApp,
+    ) -> Option<tokio::sync::broadcast::Receiver<caduceus_core::AgentEvent>> {
+        None
+    }
+    /// ST7 r3 followup-B: surface the subagent's currently-selected
+    /// (provider, model) so `classify_subagent_error` at the
+    /// spawn-tool boundary can build a populated `ClassifyContext`
+    /// (used by ST8 vendor rerouting). Default impl returns
+    /// `ClassifyContext::empty()` so adding this method is non-breaking
+    /// for downstream `SubagentHandle` impls (e.g. `FakeSubagent`).
+    fn classify_context(&self, _cx: &App) -> caduceus_core::ClassifyContext {
+        caduceus_core::ClassifyContext::empty()
+    }
 }
 
 /// Options for spawning a sub-agent. Allows the master to override inherited
@@ -888,26 +910,27 @@ static ATOMIC_WRITE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// loader — only make sense against a folder workspace. Gating them on
 /// this helper turns "user opened a file" from a cascade of confusing
 /// ENOTDIR errors into a single one-time info log.
-pub(crate) fn caduceus_workspace_folder(
-    project: &Entity<Project>,
-    cx: &App,
-) -> Option<PathBuf> {
-    let root = project
-        .read(cx)
-        .worktrees(cx)
-        .next()?
-        .read(cx)
-        .abs_path()
-        .to_path_buf();
-    if root.is_dir() { Some(root) } else { None }
+pub(crate) fn caduceus_workspace_folder(project: &Entity<Project>, cx: &App) -> Option<PathBuf> {
+    let worktree = project.read(cx).worktrees(cx).next()?;
+    let worktree = worktree.read(cx);
+    // Trust the worktree's own metadata (works for FakeFs in tests and
+    // real fs in prod). Fall back to disk-probe if no root_entry yet.
+    let is_folder = match worktree.root_entry() {
+        Some(entry) => entry.is_dir(),
+        None => worktree.abs_path().is_dir(),
+    };
+    if is_folder {
+        Some(worktree.abs_path().to_path_buf())
+    } else {
+        None
+    }
 }
 
 /// Emits exactly one `info!` per process explaining that Caduceus features
 /// require a folder workspace. Subsequent calls are no-ops. Use from any
 /// site where `caduceus_workspace_folder` returned `None`.
 pub(crate) fn log_no_folder_workspace_once() {
-    static LOGGED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         log::info!(
             "[caduceus] Workspace is not a folder. Caduceus features (native \
@@ -1286,8 +1309,7 @@ pub(crate) struct CaduceusState {
     /// When `caduceus_native_loop` setting is ON the bridge's
     /// `native_loop_enabled` atomic is set; `run_turn_internal` dispatches
     /// to the native loop via this handle.
-    pub(crate) bridge:
-        Option<std::sync::Arc<caduceus_bridge::orchestrator::OrchestratorBridge>>,
+    pub(crate) bridge: Option<std::sync::Arc<caduceus_bridge::orchestrator::OrchestratorBridge>>,
     /// G1: engine harness for the native loop. Lazily built on first native
     /// turn; invalidated on cancel/model-change so the next turn rebuilds
     /// with fresh state.
@@ -1295,9 +1317,8 @@ pub(crate) struct CaduceusState {
     /// G1: per-thread mutable engine state held behind an async mutex so
     /// the turn task can `lock()` for the full duration of a harness call.
     /// Panic-safe via mutex poison; invalidated together with the harness.
-    pub(crate) native_state: Option<
-        std::sync::Arc<tokio::sync::Mutex<crate::caduceus_native_state::NativeLoopState>>,
-    >,
+    pub(crate) native_state:
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::caduceus_native_state::NativeLoopState>>>,
     /// G1: cancellation token given to the harness at build time. Zed →
     /// engine cancel flips this; the harness cooperates via its internal
     /// `select!`.
@@ -1362,6 +1383,33 @@ impl Thread {
             depth: parent_thread.read(cx).depth() + 1,
         });
         thread.inherit_parent_settings(parent_thread, cx);
+        // ST7 r3 #1: seed `caduceus.emitter` eagerly so that
+        // `subagent_event_subscriber()` can return a live receiver
+        // BEFORE `prompt()` builds the harness. Without this seed,
+        // `spawn_agent_tool::run()` calls `subagent.events(cx)` at
+        // line ~458 (before `subagent.send()` runs) and gets None,
+        // so the phase-tracking pump task never starts — leaving
+        // last_phase pinned at ModelSelection / tools_started=false
+        // through every timeout.
+        //
+        // The mpsc rx returned by `AgentEventEmitter::channel(...)`
+        // would otherwise let the channel close as soon as `prompt()`
+        // attaches the harness. Drain it on a background task whose
+        // lifetime equals the (cloneable) emitter — i.e. as long as
+        // *any* clone of the emitter exists, the rx stays alive and
+        // `try_send` never trips Closed. The drain task ends when the
+        // last emitter clone drops (parent invalidates, thread drops).
+        //
+        // The harness builder later reuses this seeded emitter via
+        // `with_emitter_reuse(em)` (see thread.rs:~3707) so events
+        // emitted by the harness reach the same broadcast fan-out
+        // the pump is subscribed to.
+        let (em, mut rx) = caduceus_orchestrator::AgentEventEmitter::channel(
+            caduceus_bridge::orchestrator::OrchestratorBridge::DEFAULT_EVENT_CHANNEL_BUFFER,
+        );
+        thread.caduceus.emitter = Some(em);
+        cx.background_spawn(async move { while rx.recv().await.is_some() {} })
+            .detach();
         thread
     }
 
@@ -1518,10 +1566,7 @@ impl Thread {
         if let Some(mode) = opts.mode_override.as_ref() {
             use caduceus_orchestrator::modes::AgentMode;
             if AgentMode::from_str_loose(mode).is_none() {
-                anyhow::bail!(
-                    "Unknown mode '{}'. Valid: plan, act, autopilot",
-                    mode
-                );
+                anyhow::bail!("Unknown mode '{}'. Valid: plan, act, autopilot", mode);
             }
             self.caduceus_mode = Some(mode.clone());
         }
@@ -1545,7 +1590,12 @@ impl Thread {
                         "Unknown model '{}'. {} models available; first 10: [{}]",
                         model_id,
                         available.len(),
-                        available.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+                        available
+                            .iter()
+                            .take(10)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
             }
@@ -1561,6 +1611,18 @@ impl Thread {
     /// Returns true if this thread was imported from a shared thread.
     pub fn is_imported(&self) -> bool {
         self.imported
+    }
+
+    /// ST7 fix #3: subscribe to the caduceus engine's `AgentEventEmitter`
+    /// for this thread, if a harness has been built. Returns `None` when
+    /// no emitter is wired (legacy code paths or pre-harness-build state).
+    /// Each call returns a fresh broadcast receiver scoped to events
+    /// emitted *after* this call (use the emitter's retention ring for
+    /// replay if needed).
+    pub fn subagent_event_subscriber(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<caduceus_core::AgentEvent>> {
+        self.caduceus.emitter.as_ref().map(|e| e.subscribe())
     }
 
     pub fn replay(
@@ -2039,7 +2101,7 @@ impl Thread {
         );
         let cancel_token = caduceus_core::CancellationToken::new();
         let state = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::caduceus_native_state::NativeLoopState::new(root.clone()),
+            crate::caduceus_native_state::NativeLoopState::new(root),
         ));
 
         // ST-A2d: stash bridge + cancel token + native state so
@@ -3403,7 +3465,8 @@ impl Thread {
             /// NW-1: enabled-tools snapshot captured in Phase 1 under
             /// the `this.update` borrow so Phase 2 can build the tool
             /// dispatcher without a second `update` round-trip.
-            enabled_tools: std::collections::BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>>,
+            enabled_tools:
+                std::collections::BTreeMap<SharedString, std::sync::Arc<dyn AnyAgentTool>>,
             /// NW-2: rendered base system prompt captured in Phase 1.
             /// The engine's `effective_system_prompt` wraps this with
             /// behavior_rules + mode block + envelope, so we pass only
@@ -3457,8 +3520,7 @@ impl Thread {
             // the legacy path uses. Engine adds behavior_rules + mode
             // on top; we pass only the project-focused content here
             // so nothing double-renders.
-            let available_tools: Vec<SharedString> =
-                enabled_tools.keys().cloned().collect();
+            let available_tools: Vec<SharedString> = enabled_tools.keys().cloned().collect();
             let system_prompt = SystemPromptTemplate {
                 project: this.project_context.read(cx),
                 available_tools,
@@ -3544,9 +3606,11 @@ impl Thread {
                         let _ = respond_to.send(Err(ct::AdapterError::UnknownTool(tool_name)));
                         continue;
                     };
-                    let tool_use_id = language_model::LanguageModelToolUseId::from(
-                        format!("native-{}-{}", tool_name, uuid::Uuid::new_v4()),
-                    );
+                    let tool_use_id = language_model::LanguageModelToolUseId::from(format!(
+                        "native-{}-{}",
+                        tool_name,
+                        uuid::Uuid::new_v4()
+                    ));
                     // Run the Zed tool on the gpui main thread.
                     let this_weak = this_weak.clone();
                     let spawn_res = this_weak.update(cx_loop, |this, cx| {
@@ -3571,8 +3635,8 @@ impl Thread {
                     let task = match spawn_res {
                         Ok(t) => t,
                         Err(e) => {
-                            let _ = respond_to
-                                .send(Err(ct::AdapterError::Execution(e.to_string())));
+                            let _ =
+                                respond_to.send(Err(ct::AdapterError::Execution(e.to_string())));
                             continue;
                         }
                     };
@@ -3595,28 +3659,37 @@ impl Thread {
             })
             .detach();
 
-            let tool_registry =
-                crate::caduceus_tool_adapter::build_zed_tool_registry(
-                    &setup.enabled_tools,
-                    tool_handle,
-                    |_| true,
-                )
-                .unwrap_or_else(|e| {
-                    log::warn!("[native-loop] build_zed_tool_registry failed: {e}; \
-                                falling back to empty registry");
-                    caduceus_tools::ToolRegistry::new()
-                });
+            let tool_registry = crate::caduceus_tool_adapter::build_zed_tool_registry(
+                &setup.enabled_tools,
+                tool_handle,
+                |_| true,
+            )
+            .unwrap_or_else(|e| {
+                log::warn!(
+                    "[native-loop] build_zed_tool_registry failed: {e}; \
+                                falling back to empty registry"
+                );
+                caduceus_tools::ToolRegistry::new()
+            });
 
-            let provider_id =
-                caduceus_core::ProviderId::new(setup.model.provider_id().0.as_ref());
+            let provider_id = caduceus_core::ProviderId::new(setup.model.provider_id().0.as_ref());
             let provider = std::sync::Arc::new(ZedLlmAdapter::new(provider_id, disp_handle.clone()))
                 as std::sync::Arc<dyn caduceus_providers::LlmAdapter>;
-            let built = setup
-                .bridge
-                .harness(provider, tool_registry, setup.system_prompt.clone())
-                .with_emitter()
-                .with_reducer_sink()
-                .build();
+            // ST7 r3 #1: prefer the pre-seeded emitter (subagent path
+            // — Thread::new_subagent seeded it so spawn_agent_tool's
+            // events() pump can attach BEFORE prompt() runs). When no
+            // emitter is seeded (parent thread, first turn) the
+            // builder mints a fresh one as before.
+            let mut harness_builder =
+                setup
+                    .bridge
+                    .harness(provider, tool_registry, setup.system_prompt.clone());
+            harness_builder = if let Some(em) = setup.emitter.clone() {
+                harness_builder.with_emitter_reuse(em)
+            } else {
+                harness_builder.with_emitter()
+            };
+            let built = harness_builder.with_reducer_sink().build();
 
             // FU#5 / emitter-mpsc-leak fix: HarnessBuilder hands us
             // `built.event_rx` — the single-consumer mpsc `Receiver`
@@ -3663,8 +3736,8 @@ impl Thread {
             // `mode_prompt_for_profile`.
             let harness_with_mode = {
                 use caduceus_orchestrator::modes::{ActLens, AgentMode};
-                let mode = AgentMode::from_str_loose(&setup.caduceus_mode)
-                    .unwrap_or(AgentMode::Plan);
+                let mode =
+                    AgentMode::from_str_loose(&setup.caduceus_mode).unwrap_or(AgentMode::Plan);
                 let lens = setup
                     .caduceus_lens
                     .as_deref()
@@ -3679,7 +3752,12 @@ impl Thread {
 
             this.update(cx, |this, _| {
                 this.caduceus.harness = Some(harness_arc.clone());
-                this.caduceus.emitter = Some(emitter.clone());
+                // ST7 r3 #1: get_or_insert — preserve the seeded
+                // emitter (subagent path) so already-attached pump
+                // subscribers keep observing the same broadcast
+                // channel. For non-seeded parent threads, this falls
+                // back to populating from the harness output.
+                this.caduceus.emitter.get_or_insert_with(|| emitter.clone());
                 this.caduceus.dispatcher = Some(disp_handle.clone());
                 this.caduceus.approval_tx = Some(approval_tx.clone());
             })?;
@@ -3747,7 +3825,7 @@ impl Thread {
         let enabled_tools_for_consumer = setup.enabled_tools.clone();
         let consumer_task = cx.spawn(async move |cx_cons| {
             use caduceus_bridge::event_translator::{
-                TranslatedThreadEvent as T, ToolInputAggregator,
+                ToolInputAggregator, TranslatedThreadEvent as T,
             };
             // FU#4: per-id aggregation (id → name, id → input bytes)
             // now lives in the bridge crate's `ToolInputAggregator`,
@@ -5014,7 +5092,7 @@ impl Thread {
         // doesn't show a ghost edge for an agent that's no longer running.
         // Using SessionId here matches the id-space chosen in
         // register_running_subagent (Sonnet #1).
-        caduceus_bridge::index_dag::remove_spawn(&subagent_session_id.0.to_string());
+        caduceus_bridge::index_dag::remove_spawn(&subagent_session_id.0);
         self.running_subagents.retain(|s| {
             s.upgrade()
                 .map_or(false, |s| s.read(cx).id() != subagent_session_id)
@@ -5130,7 +5208,6 @@ impl Thread {
         let mut assembler = ContextAssembler::new(budget);
 
         if let Some(root) = caduceus_workspace_folder(&self.project, cx) {
-
             // Project instructions (cached after first load)
             let instr = if let Some(cached) = &self.cached_project_instructions {
                 cached.clone()
@@ -5156,10 +5233,9 @@ impl Thread {
             }
 
             // Wiki overview (compact)
-            if let Some(overview) = caduceus_bridge::memory::get(
-                &root,
-                caduceus_bridge::memory::KEY_PROJECT_OVERVIEW,
-            ) {
+            if let Some(overview) =
+                caduceus_bridge::memory::get(&root, caduceus_bridge::memory::KEY_PROJECT_OVERVIEW)
+            {
                 let compact: String = overview.chars().take(300).collect();
                 assembler.add_source(ContextSource::MemoryBank(compact));
             }
@@ -5943,6 +6019,7 @@ impl ThreadEventStream {
 // Timeout policy is engine-side (default ~300s). If the user closes
 // the panel without deciding, the oneshot is dropped → engine receives
 // `PermissionOutcome::ChannelClosed` → tool call is denied fail-fast.
+#[allow(clippy::redundant_clone)]
 fn route_native_permission_request(
     id: &str,
     tool: &str,
@@ -6015,19 +6092,20 @@ fn route_native_permission_request(
         id.to_string(),
         acp::ToolCallUpdateFields::new().title(title),
     );
-    let options = acp_thread::PermissionOptions::Dropdown(vec![acp_thread::PermissionOptionChoice {
-        allow: acp::PermissionOption::new(
-            acp::PermissionOptionId::new("allow_once".to_string()),
-            "Allow".to_string(),
-            acp::PermissionOptionKind::AllowOnce,
-        ),
-        deny: acp::PermissionOption::new(
-            acp::PermissionOptionId::new("deny_once".to_string()),
-            "Deny".to_string(),
-            acp::PermissionOptionKind::RejectOnce,
-        ),
-        sub_patterns: vec![],
-    }]);
+    let options =
+        acp_thread::PermissionOptions::Dropdown(vec![acp_thread::PermissionOptionChoice {
+            allow: acp::PermissionOption::new(
+                acp::PermissionOptionId::new("allow_once".to_string()),
+                "Allow".to_string(),
+                acp::PermissionOptionKind::AllowOnce,
+            ),
+            deny: acp::PermissionOption::new(
+                acp::PermissionOptionId::new("deny_once".to_string()),
+                "Deny".to_string(),
+                acp::PermissionOptionKind::RejectOnce,
+            ),
+            sub_patterns: vec![],
+        }]);
     if stream
         .0
         .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
@@ -6154,7 +6232,11 @@ fn handle_native_tool_lifecycle(
                 (Some(input), Some(name)) => {
                     let input = input.clone();
                     let name_ss: SharedString = name.clone().into();
-                    cx.update(|cx| enabled_tools.get(&name_ss).map(|t| t.initial_title(input, cx)))
+                    cx.update(|cx| {
+                        enabled_tools
+                            .get(&name_ss)
+                            .map(|t| t.initial_title(input, cx))
+                    })
                 }
                 _ => None,
             };
@@ -7463,7 +7545,8 @@ mod caduceus_native_loop_tests {
         });
 
         let fs = fs::FakeFs::new(cx.background_executor.clone());
-        fs.insert_tree(path!("/project"), serde_json::json!({})).await;
+        fs.insert_tree(path!("/project"), serde_json::json!({}))
+            .await;
         let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
         let templates = Templates::new();
 
@@ -7489,10 +7572,7 @@ mod caduceus_native_loop_tests {
         cx.update(|cx| {
             SettingsStore::update_global(cx, |store, cx| {
                 store
-                    .set_user_settings(
-                        r#"{ "agent": { "caduceus_native_loop": true } }"#,
-                        cx,
-                    )
+                    .set_user_settings(r#"{ "agent": { "caduceus_native_loop": true } }"#, cx)
                     .unwrap();
             });
         });
@@ -7512,8 +7592,14 @@ mod caduceus_native_loop_tests {
             );
             let t = thread.read(cx);
             assert!(t.caduceus.bridge.is_none(), "bridge must stay None");
-            assert!(t.caduceus.native_state.is_none(), "native_state must stay None");
-            assert!(t.caduceus.cancel_token.is_none(), "cancel_token must stay None");
+            assert!(
+                t.caduceus.native_state.is_none(),
+                "native_state must stay None"
+            );
+            assert!(
+                t.caduceus.cancel_token.is_none(),
+                "cancel_token must stay None"
+            );
             assert!(t.caduceus.harness.is_none(), "harness must stay None");
         });
     }
@@ -7609,14 +7695,24 @@ mod caduceus_native_loop_tests {
 
         cx.update(|cx| {
             let res = thread.update(cx, |t, cx| t.ensure_caduceus_harness(cx));
+            // WG (Worktree-Gate): when no folder workspace is open we now
+            // no-op gracefully instead of erroring. The contract is the
+            // same — Caduceus features stay disabled, legacy dispatch keeps
+            // running — but the surface is `Ok(false)` + one info log,
+            // not `Err(_)` + repeated error logs.
+            let provisioned = res.expect(
+                "ensure_caduceus_harness must return Ok(false) (silent no-op) \
+                 when flag is ON but no folder workspace exists",
+            );
             assert!(
-                res.is_err(),
-                "ensure_caduceus_harness must return Err when flag is ON but no worktree exists"
+                !provisioned,
+                "ensure_caduceus_harness must report not-provisioned when no \
+                 folder workspace is open (WG worktree-gate)"
             );
             let t = thread.read(cx);
             assert!(
                 t.caduceus.bridge.is_none(),
-                "bridge must stay None after error (legacy path fallback contract)"
+                "bridge must stay None after no-op (legacy path fallback contract)"
             );
         });
 
@@ -7647,10 +7743,7 @@ mod caduceus_native_loop_tests {
         cx.update(|cx| {
             SettingsStore::update_global(cx, |store, cx| {
                 store
-                    .set_user_settings(
-                        r#"{ "agent": { "caduceus_native_loop": false } }"#,
-                        cx,
-                    )
+                    .set_user_settings(r#"{ "agent": { "caduceus_native_loop": false } }"#, cx)
                     .unwrap();
             });
         });
@@ -8240,10 +8333,8 @@ mod native_turn_e2e_tests {
         // 2. A ToolCall (or ToolCallUpdate) appears — the UI card must
         //    materialise for the user to see the tool run.
         assert!(
-            evs.iter().any(|e| matches!(
-                e,
-                ThreadEvent::ToolCall(_) | ThreadEvent::ToolCallUpdate(_)
-            )),
+            evs.iter()
+                .any(|e| matches!(e, ThreadEvent::ToolCall(_) | ThreadEvent::ToolCallUpdate(_))),
             "must see at least one tool-call event for read_file; got {evs:?}"
         );
 
@@ -8330,11 +8421,13 @@ mod native_turn_e2e_tests {
         // Contract: failed tool-result must surface as a ToolCallUpdate
         // whose status is Failed (otherwise the GUI card stays stuck
         // on "running").
-        let failed_update = evs.iter().any(|e| matches!(
-            e,
-            ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(u))
-                if matches!(u.fields.status, Some(acp::ToolCallStatus::Failed))
-        ));
+        let failed_update = evs.iter().any(|e| {
+            matches!(
+                e,
+                ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(u))
+                    if matches!(u.fields.status, Some(acp::ToolCallStatus::Failed))
+            )
+        });
         assert!(
             failed_update,
             "failed tool must surface a ToolCallUpdate with status=Failed; got {evs:?}"
@@ -8391,12 +8484,14 @@ mod native_turn_e2e_tests {
         // dispatcher for permission events; on the dispatcher-only
         // path tested here, the event falls through to a warning
         // diagnostic. Either way, the stream MUST keep flowing.
-        let perm_diag = evs.iter().any(|e| matches!(
-            e,
-            ThreadEvent::EngineDiagnostic(d)
-                if d.kind == "permission.request"
-                && d.severity == EngineDiagnosticSeverity::Warning
-        ));
+        let perm_diag = evs.iter().any(|e| {
+            matches!(
+                e,
+                ThreadEvent::EngineDiagnostic(d)
+                    if d.kind == "permission.request"
+                    && d.severity == EngineDiagnosticSeverity::Warning
+            )
+        });
         assert!(
             perm_diag,
             "permission request must surface as EngineDiagnostic(permission.request, Warning); got {evs:?}"
@@ -8444,7 +8539,10 @@ mod route_native_permission_tests {
         });
     }
 
-    fn make_stream() -> (ThreadEventStream, fmpsc::UnboundedReceiver<Result<ThreadEvent>>) {
+    fn make_stream() -> (
+        ThreadEventStream,
+        fmpsc::UnboundedReceiver<Result<ThreadEvent>>,
+    ) {
         let (tx, rx) = fmpsc::unbounded::<Result<ThreadEvent>>();
         (ThreadEventStream(tx), rx)
     }
@@ -8547,7 +8645,9 @@ mod route_native_permission_tests {
             "expected permission.auto_allow diagnostic, got {events:?}"
         );
         assert!(
-            !events.iter().any(|e| matches!(e, ThreadEvent::ToolCallAuthorization { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(e, ThreadEvent::ToolCallAuthorization { .. })),
             "UI prompt must NOT be emitted on auto-allow"
         );
     }
@@ -8701,7 +8801,10 @@ mod native_tool_lifecycle_tests {
     use gpui::TestAppContext;
     use std::collections::{BTreeMap, HashMap};
 
-    fn make_stream() -> (ThreadEventStream, fmpsc::UnboundedReceiver<Result<ThreadEvent>>) {
+    fn make_stream() -> (
+        ThreadEventStream,
+        fmpsc::UnboundedReceiver<Result<ThreadEvent>>,
+    ) {
         let (tx, rx) = fmpsc::unbounded::<Result<ThreadEvent>>();
         (ThreadEventStream(tx), rx)
     }
@@ -8922,10 +9025,7 @@ mod native_tool_lifecycle_tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(update)) => {
-                assert_eq!(
-                    update.fields.status,
-                    Some(acp::ToolCallStatus::InProgress)
-                );
+                assert_eq!(update.fields.status, Some(acp::ToolCallStatus::InProgress));
                 assert!(
                     update.fields.raw_input.is_none(),
                     "raw_input must be None when the buffer was empty / unparseable"

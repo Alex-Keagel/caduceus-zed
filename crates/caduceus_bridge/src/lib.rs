@@ -28,8 +28,8 @@ pub mod safety;
 pub mod search;
 pub mod security;
 pub mod storage;
-pub mod tokio_rt;
 pub mod telemetry;
+pub mod tokio_rt;
 pub mod tools;
 pub mod tree_sitter;
 

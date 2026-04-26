@@ -1,7 +1,7 @@
 mod caduceus_native_state;
-pub mod dag_diversity;
 mod caduceus_provider_adapter;
 mod caduceus_tool_adapter;
+pub mod dag_diversity;
 mod db;
 mod edit_agent;
 mod legacy_thread;
@@ -298,9 +298,7 @@ impl NativeAgent {
                 let pending: Vec<_> = this
                     .sessions
                     .values_mut()
-                    .map(|s| {
-                        std::mem::replace(&mut s.pending_save, gpui::Task::ready(Ok(())))
-                    })
+                    .map(|s| std::mem::replace(&mut s.pending_save, gpui::Task::ready(Ok(()))))
                     .collect();
                 async move {
                     log::info!(
@@ -532,7 +530,7 @@ impl NativeAgent {
         // Caduceus: auto-index project on open and populate wiki
         if let Some(engine) = caduceus_engine {
             let project_for_index = project.clone();
-            let engine_clone = engine.clone();
+            let engine_clone = engine;
             cx.spawn(async move |_this, cx| {
                 let project_root = cx.update(|cx| {
                     project_for_index
@@ -1054,10 +1052,13 @@ impl NativeAgent {
                 )),
             ),
             acp::AvailableCommand::new("index", "Index project for semantic search"),
-            acp::AvailableCommand::new("pull", "Pull another thread into this conversation by session id")
-                .input(acp::AvailableCommandInput::Unstructured(
-                    acp::UnstructuredCommandInput::new("<session_id>"),
-                )),
+            acp::AvailableCommand::new(
+                "pull",
+                "Pull another thread into this conversation by session id",
+            )
+            .input(acp::AvailableCommandInput::Unstructured(
+                acp::UnstructuredCommandInput::new("<session_id>"),
+            )),
             acp::AvailableCommand::new(
                 "init",
                 "Create a new project directory under ~/Dev and bind it as the workspace",
@@ -1576,7 +1577,7 @@ impl NativeAgentConnection {
                     let pin_count = t.list_pins().len();
 
                     dashboard.push_str("### 🧠 Session\n");
-                    dashboard.push_str(&format!("| Metric | Value |\n|--------|-------|\n"));
+                    dashboard.push_str("| Metric | Value |\n|--------|-------|\n");
                     dashboard.push_str(&format!("| Mode | **{}** |\n", mode.to_uppercase()));
                     dashboard.push_str(&format!("| Messages | {} |\n", msg_count));
                     dashboard.push_str(&format!("| Context | {:.0}% — **{}** |\n", fill_pct, zone.label()));
@@ -1713,7 +1714,7 @@ impl NativeAgentConnection {
                 } else if let Some(thread) = self.thread(session_id, cx) {
                     let engine = thread.read(cx).project().read(cx).worktrees(cx).next()
                         .map(|wt| caduceus_bridge::engine::CaduceusEngine::new(wt.read(cx).abs_path().to_path_buf()));
-                    if let Some(engine) = engine {
+                    if let Some(_engine) = engine {
                         // Run search synchronously for slash command (async would need different pattern)
                         format!("🔍 Use `caduceus_semantic_search` tool with query: \"{}\"\n\
                                  The agent will search your indexed codebase.", query)
@@ -1869,7 +1870,8 @@ impl NativeAgentConnection {
             return Self::push_init_response(
                 self,
                 &session_id,
-                "❌ Usage: `/init <name>` — creates `~/Dev/<name>` and binds it as the workspace.".to_string(),
+                "❌ Usage: `/init <name>` — creates `~/Dev/<name>` and binds it as the workspace."
+                    .to_string(),
                 cx,
             );
         }
@@ -1913,10 +1915,7 @@ impl NativeAgentConnection {
             return Self::push_init_response(
                 self,
                 &session_id,
-                format!(
-                    "❌ Could not create `{}`: {err}",
-                    target.display()
-                ),
+                format!("❌ Could not create `{}`: {err}", target.display()),
                 cx,
             );
         }
@@ -1941,7 +1940,6 @@ impl NativeAgentConnection {
             );
         };
         let project = project_state.project.clone();
-        drop(inner);
 
         let target_for_msg = target.clone();
         cx.spawn(async move |cx| {
@@ -2826,9 +2824,14 @@ impl NativeThreadEnvironment {
         let parent_session_id = parent_thread.id().clone();
 
         if current_depth >= MAX_SUBAGENT_DEPTH {
+            // ST7: surface a typed SubAgentFailure so spawn_agent_tool can
+            // classify via downcast instead of string-matching the
+            // anyhow message.
             return Err(anyhow!(
-                "Maximum subagent depth ({}) reached",
-                MAX_SUBAGENT_DEPTH
+                caduceus_core::SubAgentFailure::RecursionLimitExceeded {
+                    current_depth,
+                    max_depth: MAX_SUBAGENT_DEPTH,
+                }
             ));
         }
 
@@ -2973,6 +2976,12 @@ enum SubagentPromptResult {
     Cancelled,
     ContextWindowWarning,
     Error(String),
+    /// ST7: typed sub-agent failure threaded back through the prompt
+    /// callback. Used today only for `StopReason::Refusal` →
+    /// `ModelRefusal` (so spawn_agent_tool's downcast classifier can
+    /// surface it without string-matching). Other arms continue to use
+    /// `Error(String)` until ST7-followup-A lifts more discriminants.
+    TypedError(caduceus_core::SubAgentFailure),
 }
 
 pub struct NativeSubagentHandle {
@@ -3020,6 +3029,22 @@ impl SubagentHandle for NativeSubagentHandle {
                     .latest_token_usage()
                     .map(|usage| usage.ratio());
 
+                // ST7 r3 #2: capture (provider, model) BEFORE the
+                // background_spawn so the classifier downstream can
+                // populate ClassifyContext. The background future
+                // can't read `thread` (no AsyncApp in scope), so we
+                // read here and move the IDs into the closure.
+                let classify_ctx = {
+                    let t = thread.read(cx);
+                    let model = t.model();
+                    let provider = model.map(|m| {
+                        caduceus_core::ProviderId::new(m.provider_id().0.as_ref())
+                    });
+                    let model_id = model
+                        .map(|m| caduceus_core::ModelId::new(m.id().0.as_ref()));
+                    caduceus_core::ClassifyContext::new(provider, model_id)
+                };
+
                 parent_thread
                     .update(cx, |parent_thread, cx| {
                         parent_thread.register_running_subagent(thread.downgrade(), cx)
@@ -3061,12 +3086,54 @@ impl SubagentHandle for NativeSubagentHandle {
                                         acp::StopReason::Cancelled => SubagentPromptResult::Cancelled,
                                         acp::StopReason::MaxTokens => SubagentPromptResult::Error("The agent reached the maximum number of tokens.".into()),
                                         acp::StopReason::MaxTurnRequests => SubagentPromptResult::Error("The agent reached the maximum number of allowed requests between user turns. Try prompting again.".into()),
-                                        acp::StopReason::Refusal => SubagentPromptResult::Error("The agent refused to process that prompt. Try again.".into()),
+                                        acp::StopReason::Refusal => SubagentPromptResult::TypedError(caduceus_core::SubAgentFailure::ModelRefusal { refusal_text: "The agent refused to process that prompt. Try again.".into() }),
                                         acp::StopReason::EndTurn | _ => SubagentPromptResult::Completed,
                                     }
                                 }
                                 Ok(None) => SubagentPromptResult::Error("No response from the agent. You can try messaging again.".into()),
-                                Err(error) => SubagentPromptResult::Error(error.to_string()),
+                                Err(error) => {
+                                    // ST7 fix-loop #1: preserve typed errors on the
+                                    // live path. Reviewer convergence (Sonnet+GPT)
+                                    // flagged this site as where the typed taxonomy
+                                    // dies — `error.to_string()` flattened
+                                    // CaduceusError / SubAgentFailure into an opaque
+                                    // String BEFORE spawn_agent_tool's classifier
+                                    // could downcast.
+                                    //
+                                    // Order matters: SubAgentFailure first (already
+                                    // classified upstream — e.g. RecursionLimit at
+                                    // agent.rs:2832), then CaduceusError (run the
+                                    // classifier so 429/503/timeout map to
+                                    // RetryClass correctly). Genuinely unknown
+                                    // errors fall back to String.
+                                    if let Some(failure) =
+                                        error.downcast_ref::<caduceus_core::SubAgentFailure>()
+                                    {
+                                        SubagentPromptResult::TypedError(failure.clone())
+                                    } else if let Some(cd_err) =
+                                        error.downcast_ref::<caduceus_core::CaduceusError>()
+                                    {
+                                        // ST7 r3 #2: ClassifyContext now
+                                        // populated from the subagent
+                                        // thread's configured model
+                                        // (captured outside the
+                                        // background_spawn). Provider /
+                                        // model are forwarded into
+                                        // ProviderErrorFailure for ST8's
+                                        // vendor-rerouting decision.
+                                        let failure = caduceus_core::classify_caduceus_error(
+                                            cd_err,
+                                            &classify_ctx,
+                                            caduceus_core::SubAgentPhase::Unknown,
+                                            false,
+                                            None,
+                                            None,
+                                        );
+                                        SubagentPromptResult::TypedError(failure)
+                                    } else {
+                                        SubagentPromptResult::Error(error.to_string())
+                                    }
+                                }
                             },
                             _ = token_limit_rx.fuse() => SubagentPromptResult::ContextWindowWarning,
                         }
@@ -3098,6 +3165,7 @@ impl SubagentHandle for NativeSubagentHandle {
                 }),
                 SubagentPromptResult::Cancelled => Err(anyhow!("User canceled")),
                 SubagentPromptResult::Error(message) => Err(anyhow!("{message}")),
+                SubagentPromptResult::TypedError(failure) => Err(anyhow!(failure)),
                 SubagentPromptResult::ContextWindowWarning => {
                     thread.update(cx, |thread, cx| thread.cancel(cx)).await;
                     Err(anyhow!(
@@ -3116,6 +3184,31 @@ impl SubagentHandle for NativeSubagentHandle {
 
             result
         })
+    }
+
+    /// ST7 fix #3: subscribe to the spawned thread's caduceus
+    /// `AgentEventEmitter` so `spawn_agent_tool` can drive phase
+    /// tracking. Returns `None` when the harness is not yet built (no
+    /// emitter populated) — phase tracking then stays at the default
+    /// `ModelSelection`/`tools_started=false`, matching pre-fix
+    /// behavior.
+    fn events(
+        &self,
+        cx: &mut AsyncApp,
+    ) -> Option<tokio::sync::broadcast::Receiver<caduceus_core::AgentEvent>> {
+        self.subagent_thread
+            .read_with(cx, |thread, _cx| thread.subagent_event_subscriber())
+    }
+
+    fn classify_context(&self, cx: &App) -> caduceus_core::ClassifyContext {
+        // ST7 r3 followup-B: read currently-selected (provider, model) from
+        // the subagent thread so the spawn-tool boundary classifier surfaces
+        // them to ST8 vendor-rerouting (no more `ClassifyContext::empty()`).
+        let t = self.subagent_thread.read(cx);
+        let model = t.model();
+        let provider = model.map(|m| caduceus_core::ProviderId::new(m.provider_id().0.as_ref()));
+        let model_id = model.map(|m| caduceus_core::ModelId::new(m.id().0.as_ref()));
+        caduceus_core::ClassifyContext::new(provider, model_id)
     }
 }
 

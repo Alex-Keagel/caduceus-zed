@@ -382,7 +382,7 @@ impl AgentTool for CaduceusApiRegistryTool {
                             .canonicalize()
                             .unwrap_or_else(|_| self.project_root.clone());
                         let candidate = if raw.is_absolute() {
-                            raw.clone()
+                            raw
                         } else {
                             self.project_root.join(&raw)
                         };

@@ -149,11 +149,10 @@ impl AgentTool for CompactThreadTool {
                 transcript = format!("# Focus: {focus}\n\n{transcript}");
             }
             let original_chars = transcript.chars().count();
-            let summary =
-                caduceus_bridge::orchestrator::OrchestratorBridge::compact_instructions(
-                    &transcript,
-                    max_chars,
-                );
+            let summary = caduceus_bridge::orchestrator::OrchestratorBridge::compact_instructions(
+                &transcript,
+                max_chars,
+            );
             let compacted_chars = summary.chars().count();
 
             Ok(CompactThreadToolOutput::Success {
@@ -262,11 +261,10 @@ mod tests {
         let original = transcript.chars().count();
 
         let max_chars = 800;
-        let summary =
-            caduceus_bridge::orchestrator::OrchestratorBridge::compact_instructions(
-                &transcript,
-                max_chars,
-            );
+        let summary = caduceus_bridge::orchestrator::OrchestratorBridge::compact_instructions(
+            &transcript,
+            max_chars,
+        );
         let compacted = summary.chars().count();
 
         assert!(

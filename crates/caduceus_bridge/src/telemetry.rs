@@ -171,7 +171,7 @@ impl TelemetryBridge {
     /// Generate a full telemetry report string.
     pub fn generate_report(&self) -> String {
         let mut report = String::from("# Telemetry Report\n\n");
-        report.push_str(&format!("## Token Usage\n"));
+        report.push_str("## Token Usage\n");
         report.push_str(&format!(
             "- Input tokens:  {}\n",
             self.counter.total_usage().input_tokens
@@ -184,11 +184,11 @@ impl TelemetryBridge {
             "- Total cost:    ${:.6}\n\n",
             self.logger.total_cost()
         ));
-        report.push_str(&format!("## Budget\n"));
+        report.push_str("## Budget\n");
         report.push_str(&format!("- Limit:     ${:.4}\n", self.budget.limit()));
         report.push_str(&format!("- Spent:     ${:.4}\n", self.budget.spent()));
         report.push_str(&format!("- Remaining: ${:.4}\n\n", self.budget.remaining()));
-        report.push_str(&format!("## SLOs\n"));
+        report.push_str("## SLOs\n");
         for status in self.slo_monitor.all_statuses() {
             report.push_str(&format!(
                 "- {} — target: {:.2}, current: {:.2}, met: {}\n",

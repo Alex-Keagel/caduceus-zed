@@ -52,6 +52,7 @@ pub const REQUEST_CHANNEL_CAP: usize = 64;
 
 /// Max simultaneous tool executions on the main thread. Matches legacy
 /// `FuturesUnordered` steady-state (observed ~8 during heavy edits).
+#[allow(dead_code)]
 pub const DEFAULT_MAX_CONCURRENCY: usize = 8;
 
 /// One request flowing from engine thread → main-thread dispatcher.
@@ -65,6 +66,7 @@ pub struct DispatchRequest {
 /// Errors the adapter surfaces back to the engine. They map onto
 /// `ToolResult { is_error: true }` inside [`ZedToolAdapter::call`].
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum AdapterError {
     #[error("dispatcher channel closed (Thread torn down or cancelled)")]
     ChannelClosed,
@@ -88,6 +90,7 @@ impl DispatcherHandle {
         Self { tx }
     }
 
+    #[allow(dead_code)]
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }
@@ -177,6 +180,7 @@ fn error_result(msg: String) -> ToolResult {
 /// boxed future resolving to the `ToolResult` (or an `AdapterError`).
 /// The dispatcher holds semaphore permits around this call so callers
 /// can treat the returned future as opaque "main-thread work".
+#[allow(dead_code)]
 pub type ExecFn = Arc<
     dyn Fn(String, Value) -> futures::future::BoxFuture<'static, Result<ToolResult, AdapterError>>
         + Send
@@ -189,6 +193,7 @@ pub type ExecFn = Arc<
 /// `spawn_local` is the caller-provided spawner. In production the
 /// caller passes a closure that calls `cx.spawn(...)`; in tests we
 /// pass `tokio::spawn`.
+#[allow(dead_code)]
 pub async fn drive<Spawn, Fut>(
     mut rx: mpsc::Receiver<DispatchRequest>,
     exec: ExecFn,
@@ -454,4 +459,5 @@ mod tests {
 
 // Re-export anyhow for downstream call sites that want to annotate
 // errors without pulling the crate in directly.
+#[allow(unused_imports)]
 pub use anyhow::Error as AnyError;

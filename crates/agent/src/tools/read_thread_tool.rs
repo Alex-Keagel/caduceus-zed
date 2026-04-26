@@ -105,11 +105,9 @@ impl AgentTool for ReadThreadTool {
                 })?;
             let session_id = acp::SessionId::new(input.session_id.clone());
 
-            let db = db_future
-                .await
-                .map_err(|e| ReadThreadToolOutput::Error {
-                    error: format!("DB connect failed: {e}"),
-                })?;
+            let db = db_future.await.map_err(|e| ReadThreadToolOutput::Error {
+                error: format!("DB connect failed: {e}"),
+            })?;
             let thread = db
                 .load_thread(session_id)
                 .await
