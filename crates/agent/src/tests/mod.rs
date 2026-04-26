@@ -4736,6 +4736,7 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         profile: None,
         model: None,
         mode: None,
+        timeout_secs: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -4874,6 +4875,7 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         profile: None,
         model: None,
         mode: None,
+        timeout_secs: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5025,6 +5027,7 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         profile: None,
         model: None,
         mode: None,
+        timeout_secs: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5158,6 +5161,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         profile: None,
         model: None,
         mode: None,
+        timeout_secs: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5222,6 +5226,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         profile: None,
         model: None,
         mode: None,
+        timeout_secs: None,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -5500,6 +5505,7 @@ async fn test_subagent_context_window_warning(cx: &mut TestAppContext) {
         profile: None,
         model: None,
         mode: None,
+        timeout_secs: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5629,6 +5635,7 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
         profile: None,
         model: None,
         mode: None,
+        timeout_secs: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5698,6 +5705,7 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
         profile: None,
         model: None,
         mode: None,
+        timeout_secs: None,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -5809,6 +5817,7 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         profile: None,
         model: None,
         mode: None,
+        timeout_secs: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),

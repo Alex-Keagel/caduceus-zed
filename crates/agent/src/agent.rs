@@ -2826,10 +2826,13 @@ impl NativeThreadEnvironment {
         let parent_session_id = parent_thread.id().clone();
 
         if current_depth >= MAX_SUBAGENT_DEPTH {
-            return Err(anyhow!(
-                "Maximum subagent depth ({}) reached",
-                MAX_SUBAGENT_DEPTH
-            ));
+            // ST7: surface a typed SubAgentFailure so spawn_agent_tool can
+            // classify via downcast instead of string-matching the
+            // anyhow message.
+            return Err(anyhow!(caduceus_core::SubAgentFailure::RecursionLimitExceeded {
+                current_depth,
+                max_depth: MAX_SUBAGENT_DEPTH,
+            }));
         }
 
         let label = opts.label.clone();
@@ -2973,6 +2976,12 @@ enum SubagentPromptResult {
     Cancelled,
     ContextWindowWarning,
     Error(String),
+    /// ST7: typed sub-agent failure threaded back through the prompt
+    /// callback. Used today only for `StopReason::Refusal` →
+    /// `ModelRefusal` (so spawn_agent_tool's downcast classifier can
+    /// surface it without string-matching). Other arms continue to use
+    /// `Error(String)` until ST7-followup-A lifts more discriminants.
+    TypedError(caduceus_core::SubAgentFailure),
 }
 
 pub struct NativeSubagentHandle {
@@ -3061,7 +3070,7 @@ impl SubagentHandle for NativeSubagentHandle {
                                         acp::StopReason::Cancelled => SubagentPromptResult::Cancelled,
                                         acp::StopReason::MaxTokens => SubagentPromptResult::Error("The agent reached the maximum number of tokens.".into()),
                                         acp::StopReason::MaxTurnRequests => SubagentPromptResult::Error("The agent reached the maximum number of allowed requests between user turns. Try prompting again.".into()),
-                                        acp::StopReason::Refusal => SubagentPromptResult::Error("The agent refused to process that prompt. Try again.".into()),
+                                        acp::StopReason::Refusal => SubagentPromptResult::TypedError(caduceus_core::SubAgentFailure::ModelRefusal { refusal_text: "The agent refused to process that prompt. Try again.".into() }),
                                         acp::StopReason::EndTurn | _ => SubagentPromptResult::Completed,
                                     }
                                 }
@@ -3098,6 +3107,7 @@ impl SubagentHandle for NativeSubagentHandle {
                 }),
                 SubagentPromptResult::Cancelled => Err(anyhow!("User canceled")),
                 SubagentPromptResult::Error(message) => Err(anyhow!("{message}")),
+                SubagentPromptResult::TypedError(failure) => Err(anyhow!(failure)),
                 SubagentPromptResult::ContextWindowWarning => {
                     thread.update(cx, |thread, cx| thread.cancel(cx)).await;
                     Err(anyhow!(
