@@ -2671,9 +2671,7 @@ impl Thread {
             _ => None,
         });
         let Some(id) = target else {
-            log::warn!(
-                "[st2] scope expansion requested before any user message; pin dropped"
-            );
+            log::warn!("[st2] scope expansion requested before any user message; pin dropped");
             return;
         };
         self.pin_replace(PinnedMessageKey::User(id), PinReason::ScopeExpansionActive);
@@ -5904,8 +5902,9 @@ impl Thread {
                 )));
             }
 
-            // Resolve @mentions from the latest user message
-            if let Some(last_user_text) = self.messages.iter().rev().find_map(|m| {
+            // Latest user message — used by both @mention resolver and the
+            // wiki auto-inject path (D1). Computed once.
+            let last_user_text: Option<String> = self.messages.iter().rev().find_map(|m| {
                 if let Message::User(u) = m {
                     Some(
                         u.content
@@ -5923,9 +5922,12 @@ impl Thread {
                 } else {
                     None
                 }
-            }) {
+            });
+
+            // Resolve @mentions from the latest user message
+            if let Some(last_user_text) = last_user_text.as_deref() {
                 let resolver = caduceus_bridge::orchestrator::MentionResolver::new(&root);
-                if let Ok(Some(resolved)) = resolver.resolve(&last_user_text) {
+                if let Ok(Some(resolved)) = resolver.resolve(last_user_text) {
                     if !resolved.is_empty() {
                         let truncated: String = resolved.chars().take(2000).collect();
                         assembler.add_source(ContextSource::FileContext {
@@ -5933,6 +5935,59 @@ impl Thread {
                             content: truncated,
                             priority: 2,
                         });
+                    }
+                }
+            }
+
+            // Wiki auto-inject (wiki-D1). Default-off behind
+            // `CADUCEUS_WIKI_AUTO_INJECT=1`. Skipped silently when the wiki
+            // directory doesn't exist, so opting in on a wiki-less project
+            // is a no-op rather than a silent dir-creation. Top-K = 3,
+            // truncated to 1500 chars per page; priority 3 sits below
+            // @mention (2) and above MemoryBank (5 in ContextAssembler
+            // ordering) so the assembler's truncation policy preserves
+            // user-explicit context first.
+            let wiki_auto_inject =
+                std::env::var("CADUCEUS_WIKI_AUTO_INJECT").ok().as_deref() == Some("1");
+            if wiki_auto_inject {
+                if let Some(query) = last_user_text.as_deref() {
+                    if !query.trim().is_empty() {
+                        match caduceus_bridge::storage::search_pages_no_init(&root, query) {
+                            Ok(pages) => {
+                                let mut included: u64 = 0;
+                                for page in pages.into_iter().take(3) {
+                                    let content = match std::fs::read_to_string(&page.path) {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            log::warn!(
+                                                "[caduceus] wiki auto-inject read {} failed: {e}",
+                                                page.slug
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    let snippet: String = content.chars().take(1500).collect();
+                                    assembler.add_source(ContextSource::FileContext {
+                                        path: format!("wiki:{}", page.slug),
+                                        content: snippet,
+                                        priority: 3,
+                                    });
+                                    included += 1;
+                                }
+                                telemetry::event!(
+                                    "wiki.injection.completed",
+                                    thread_id = self.id.to_string(),
+                                    pages_included = included
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!("[caduceus] wiki auto-inject failed: {e}");
+                                telemetry::event!(
+                                    "wiki.injection.failed",
+                                    thread_id = self.id.to_string()
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -8775,7 +8830,10 @@ mod native_dispatch_tests {
             "BudgetExceeded must emit context.exhausted Warning, got {evs:?}"
         );
         assert!(
-            matches!(evs.last(), Some(ThreadEvent::Stop(acp::StopReason::MaxTokens))),
+            matches!(
+                evs.last(),
+                Some(ThreadEvent::Stop(acp::StopReason::MaxTokens))
+            ),
             "terminal Stop must remain MaxTokens for acp compat, got {evs:?}"
         );
     }
@@ -9885,9 +9943,7 @@ mod st2_pinned_tests {
             .collect()
     }
 
-    async fn setup_thread_for_test(
-        cx: &mut TestAppContext,
-    ) -> (Entity<Thread>, ThreadEventStream) {
+    async fn setup_thread_for_test(cx: &mut TestAppContext) -> (Entity<Thread>, ThreadEventStream) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -10049,8 +10105,7 @@ mod st2_pinned_tests {
             t.pin_at(a.clone(), PinReason::FirstUser, fixed_now());
             t.pin_at(b.clone(), PinReason::Manual, fixed_now());
             t.pin_at(c.clone(), PinReason::PlanUpdate, fixed_now());
-            let keys: Vec<&PinnedMessageKey> =
-                t.pinned_refs().iter().map(|p| &p.key).collect();
+            let keys: Vec<&PinnedMessageKey> = t.pinned_refs().iter().map(|p| &p.key).collect();
             assert_eq!(keys, vec![&a, &b, &c]);
         });
     }
@@ -10137,9 +10192,10 @@ mod st2_pinned_tests {
             assert_eq!(t.pinned_refs().len(), 3);
             t.gc_pinned();
             assert_eq!(t.pinned_refs().len(), 1);
-            assert!(t
-                .is_pinned(&PinnedMessageKey::User(live_id))
-                .contains(&PinReason::Manual));
+            assert!(
+                t.is_pinned(&PinnedMessageKey::User(live_id))
+                    .contains(&PinReason::Manual)
+            );
         });
     }
 
@@ -10181,11 +10237,7 @@ mod st2_pinned_tests {
                 fixed_now(),
             );
             t.pin_at(PinnedMessageKey::Resume(r2), PinReason::Resume, fixed_now());
-            t.pin_at(
-                PinnedMessageKey::User(id_b),
-                PinReason::Manual,
-                fixed_now(),
-            );
+            t.pin_at(PinnedMessageKey::User(id_b), PinReason::Manual, fixed_now());
             let indices = t.pinned_message_indices();
             assert_eq!(indices, vec![0, 2, 3]);
         });
@@ -10265,7 +10317,10 @@ mod st2_pinned_tests {
         });
         let subagent = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent, cx)));
         subagent.update(cx, |t, _| {
-            assert!(t.pinned_refs().is_empty(), "subagent must start with empty pinned");
+            assert!(
+                t.pinned_refs().is_empty(),
+                "subagent must start with empty pinned"
+            );
         });
     }
 
@@ -10378,19 +10433,19 @@ mod st2_pinned_tests {
             // And by identity:
             let pinned_pos = t.pinned_message_indices()[0];
             match &t.messages[pinned_pos] {
-                Message::Resume(id) => assert_eq!(
-                    *id, r2,
-                    "Resume pin must still target original r2, not r3"
-                ),
+                Message::Resume(id) => {
+                    assert_eq!(*id, r2, "Resume pin must still target original r2, not r3")
+                }
                 other => panic!("expected Resume marker at pinned pos, got {other:?}"),
             }
 
             // gc_pinned must NOT drop the live pin.
             t.gc_pinned();
             assert_eq!(t.pinned_refs().len(), 1);
-            assert!(t
-                .is_pinned(&PinnedMessageKey::Resume(r2))
-                .contains(&PinReason::Resume));
+            assert!(
+                t.is_pinned(&PinnedMessageKey::Resume(r2))
+                    .contains(&PinReason::Resume)
+            );
         });
     }
 
@@ -10420,12 +10475,14 @@ mod st2_pinned_tests {
             t.on_plan_event_emitted(cx);
         });
         thread.update(cx, |t, _| {
-            assert!(t
-                .is_pinned(&PinnedMessageKey::Agent(agent_id_2))
-                .contains(&PinReason::PlanUpdate));
-            assert!(!t
-                .is_pinned(&PinnedMessageKey::Agent(agent_id_1))
-                .contains(&PinReason::PlanUpdate));
+            assert!(
+                t.is_pinned(&PinnedMessageKey::Agent(agent_id_2))
+                    .contains(&PinReason::PlanUpdate)
+            );
+            assert!(
+                !t.is_pinned(&PinnedMessageKey::Agent(agent_id_1))
+                    .contains(&PinReason::PlanUpdate)
+            );
         });
     }
 
@@ -10443,10 +10500,11 @@ mod st2_pinned_tests {
                 cx,
             );
             t.on_plan_event_emitted(cx);
-            assert!(t
-                .pinned_refs()
-                .iter()
-                .all(|p| p.reason != PinReason::PlanUpdate));
+            assert!(
+                t.pinned_refs()
+                    .iter()
+                    .all(|p| p.reason != PinReason::PlanUpdate)
+            );
         });
     }
 
@@ -10482,13 +10540,15 @@ mod st2_pinned_tests {
         });
         thread.update(cx, |t, _| {
             // Pin must land on the pending (current-turn) message.
-            assert!(t
-                .is_pinned(&PinnedMessageKey::Agent(pending_agent_id))
-                .contains(&PinReason::PlanUpdate));
+            assert!(
+                t.is_pinned(&PinnedMessageKey::Agent(pending_agent_id))
+                    .contains(&PinReason::PlanUpdate)
+            );
             // And NOT on the historical agent.
-            assert!(!t
-                .is_pinned(&PinnedMessageKey::Agent(historical_agent_id))
-                .contains(&PinReason::PlanUpdate));
+            assert!(
+                !t.is_pinned(&PinnedMessageKey::Agent(historical_agent_id))
+                    .contains(&PinReason::PlanUpdate)
+            );
         });
     }
 
@@ -10528,15 +10588,18 @@ mod st2_pinned_tests {
             t.on_plan_event_emitted(cx);
         });
         thread.update(cx, |t, _| {
-            assert!(t
-                .is_pinned(&PinnedMessageKey::Agent(agent_3))
-                .contains(&PinReason::PlanUpdate));
-            assert!(!t
-                .is_pinned(&PinnedMessageKey::Agent(agent_2))
-                .contains(&PinReason::PlanUpdate));
-            assert!(!t
-                .is_pinned(&PinnedMessageKey::Agent(agent_0))
-                .contains(&PinReason::PlanUpdate));
+            assert!(
+                t.is_pinned(&PinnedMessageKey::Agent(agent_3))
+                    .contains(&PinReason::PlanUpdate)
+            );
+            assert!(
+                !t.is_pinned(&PinnedMessageKey::Agent(agent_2))
+                    .contains(&PinReason::PlanUpdate)
+            );
+            assert!(
+                !t.is_pinned(&PinnedMessageKey::Agent(agent_0))
+                    .contains(&PinReason::PlanUpdate)
+            );
         });
     }
 
@@ -10567,9 +10630,10 @@ mod st2_pinned_tests {
                 PinnedMessageKey::Agent(stale_agent_id),
                 PinReason::PlanUpdate,
             );
-            assert!(t
-                .is_pinned(&PinnedMessageKey::Agent(stale_agent_id))
-                .contains(&PinReason::PlanUpdate));
+            assert!(
+                t.is_pinned(&PinnedMessageKey::Agent(stale_agent_id))
+                    .contains(&PinReason::PlanUpdate)
+            );
 
             // New turn: only a User message, no agent reply yet, no pending.
             t.push_acp_user_block(
@@ -10584,14 +10648,16 @@ mod st2_pinned_tests {
         });
         thread.update(cx, |t, _| {
             // Stale pin must have been proactively removed.
-            assert!(!t
-                .is_pinned(&PinnedMessageKey::Agent(stale_agent_id))
-                .contains(&PinReason::PlanUpdate));
+            assert!(
+                !t.is_pinned(&PinnedMessageKey::Agent(stale_agent_id))
+                    .contains(&PinReason::PlanUpdate)
+            );
             // No PlanUpdate pin anywhere.
-            assert!(t
-                .pinned_refs()
-                .iter()
-                .all(|p| p.reason != PinReason::PlanUpdate));
+            assert!(
+                t.pinned_refs()
+                    .iter()
+                    .all(|p| p.reason != PinReason::PlanUpdate)
+            );
         });
     }
 
@@ -10606,10 +10672,11 @@ mod st2_pinned_tests {
             let pins_before = t.pinned_refs().len();
             t.on_plan_event_emitted(cx);
             assert_eq!(t.pinned_refs().len(), pins_before);
-            assert!(t
-                .pinned_refs()
-                .iter()
-                .all(|p| p.reason != PinReason::PlanUpdate));
+            assert!(
+                t.pinned_refs()
+                    .iter()
+                    .all(|p| p.reason != PinReason::PlanUpdate)
+            );
         });
     }
 
@@ -10641,9 +10708,10 @@ mod st2_pinned_tests {
                 .filter(|p| p.reason == PinReason::ScopeExpansionActive)
                 .count();
             assert_eq!(count, 1);
-            assert!(t
-                .is_pinned(&PinnedMessageKey::User(id2))
-                .contains(&PinReason::ScopeExpansionActive));
+            assert!(
+                t.is_pinned(&PinnedMessageKey::User(id2))
+                    .contains(&PinReason::ScopeExpansionActive)
+            );
         });
     }
 
@@ -10679,7 +10747,11 @@ mod st2_pinned_tests {
                 .iter()
                 .map(|p| (format!("{:?}", p.key), p.reason))
                 .collect();
-            assert_eq!(set.len(), pinned.len(), "uniqueness violated for seed {seed}");
+            assert_eq!(
+                set.len(),
+                pinned.len(),
+                "uniqueness violated for seed {seed}"
+            );
         }
     }
 
@@ -10783,8 +10855,8 @@ mod st2_pinned_tests {
                 }
             ]
         });
-        let parsed: DbThread = serde_json::from_value(base)
-            .expect("DbThread with unknown pin key must parse");
+        let parsed: DbThread =
+            serde_json::from_value(base).expect("DbThread with unknown pin key must parse");
         assert_eq!(
             parsed.pinned.len(),
             1,
@@ -10809,14 +10881,20 @@ mod st2_pinned_tests {
             );
             t.pin_at(k.clone(), PinReason::Manual, fixed_now());
         });
-        let db = cx
-            .update(|cx| thread.read(cx).to_db(cx))
-            .await;
+        let db = cx.update(|cx| thread.read(cx).to_db(cx)).await;
         // The pushed user message also auto-pins as FirstUser, so we
         // expect 2 pins (Manual + FirstUser) — not orphaned.
         assert_eq!(db.pinned.len(), 2);
-        assert!(db.pinned.iter().any(|p| p.key == k && p.reason == PinReason::Manual));
-        assert!(db.pinned.iter().any(|p| p.key == k && p.reason == PinReason::FirstUser));
+        assert!(
+            db.pinned
+                .iter()
+                .any(|p| p.key == k && p.reason == PinReason::Manual)
+        );
+        assert!(
+            db.pinned
+                .iter()
+                .any(|p| p.key == k && p.reason == PinReason::FirstUser)
+        );
     }
 
     #[gpui::test]
@@ -10831,9 +10909,7 @@ mod st2_pinned_tests {
             let orphan = PinnedMessageKey::User(UserMessageId::new());
             t.pin_at(orphan, PinReason::Manual, fixed_now());
         });
-        let db = cx
-            .update(|cx| thread.read(cx).to_db(cx))
-            .await;
+        let db = cx.update(|cx| thread.read(cx).to_db(cx)).await;
         assert!(
             db.pinned.is_empty(),
             "to_db must filter orphaned pins; got {:?}",
@@ -10892,9 +10968,7 @@ mod st2_pinned_tests {
     #[gpui::test]
     async fn t_empty_pinned_round_trip(cx: &mut TestAppContext) {
         let (thread, _ev) = setup_thread_for_test(cx).await;
-        let db = cx
-            .update(|cx| thread.read(cx).to_db(cx))
-            .await;
+        let db = cx.update(|cx| thread.read(cx).to_db(cx)).await;
         assert!(db.pinned.is_empty());
     }
 }
