@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use client::{Client, UserStore};
 use codestral::{CodestralEditPredictionDelegate, load_codestral_api_key};
 use collections::HashMap;

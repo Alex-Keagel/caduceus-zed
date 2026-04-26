@@ -460,7 +460,7 @@ pub fn execute_run(
     let startup_time = Instant::now();
     let app = gpui_platform::headless();
     let pid = std::process::id();
-    let id = pid.to_string();
+    let _id = pid.to_string();
     // CADUCEUS: crashes crate removed
     // crashes::init(
     //     crashes::InitCrashHandler {
@@ -716,7 +716,7 @@ pub(crate) fn execute_proxy(
 
     let server_paths = ServerPaths::new(&identifier)?;
 
-    let id = std::process::id().to_string();
+    let _id = std::process::id().to_string();
     // CADUCEUS: crashes crate removed
     // crashes::init(
     //     crashes::InitCrashHandler {

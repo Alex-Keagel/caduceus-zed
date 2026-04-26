@@ -117,7 +117,7 @@ impl CaduceusArchitectTool {
 
         // Add API nodes
         for api in &registry.apis {
-            let api_node = Self::sanitize_mermaid_id(&api.name.replace('/', "_").replace('.', "_"));
+            let api_node = Self::sanitize_mermaid_id(&api.name.replace(['/', '.'], "_"));
             let label = Self::sanitize_mermaid_label(&format!(
                 "{} ({})",
                 api.title.as_deref().unwrap_or(&api.name),

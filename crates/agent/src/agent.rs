@@ -1,7 +1,7 @@
 mod caduceus_native_state;
-pub mod dag_diversity;
 mod caduceus_provider_adapter;
 mod caduceus_tool_adapter;
+pub mod dag_diversity;
 mod db;
 mod edit_agent;
 mod legacy_thread;
@@ -298,9 +298,7 @@ impl NativeAgent {
                 let pending: Vec<_> = this
                     .sessions
                     .values_mut()
-                    .map(|s| {
-                        std::mem::replace(&mut s.pending_save, gpui::Task::ready(Ok(())))
-                    })
+                    .map(|s| std::mem::replace(&mut s.pending_save, gpui::Task::ready(Ok(()))))
                     .collect();
                 async move {
                     log::info!(
@@ -532,7 +530,7 @@ impl NativeAgent {
         // Caduceus: auto-index project on open and populate wiki
         if let Some(engine) = caduceus_engine {
             let project_for_index = project.clone();
-            let engine_clone = engine.clone();
+            let engine_clone = engine;
             cx.spawn(async move |_this, cx| {
                 let project_root = cx.update(|cx| {
                     project_for_index
@@ -1054,10 +1052,13 @@ impl NativeAgent {
                 )),
             ),
             acp::AvailableCommand::new("index", "Index project for semantic search"),
-            acp::AvailableCommand::new("pull", "Pull another thread into this conversation by session id")
-                .input(acp::AvailableCommandInput::Unstructured(
-                    acp::UnstructuredCommandInput::new("<session_id>"),
-                )),
+            acp::AvailableCommand::new(
+                "pull",
+                "Pull another thread into this conversation by session id",
+            )
+            .input(acp::AvailableCommandInput::Unstructured(
+                acp::UnstructuredCommandInput::new("<session_id>"),
+            )),
             acp::AvailableCommand::new(
                 "init",
                 "Create a new project directory under ~/Dev and bind it as the workspace",
@@ -1576,7 +1577,7 @@ impl NativeAgentConnection {
                     let pin_count = t.list_pins().len();
 
                     dashboard.push_str("### 🧠 Session\n");
-                    dashboard.push_str(&format!("| Metric | Value |\n|--------|-------|\n"));
+                    dashboard.push_str("| Metric | Value |\n|--------|-------|\n");
                     dashboard.push_str(&format!("| Mode | **{}** |\n", mode.to_uppercase()));
                     dashboard.push_str(&format!("| Messages | {} |\n", msg_count));
                     dashboard.push_str(&format!("| Context | {:.0}% — **{}** |\n", fill_pct, zone.label()));
@@ -1713,7 +1714,7 @@ impl NativeAgentConnection {
                 } else if let Some(thread) = self.thread(session_id, cx) {
                     let engine = thread.read(cx).project().read(cx).worktrees(cx).next()
                         .map(|wt| caduceus_bridge::engine::CaduceusEngine::new(wt.read(cx).abs_path().to_path_buf()));
-                    if let Some(engine) = engine {
+                    if let Some(_engine) = engine {
                         // Run search synchronously for slash command (async would need different pattern)
                         format!("🔍 Use `caduceus_semantic_search` tool with query: \"{}\"\n\
                                  The agent will search your indexed codebase.", query)
@@ -1869,7 +1870,8 @@ impl NativeAgentConnection {
             return Self::push_init_response(
                 self,
                 &session_id,
-                "❌ Usage: `/init <name>` — creates `~/Dev/<name>` and binds it as the workspace.".to_string(),
+                "❌ Usage: `/init <name>` — creates `~/Dev/<name>` and binds it as the workspace."
+                    .to_string(),
                 cx,
             );
         }
@@ -1913,10 +1915,7 @@ impl NativeAgentConnection {
             return Self::push_init_response(
                 self,
                 &session_id,
-                format!(
-                    "❌ Could not create `{}`: {err}",
-                    target.display()
-                ),
+                format!("❌ Could not create `{}`: {err}", target.display()),
                 cx,
             );
         }
@@ -1941,7 +1940,6 @@ impl NativeAgentConnection {
             );
         };
         let project = project_state.project.clone();
-        drop(inner);
 
         let target_for_msg = target.clone();
         cx.spawn(async move |cx| {
@@ -2829,10 +2827,12 @@ impl NativeThreadEnvironment {
             // ST7: surface a typed SubAgentFailure so spawn_agent_tool can
             // classify via downcast instead of string-matching the
             // anyhow message.
-            return Err(anyhow!(caduceus_core::SubAgentFailure::RecursionLimitExceeded {
-                current_depth,
-                max_depth: MAX_SUBAGENT_DEPTH,
-            }));
+            return Err(anyhow!(
+                caduceus_core::SubAgentFailure::RecursionLimitExceeded {
+                    current_depth,
+                    max_depth: MAX_SUBAGENT_DEPTH,
+                }
+            ));
         }
 
         let label = opts.label.clone();
@@ -3206,8 +3206,7 @@ impl SubagentHandle for NativeSubagentHandle {
         // them to ST8 vendor-rerouting (no more `ClassifyContext::empty()`).
         let t = self.subagent_thread.read(cx);
         let model = t.model();
-        let provider =
-            model.map(|m| caduceus_core::ProviderId::new(m.provider_id().0.as_ref()));
+        let provider = model.map(|m| caduceus_core::ProviderId::new(m.provider_id().0.as_ref()));
         let model_id = model.map(|m| caduceus_core::ModelId::new(m.id().0.as_ref()));
         caduceus_core::ClassifyContext::new(provider, model_id)
     }

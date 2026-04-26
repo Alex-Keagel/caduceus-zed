@@ -73,11 +73,7 @@ pub fn family_of(model_id: &str) -> String {
 /// `exclude` is matched as a literal model id and removed from the candidate
 /// pool — typically the master's own model so that the suggested fan-out is
 /// disjoint from the master.
-pub fn assign_diverse_models(
-    n: usize,
-    exclude: Option<&str>,
-    cx: &App,
-) -> Vec<DiverseModel> {
+pub fn assign_diverse_models(n: usize, exclude: Option<&str>, cx: &App) -> Vec<DiverseModel> {
     if n == 0 {
         return Vec::new();
     }
@@ -93,11 +89,14 @@ pub fn assign_diverse_models(
         }
         let provider_id = model.provider_id().0.to_string();
         let family = family_of(&id);
-        by_family.entry(family.clone()).or_default().push(DiverseModel {
-            model_id: id,
-            provider_id,
-            family,
-        });
+        by_family
+            .entry(family.clone())
+            .or_default()
+            .push(DiverseModel {
+                model_id: id,
+                provider_id,
+                family,
+            });
     }
 
     // Within each family, sort by id descending so newer-looking ids win

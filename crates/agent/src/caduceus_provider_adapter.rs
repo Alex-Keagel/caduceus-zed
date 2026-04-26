@@ -54,9 +54,10 @@ use futures::{
 };
 use language_model::{
     CompletionIntent as LmIntent, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelImage, LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
-    LanguageModelToolChoice, LanguageModelToolResult, LanguageModelToolResultContent,
-    LanguageModelToolUse, MessageContent, Role, StopReason as LmStopReason,
+    LanguageModelImage, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelRequestTool, LanguageModelToolChoice, LanguageModelToolResult,
+    LanguageModelToolResultContent, LanguageModelToolUse, MessageContent, Role,
+    StopReason as LmStopReason,
 };
 use std::sync::Arc;
 use std::task::{Context as TaskCtx, Poll};
@@ -210,6 +211,7 @@ pub const DISPATCH_CHANNEL_BOUND: usize = 64;
 /// by the caller via `call_stream`. Currently `call_stream` is a
 /// closure because the adapter can't reach into `AsyncApp` itself;
 /// callers inject it.
+#[allow(dead_code)]
 pub fn spawn_dispatcher<Spawn, Fut, CallStream>(
     spawn_fn: Spawn,
     call_stream: CallStream,
@@ -242,6 +244,7 @@ where
     DispatcherHandle { tx }
 }
 
+#[allow(dead_code)]
 async fn drive_dispatcher<CallStream>(
     mut rx: mpsc::Receiver<DispatchRequest>,
     call_stream: Arc<CallStream>,
@@ -343,7 +346,6 @@ pub(crate) fn translate_chat_request(req: &ChatRequest) -> LanguageModelRequest 
         thinking_allowed: req.thinking_mode,
         thinking_effort: req.thinking_effort.clone(),
         speed: req.speed.map(map_caduceus_speed_to_zed),
-        ..Default::default()
     }
 }
 
@@ -484,6 +486,7 @@ pub(crate) fn translate_stop_reason(s: LmStopReason) -> StopReason {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn translate_tool_use(lm: &LanguageModelToolUse) -> ToolUse {
     ToolUse {
         id: lm.id.to_string(),
@@ -1207,9 +1210,7 @@ mod tests {
             content: String::new(),
             content_blocks: None,
             tool_calls: vec![],
-            tool_result: Some(
-                CoreToolResult::success("hello").with_tool_use_id("call_42"),
-            ),
+            tool_result: Some(CoreToolResult::success("hello").with_tool_use_id("call_42")),
             cache_breakpoint: false,
         };
         let req = mk_req(vec![asst, tool_result_msg]);

@@ -6977,9 +6977,7 @@ async fn test_caduceus_c5_token_cache_invalidates_on_send(cx: &mut TestAppContex
 /// threads sat at zone Green while the banner was red and auto-compact
 /// silently no-op'd.
 #[gpui::test]
-async fn test_context_zone_uses_provider_token_usage_not_local_estimate(
-    cx: &mut TestAppContext,
-) {
+async fn test_context_zone_uses_provider_token_usage_not_local_estimate(cx: &mut TestAppContext) {
     use language_model::TokenUsage as LmTokenUsage;
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
     let fake_model = model.as_fake();
@@ -6998,14 +6996,14 @@ async fn test_context_zone_uses_provider_token_usage_not_local_estimate(
     // number large enough relative to whatever default the fake exposes).
     let max = thread.read_with(cx, |t, _| t.model_max_tokens_for_test());
     let provider_used = (max as u64).saturating_mul(90).saturating_div(100);
-    fake_model.send_last_completion_stream_event(
-        LanguageModelCompletionEvent::UsageUpdate(LmTokenUsage {
+    fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::UsageUpdate(
+        LmTokenUsage {
             input_tokens: provider_used,
             output_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
-        }),
-    );
+        },
+    ));
     fake_model
         .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::EndTurn));
     fake_model.end_last_completion_stream();

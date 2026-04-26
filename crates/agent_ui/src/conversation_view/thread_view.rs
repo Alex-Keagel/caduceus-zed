@@ -8,7 +8,6 @@ use std::time::Instant;
 use acp_thread::{ContentBlock, PlanEntry};
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
 use editor::actions::OpenExcerpts;
-use feature_flags::AcpBetaFeatureFlag;
 
 use crate::message_editor::SharedSessionCapabilities;
 
@@ -3576,13 +3575,20 @@ impl ThreadView {
                 this.update(cx, |this, cx| {
                     this._guardrail_dismiss_task = None;
                     cx.notify();
-                }).ok();
+                })
+                .ok();
             }));
         }
 
         let (bg_color, border_color) = match severity {
-            agent::AlertSeverity::Error => (cx.theme().status().error.opacity(0.1), cx.theme().status().error.opacity(0.4)),
-            agent::AlertSeverity::Warning => (cx.theme().status().warning.opacity(0.1), cx.theme().status().warning.opacity(0.4)),
+            agent::AlertSeverity::Error => (
+                cx.theme().status().error.opacity(0.1),
+                cx.theme().status().error.opacity(0.4),
+            ),
+            agent::AlertSeverity::Warning => (
+                cx.theme().status().warning.opacity(0.1),
+                cx.theme().status().warning.opacity(0.4),
+            ),
         };
 
         let label_color = match severity {
@@ -3697,7 +3703,11 @@ impl ThreadView {
                 if cnt == 0 {
                     (None, "No checkpoints".to_string())
                 } else {
-                    let tip = format!("📌 {} checkpoints: {}\nUse /checkpoint to manage", cnt, entries.join(", "));
+                    let tip = format!(
+                        "📌 {} checkpoints: {}\nUse /checkpoint to manage",
+                        cnt,
+                        entries.join(", ")
+                    );
                     (Some(cnt), tip)
                 }
             } else {
@@ -3710,7 +3720,9 @@ impl ThreadView {
         };
 
         let count = count?;
-        let tooltip = self.checkpoint_tooltip_cache.clone()
+        let tooltip = self
+            .checkpoint_tooltip_cache
+            .clone()
             .unwrap_or_else(|| format!("📌 {} checkpoints", count));
 
         Some(

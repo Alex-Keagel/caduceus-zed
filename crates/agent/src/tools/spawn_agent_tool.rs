@@ -295,8 +295,7 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
                 o.insert(
                     "session_id".into(),
                     match session_id {
-                        Some(sid) => serde_json::to_value(sid)
-                            .unwrap_or(serde_json::Value::Null),
+                        Some(sid) => serde_json::to_value(sid).unwrap_or(serde_json::Value::Null),
                         None => serde_json::Value::Null,
                     },
                 );
@@ -308,9 +307,7 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
                     o.insert("failure_details".into(), fd);
                 }
                 serde_json::to_string(&serde_json::Value::Object(o))
-                    .unwrap_or_else(|e| {
-                        format!("Failed to serialize spawn_agent output: {e}")
-                    })
+                    .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
                     .into()
             }
         }
@@ -353,6 +350,7 @@ impl AgentTool for SpawnAgentTool {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
@@ -377,9 +375,7 @@ impl AgentTool for SpawnAgentTool {
             let spawn_timeout = match validate_timeout(input.timeout_secs) {
                 Ok(d) => d,
                 Err(failure) => {
-                    return Err(SpawnAgentToolOutput::from_failure(
-                        None, &failure, None,
-                    ));
+                    return Err(SpawnAgentToolOutput::from_failure(None, &failure, None));
                 }
             };
 
@@ -454,8 +450,9 @@ impl AgentTool for SpawnAgentTool {
             // clock entirely, leaving elapsed_secs ≈ 0 in
             // mock-clock timeout tests (reviewer must-fix #4).
             let started_at = cx.background_executor().now();
-            let phase_state: Arc<std::sync::Mutex<(SubAgentPhase, bool)>> =
-                Arc::new(std::sync::Mutex::new((SubAgentPhase::ModelSelection, false)));
+            let phase_state: Arc<std::sync::Mutex<(SubAgentPhase, bool)>> = Arc::new(
+                std::sync::Mutex::new((SubAgentPhase::ModelSelection, false)),
+            );
 
             // Drop guard: when this task is dropped (timeout / completion / cancel),
             // the receiver is dropped, the pump's `recv()` returns `Closed`, and
@@ -691,8 +688,14 @@ mod tests {
             other => panic!("expected text, got {other:?}"),
         };
         let v: serde_json::Value = serde_json::from_str(&s).expect("must parse");
-        assert!(v.get("session_id").is_some(), "session_id key must be present");
-        assert!(v["session_id"].is_null(), "session_id must be null when None");
+        assert!(
+            v.get("session_id").is_some(),
+            "session_id key must be present"
+        );
+        assert!(
+            v["session_id"].is_null(),
+            "session_id must be null when None"
+        );
         assert!(v.get("error").is_some(), "error must be present");
         assert_eq!(v["failure_type"], "Timeout");
         assert_eq!(v["failure_details"]["elapsed_secs"], 901);
@@ -754,18 +757,39 @@ mod tests {
         use anyhow::anyhow;
         let err = anyhow!("User canceled");
         assert!(matches!(
-            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ModelSelection, false, Some(0), Some(900)),
+            classify_subagent_error(
+                &err,
+                &caduceus_core::ClassifyContext::empty(),
+                SubAgentPhase::ModelSelection,
+                false,
+                Some(0),
+                Some(900)
+            ),
             SubAgentFailure::UserCancel
         ));
 
         let err = anyhow!("The agent refused to process that prompt. Try again.");
         assert!(matches!(
-            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900)),
+            classify_subagent_error(
+                &err,
+                &caduceus_core::ClassifyContext::empty(),
+                SubAgentPhase::ProviderCall,
+                false,
+                Some(0),
+                Some(900)
+            ),
             SubAgentFailure::ModelRefusal { .. }
         ));
 
         let err = anyhow!("synthetic random failure");
-        let f = classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::Unknown, false, Some(0), Some(900));
+        let f = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::Unknown,
+            false,
+            Some(0),
+            Some(900),
+        );
         match f {
             SubAgentFailure::InternalError { kind, .. } => {
                 assert_eq!(kind, "subagent_send_failed");
@@ -782,7 +806,14 @@ mod tests {
         p.http_status = Some(429);
         let typed = SubAgentFailure::ProviderError(p);
         let err = anyhow::Error::new(typed.clone());
-        let out = classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900));
+        let out = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        );
         match out {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_after_secs, Some(30));
@@ -808,10 +839,14 @@ mod tests {
         };
         let out = SpawnAgentToolOutput::from_failure(None, &failure, None);
         match &out {
-            SpawnAgentToolOutput::Error { error, failure_type, failure_details, .. } => {
+            SpawnAgentToolOutput::Error {
+                error,
+                failure_type,
+                failure_details,
+                ..
+            } => {
                 assert_eq!(
-                    error,
-                    "The agent refused to process that prompt. Try again.",
+                    error, "The agent refused to process that prompt. Try again.",
                     "legacy error field must be the bare refusal text (no 'model refusal: ' prefix)"
                 );
                 assert_eq!(failure_type.as_deref(), Some("ModelRefusal"));
@@ -831,7 +866,10 @@ mod tests {
             _ => panic!(),
         };
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["error"], "The agent refused to process that prompt. Try again.");
+        assert_eq!(
+            v["error"],
+            "The agent refused to process that prompt. Try again."
+        );
         assert_eq!(v["failure_type"], "ModelRefusal");
     }
 
@@ -841,7 +879,10 @@ mod tests {
         // as the error field — there's no pre-ST7 substring contract for
         // those (they didn't exist).
         let failure = SubAgentFailure::Timeout(TimeoutFailure::new(
-            901, 900, SubAgentPhase::ToolExecution, true,
+            901,
+            900,
+            SubAgentPhase::ToolExecution,
+            true,
         ));
         let out = SpawnAgentToolOutput::from_failure(None, &failure, None);
         match out {
@@ -864,8 +905,14 @@ mod tests {
             max_depth: 4,
         };
         let err = anyhow::Error::new(typed);
-        let out =
-            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ModelSelection, false, Some(0), Some(900));
+        let out = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::ModelSelection,
+            false,
+            Some(0),
+            Some(900),
+        );
         match out {
             SubAgentFailure::RecursionLimitExceeded {
                 current_depth,
@@ -889,8 +936,14 @@ mod tests {
         // forcing any future regression to be visible (different kind
         // string) instead of papered over.
         let err = anyhow::anyhow!("Maximum subagent depth (4) reached");
-        let out =
-            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ModelSelection, false, Some(0), Some(900));
+        let out = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::ModelSelection,
+            false,
+            Some(0),
+            Some(900),
+        );
         match out {
             SubAgentFailure::InternalError { kind, .. } => {
                 assert_eq!(
@@ -919,15 +972,10 @@ mod tests {
         let model = ModelId::new("claude-opus-4.7");
         let ctx = ClassifyContext::new(Some(provider.clone()), Some(model.clone()));
 
-        let err = CaduceusError::RateLimited { retry_after_secs: 30 };
-        match classify_caduceus_error(
-            &err,
-            &ctx,
-            SubAgentPhase::Unknown,
-            false,
-            None,
-            None,
-        ) {
+        let err = CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        };
+        match classify_caduceus_error(&err, &ctx, SubAgentPhase::Unknown, false, None, None) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(
                     p.provider,
@@ -953,10 +1001,11 @@ mod tests {
         // fields unpopulated — so a future regression that silently
         // injects fake values would be caught.
         use caduceus_core::{
-            CaduceusError, ClassifyContext, SubAgentFailure, SubAgentPhase,
-            classify_caduceus_error,
+            CaduceusError, ClassifyContext, SubAgentFailure, SubAgentPhase, classify_caduceus_error,
         };
-        let err = CaduceusError::RateLimited { retry_after_secs: 30 };
+        let err = CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        };
         match classify_caduceus_error(
             &err,
             &ClassifyContext::empty(),
@@ -985,8 +1034,14 @@ mod tests {
         let err = anyhow::Error::new(CaduceusError::RateLimited {
             retry_after_secs: 30,
         });
-        let out =
-            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900));
+        let out = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        );
         match out {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
@@ -1005,8 +1060,14 @@ mod tests {
             limit_ms: 5000,
             context: "chat".into(),
         });
-        let out =
-            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900));
+        let out = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        );
         match out {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
@@ -1019,8 +1080,14 @@ mod tests {
     fn classify_subagent_error_downcasts_caduceus_cancelled_to_user_cancel() {
         use caduceus_core::CaduceusError;
         let err = anyhow::Error::new(CaduceusError::Cancelled);
-        let out =
-            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900));
+        let out = classify_subagent_error(
+            &err,
+            &caduceus_core::ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        );
         assert!(matches!(out, SubAgentFailure::UserCancel));
     }
 
@@ -1030,7 +1097,9 @@ mod tests {
     #[test]
     fn classify_subagent_error_populated_context_surfaces_provider_and_model() {
         use caduceus_core::{CaduceusError, ClassifyContext, ModelId, ProviderId};
-        let err = anyhow::Error::new(CaduceusError::RateLimited { retry_after_secs: 30 });
+        let err = anyhow::Error::new(CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        });
         let ctx = ClassifyContext::new(
             Some(ProviderId::new("anthropic")),
             Some(ModelId::new("claude-opus-4.7")),
@@ -1169,8 +1238,8 @@ mod tests {
     fn phase_transitions_from_real_agent_event_variants() {
         use caduceus_core::{AgentEvent, ToolCallId};
         // ModelSelection -> ProviderCall on first ThinkingStarted
-        let p = SubAgentPhase::ModelSelection
-            .next_phase(&AgentEvent::ThinkingStarted { iteration: 0 });
+        let p =
+            SubAgentPhase::ModelSelection.next_phase(&AgentEvent::ThinkingStarted { iteration: 0 });
         assert_eq!(p, SubAgentPhase::ProviderCall);
         // ProviderCall -> ToolExecution on ToolCallStart
         let p = SubAgentPhase::ProviderCall.next_phase(&AgentEvent::ToolCallStart {
@@ -1194,14 +1263,14 @@ mod tests {
         let state = std::sync::Mutex::new((SubAgentPhase::ModelSelection, false));
 
         // Provider event flips ModelSelection -> ProviderCall, no tools.
-        apply_event_to_phase_state(
-            &state,
-            &AgentEvent::ThinkingStarted { iteration: 0 },
-        );
+        apply_event_to_phase_state(&state, &AgentEvent::ThinkingStarted { iteration: 0 });
         {
             let g = state.lock().unwrap();
             assert_eq!(g.0, SubAgentPhase::ProviderCall);
-            assert!(!g.1, "tools_started must stay false before any ToolCallStart");
+            assert!(
+                !g.1,
+                "tools_started must stay false before any ToolCallStart"
+            );
         }
 
         // ToolCallStart: phase -> ToolExecution AND tools_started=true.
@@ -1354,7 +1423,9 @@ mod tests {
                     // executor's mock clock is the only thing that can
                     // advance us — and the spawn-side select_biased!
                     // races this against the spawn timeout.
-                    executor.timer(Duration::from_secs(10 * 365 * 24 * 3600)).await;
+                    executor
+                        .timer(Duration::from_secs(10 * 365 * 24 * 3600))
+                        .await;
                     unreachable!("the spawn timeout must fire first")
                 })
             }
