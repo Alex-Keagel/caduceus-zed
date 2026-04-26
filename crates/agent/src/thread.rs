@@ -9320,3 +9320,599 @@ mod native_tool_lifecycle_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod st2_pinned_tests {
+    //! ST2 pinned-message tests. Plan v3.1 §8.
+    //!
+    //! API-level (no gpui): pin/unpin/replace/gc/coalesce semantics, key
+    //! identity, Resume index resolution, persistence proxy round-trip,
+    //! forward-compat quarantine.
+    //!
+    //! Trigger-level (gpui): FirstUser auto-pin via `push_acp_user_block`;
+    //! Resume auto-pin via direct `auto_pin_resume` after pushing a Resume
+    //! marker; PlanUpdate via `on_plan_event_emitted`; ScopeExpansionActive
+    //! via `on_scope_expansion_requested`. (Native-loop wiring is exercised
+    //! in `caduceus_native_loop_tests`; here we test the Thread-side hook.)
+    use super::*;
+    use chrono::TimeZone;
+    use futures::channel::mpsc;
+    use gpui::TestAppContext;
+    use project::Project;
+
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 26, 12, 0, 0).unwrap()
+    }
+
+    fn user_key() -> PinnedMessageKey {
+        PinnedMessageKey::User(UserMessageId::new())
+    }
+
+    fn resume_key(idx: u32) -> PinnedMessageKey {
+        PinnedMessageKey::Resume(ResumeIndex(idx))
+    }
+
+    async fn setup_thread_for_test(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Thread>, ThreadEventStream) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        let templates = Templates::new();
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        cx.update(|cx| {
+            let project_context = cx.new(|_cx| prompt_store::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| ContextServerRegistry::new(context_server_store, cx));
+
+            let thread = cx.new(|cx| {
+                Thread::new(
+                    project,
+                    project_context,
+                    context_server_registry,
+                    templates,
+                    None,
+                    cx,
+                )
+            });
+
+            let (event_tx, _event_rx) = mpsc::unbounded();
+            let event_stream = ThreadEventStream(event_tx);
+
+            (thread, event_stream)
+        })
+    }
+
+    // ─── API-level: pin / unpin / is_pinned ───────────────────────
+
+    #[gpui::test]
+    async fn t_pin_idempotent_same_reason(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let k = user_key();
+            assert!(t.pin_at(k.clone(), PinReason::Manual, fixed_now()));
+            assert!(!t.pin_at(k.clone(), PinReason::Manual, fixed_now()));
+            assert_eq!(t.pinned_refs().len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn t_pin_allows_multiple_reasons_per_key(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let k = user_key();
+            assert!(t.pin_at(k.clone(), PinReason::FirstUser, fixed_now()));
+            assert!(t.pin_at(k.clone(), PinReason::Manual, fixed_now()));
+            let reasons = t.is_pinned(&k);
+            assert_eq!(reasons.len(), 2);
+            assert!(reasons.contains(&PinReason::FirstUser));
+            assert!(reasons.contains(&PinReason::Manual));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_is_pinned_returns_all_reasons(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let k = user_key();
+            t.pin_at(k.clone(), PinReason::FirstUser, fixed_now());
+            t.pin_at(k.clone(), PinReason::PlanUpdate, fixed_now());
+            t.pin_at(k.clone(), PinReason::Manual, fixed_now());
+            assert_eq!(t.is_pinned(&k).len(), 3);
+            assert!(t.is_pinned(&user_key()).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn t_unpin_removes_all_reasons_for_key(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let k = user_key();
+            t.pin_at(k.clone(), PinReason::FirstUser, fixed_now());
+            t.pin_at(k.clone(), PinReason::PlanUpdate, fixed_now());
+            assert_eq!(t.unpin(&k), 2);
+            assert!(t.is_pinned(&k).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn t_unpin_reason_removes_only_that_reason(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let k = user_key();
+            t.pin_at(k.clone(), PinReason::FirstUser, fixed_now());
+            t.pin_at(k.clone(), PinReason::Manual, fixed_now());
+            assert!(t.unpin_reason(&k, PinReason::Manual));
+            assert_eq!(t.is_pinned(&k), vec![PinReason::FirstUser]);
+            assert!(!t.unpin_reason(&k, PinReason::Manual));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_unpin_nonexistent_is_noop(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            assert_eq!(t.unpin(&user_key()), 0);
+            assert!(!t.unpin_reason(&user_key(), PinReason::Manual));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_pinned_refs_insertion_order(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let a = user_key();
+            let b = user_key();
+            let c = user_key();
+            t.pin_at(a.clone(), PinReason::FirstUser, fixed_now());
+            t.pin_at(b.clone(), PinReason::Manual, fixed_now());
+            t.pin_at(c.clone(), PinReason::PlanUpdate, fixed_now());
+            let keys: Vec<&PinnedMessageKey> =
+                t.pinned_refs().iter().map(|p| &p.key).collect();
+            assert_eq!(keys, vec![&a, &b, &c]);
+        });
+    }
+
+    // ─── pin_replace (singleton-by-reason) ────────────────────────
+
+    #[gpui::test]
+    async fn t_pin_replace_supersedes_old(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let a = user_key();
+            let b = user_key();
+            t.pin_at(a.clone(), PinReason::ScopeExpansionActive, fixed_now());
+            let prev = t.pin_replace(b.clone(), PinReason::ScopeExpansionActive);
+            assert_eq!(prev, Some(a));
+            // exactly one ScopeExpansionActive pin remains, on `b`.
+            let count = t
+                .pinned_refs()
+                .iter()
+                .filter(|p| p.reason == PinReason::ScopeExpansionActive)
+                .count();
+            assert_eq!(count, 1);
+            assert_eq!(t.is_pinned(&b), vec![PinReason::ScopeExpansionActive]);
+        });
+    }
+
+    // ─── Resume cap + coalescing ──────────────────────────────────
+
+    #[gpui::test]
+    async fn t_resume_pin_cap_3(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            for i in 1..=5u32 {
+                t.pin_at(resume_key(i), PinReason::Resume, fixed_now());
+            }
+            let resume_keys: Vec<u32> = t
+                .pinned_refs()
+                .iter()
+                .filter_map(|p| match (&p.key, p.reason) {
+                    (PinnedMessageKey::Resume(r), PinReason::Resume) => Some(r.0),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(resume_keys.len(), MAX_RESUME_PINS);
+            // newest 3 retained
+            assert_eq!(resume_keys, vec![3, 4, 5]);
+        });
+    }
+
+    // ─── gc_pinned ────────────────────────────────────────────────
+
+    #[gpui::test]
+    async fn t_gc_drops_orphans_keeps_live(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            // live user message
+            let live_id = UserMessageId::new();
+            t.messages.push(Message::User(UserMessage {
+                id: live_id.clone(),
+                content: vec![],
+            }));
+            // orphan user pin
+            let orphan = UserMessageId::new();
+            t.pin_at(
+                PinnedMessageKey::User(live_id.clone()),
+                PinReason::Manual,
+                fixed_now(),
+            );
+            t.pin_at(
+                PinnedMessageKey::User(orphan),
+                PinReason::Manual,
+                fixed_now(),
+            );
+            // orphan resume pin (idx 5, but no resumes yet)
+            t.pin_at(resume_key(5), PinReason::Resume, fixed_now());
+            assert_eq!(t.pinned_refs().len(), 3);
+            t.gc_pinned();
+            assert_eq!(t.pinned_refs().len(), 1);
+            assert!(t
+                .is_pinned(&PinnedMessageKey::User(live_id))
+                .contains(&PinReason::Manual));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_gc_after_full_truncate_empties_pinned(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            t.pin_at(user_key(), PinReason::Manual, fixed_now());
+            t.pin_at(resume_key(1), PinReason::Resume, fixed_now());
+            // messages stays empty -> all pins orphan
+            t.gc_pinned();
+            assert!(t.pinned_refs().is_empty());
+        });
+    }
+
+    // ─── pinned_message_indices / resolve_key ─────────────────────
+
+    #[gpui::test]
+    async fn t_pinned_message_indices_returns_positions(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let id_a = UserMessageId::new();
+            let id_b = UserMessageId::new();
+            t.messages.push(Message::User(UserMessage {
+                id: id_a.clone(),
+                content: vec![],
+            }));
+            t.messages.push(Message::Resume);
+            t.messages.push(Message::User(UserMessage {
+                id: id_b.clone(),
+                content: vec![],
+            }));
+            t.messages.push(Message::Resume);
+            t.pin_at(
+                PinnedMessageKey::User(id_a),
+                PinReason::FirstUser,
+                fixed_now(),
+            );
+            t.pin_at(resume_key(2), PinReason::Resume, fixed_now());
+            t.pin_at(
+                PinnedMessageKey::User(id_b),
+                PinReason::Manual,
+                fixed_now(),
+            );
+            let indices = t.pinned_message_indices();
+            assert_eq!(indices, vec![0, 3, 2]);
+        });
+    }
+
+    #[gpui::test]
+    async fn t_resume_index_stable_across_user_message_edits(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            t.messages.push(Message::Resume); // resume #1 at idx 0
+            t.pin_at(resume_key(1), PinReason::Resume, fixed_now());
+            assert_eq!(t.pinned_message_indices(), vec![0]);
+
+            // inserting/removing user messages around the resume marker
+            // does not invalidate the resume_index pin.
+            t.messages.insert(
+                0,
+                Message::User(UserMessage {
+                    id: UserMessageId::new(),
+                    content: vec![],
+                }),
+            );
+            assert_eq!(t.pinned_message_indices(), vec![1]);
+        });
+    }
+
+    // ─── clear_inherited_pins / subagent invariant ────────────────
+
+    #[gpui::test]
+    async fn t_clear_inherited_pins(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            t.pin_at(user_key(), PinReason::Manual, fixed_now());
+            t.pin_at(user_key(), PinReason::Manual, fixed_now());
+            t.clear_inherited_pins();
+            assert!(t.pinned_refs().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn t_subagent_constructor_initializes_empty_pinned(cx: &mut TestAppContext) {
+        let (parent, _ev) = setup_thread_for_test(cx).await;
+        parent.update(cx, |t, _| {
+            t.pin_at(user_key(), PinReason::Manual, fixed_now());
+            assert_eq!(t.pinned_refs().len(), 1);
+        });
+        let subagent = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent, cx)));
+        subagent.update(cx, |t, _| {
+            assert!(t.pinned_refs().is_empty(), "subagent must start with empty pinned");
+        });
+    }
+
+    // ─── trigger sites ────────────────────────────────────────────
+
+    #[gpui::test]
+    async fn t_first_user_auto_pinned_via_acp_block(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let id = UserMessageId::new();
+        thread.update(cx, |t, cx| {
+            t.push_acp_user_block(
+                id.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+        });
+        thread.update(cx, |t, _| {
+            assert_eq!(
+                t.is_pinned(&PinnedMessageKey::User(id)),
+                vec![PinReason::FirstUser]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn t_first_user_not_repinned_on_second_user_message(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let id1 = UserMessageId::new();
+        let id2 = UserMessageId::new();
+        thread.update(cx, |t, cx| {
+            t.push_acp_user_block(
+                id1.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.push_acp_user_block(
+                id2.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+        });
+        thread.update(cx, |t, _| {
+            assert_eq!(
+                t.is_pinned(&PinnedMessageKey::User(id1)),
+                vec![PinReason::FirstUser]
+            );
+            assert!(t.is_pinned(&PinnedMessageKey::User(id2)).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn t_resume_auto_pin_assigns_correct_index(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            t.messages.push(Message::Resume);
+            t.auto_pin_resume();
+            assert_eq!(t.is_pinned(&resume_key(1)), vec![PinReason::Resume]);
+
+            t.messages.push(Message::Resume);
+            t.auto_pin_resume();
+            let resume_pins: Vec<u32> = t
+                .pinned_refs()
+                .iter()
+                .filter_map(|p| match (&p.key, p.reason) {
+                    (PinnedMessageKey::Resume(r), PinReason::Resume) => Some(r.0),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(resume_pins, vec![1, 2]);
+        });
+    }
+
+    #[gpui::test]
+    async fn t_plan_update_pins_most_recent_user_message(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let id1 = UserMessageId::new();
+        let id2 = UserMessageId::new();
+        thread.update(cx, |t, cx| {
+            t.push_acp_user_block(
+                id1.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.push_acp_user_block(
+                id2.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.on_plan_event_emitted(cx);
+        });
+        thread.update(cx, |t, _| {
+            assert!(t
+                .is_pinned(&PinnedMessageKey::User(id2))
+                .contains(&PinReason::PlanUpdate));
+            assert!(!t
+                .is_pinned(&PinnedMessageKey::User(id1))
+                .contains(&PinReason::PlanUpdate));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_plan_update_with_no_user_message_drops(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, cx| {
+            t.on_plan_event_emitted(cx);
+            assert!(t
+                .pinned_refs()
+                .iter()
+                .all(|p| p.reason != PinReason::PlanUpdate));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_scope_expansion_pin_replace_supersedes(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let id1 = UserMessageId::new();
+        let id2 = UserMessageId::new();
+        thread.update(cx, |t, cx| {
+            t.push_acp_user_block(
+                id1,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.on_scope_expansion_requested();
+            t.push_acp_user_block(
+                id2.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.on_scope_expansion_requested();
+        });
+        thread.update(cx, |t, _| {
+            let count = t
+                .pinned_refs()
+                .iter()
+                .filter(|p| p.reason == PinReason::ScopeExpansionActive)
+                .count();
+            assert_eq!(count, 1);
+            assert!(t
+                .is_pinned(&PinnedMessageKey::User(id2))
+                .contains(&PinReason::ScopeExpansionActive));
+        });
+    }
+
+    // ─── persistence: round-trip + forward-compat ─────────────────
+
+    #[test]
+    fn t_pin_uniqueness_invariant_50_iter() {
+        // Property check: 50 random sequences of pin/unpin maintain
+        // uniqueness on (key, reason).
+        use std::collections::HashSet;
+        for seed in 0..50u32 {
+            let mut pinned: Vec<MessageRef> = Vec::new();
+            // synthesize a sequence
+            let keys: Vec<PinnedMessageKey> = (0..5).map(|_| user_key()).collect();
+            let reasons = [
+                PinReason::FirstUser,
+                PinReason::Manual,
+                PinReason::PlanUpdate,
+            ];
+            for i in 0..20 {
+                let k = keys[((seed as usize + i) * 7) % keys.len()].clone();
+                let r = reasons[(i + seed as usize) % reasons.len()];
+                let dup = pinned.iter().any(|p| p.key == k && p.reason == r);
+                if !dup {
+                    pinned.push(MessageRef {
+                        key: k,
+                        reason: r,
+                        pinned_at: fixed_now(),
+                    });
+                }
+            }
+            let set: HashSet<(String, PinReason)> = pinned
+                .iter()
+                .map(|p| (format!("{:?}", p.key), p.reason))
+                .collect();
+            assert_eq!(set.len(), pinned.len(), "uniqueness violated for seed {seed}");
+        }
+    }
+
+    #[test]
+    fn t_message_ref_serde_round_trip() {
+        let r = MessageRef {
+            key: user_key(),
+            reason: PinReason::FirstUser,
+            pinned_at: fixed_now(),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: MessageRef = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn t_legacy_db_thread_without_pinned_field_defaults_empty() {
+        // Simulate a v1 DbThread JSON missing the `pinned` field.
+        // Only the three required fields are supplied; everything else
+        // (including `pinned`) must default.
+        let json = serde_json::json!({
+            "title": "x",
+            "messages": [],
+            "updated_at": fixed_now(),
+        });
+        let parsed: DbThread =
+            serde_json::from_value(json).expect("legacy DbThread must deserialize");
+        assert!(parsed.pinned.is_empty());
+    }
+
+    #[test]
+    fn t_unknown_pin_reason_is_quarantined() {
+        // Build a DbThread JSON with one valid + one Unknown variant pin.
+        let base = serde_json::json!({
+            "title": "x",
+            "messages": [],
+            "updated_at": fixed_now(),
+            "pinned": [
+                {
+                    "key": { "User": "00000000-0000-0000-0000-000000000001" },
+                    "reason": "Manual",
+                    "pinned_at": "2026-04-26T12:00:00Z"
+                },
+                {
+                    "key": { "User": "00000000-0000-0000-0000-000000000002" },
+                    "reason": "FromTheFuture",
+                    "pinned_at": "2026-04-26T12:00:00Z"
+                }
+            ]
+        });
+        let parsed: DbThread =
+            serde_json::from_value(base).expect("DbThread with unknown pin reason must parse");
+        assert_eq!(
+            parsed.pinned.len(),
+            1,
+            "Unknown reason variant must be quarantined; only Manual pin retained"
+        );
+        assert_eq!(parsed.pinned[0].reason, PinReason::Manual);
+    }
+
+    #[gpui::test]
+    async fn t_to_db_round_trips_pinned(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let k = user_key();
+        thread.update(cx, |t, _| {
+            t.pin_at(k.clone(), PinReason::Manual, fixed_now());
+        });
+        let db = cx
+            .update(|cx| thread.read(cx).to_db(cx))
+            .await;
+        assert_eq!(db.pinned.len(), 1);
+        assert_eq!(db.pinned[0].key, k);
+        assert_eq!(db.pinned[0].reason, PinReason::Manual);
+    }
+
+    #[gpui::test]
+    async fn t_empty_pinned_round_trip(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let db = cx
+            .update(|cx| thread.read(cx).to_db(cx))
+            .await;
+        assert!(db.pinned.is_empty());
+    }
+}

@@ -251,6 +251,7 @@ mod tests {
             thinking_enabled: false,
             thinking_effort: None,
             draft_prompt: None,
+            pinned: Vec::new(),
             ui_scroll_position: None,
         }
     }
