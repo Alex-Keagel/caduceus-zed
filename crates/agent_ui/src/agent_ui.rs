@@ -773,6 +773,7 @@ mod tests {
             new_thread_location: Default::default(),
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
+            caduceus_native_loop: false,
         };
 
         cx.update(|cx| {
