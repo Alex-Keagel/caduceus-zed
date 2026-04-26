@@ -2040,43 +2040,15 @@ impl Thread {
 
     pub fn to_db(&self, cx: &App) -> Task<DbThread> {
         let initial_project_snapshot = self.initial_project_snapshot.clone();
-        // ST2 fix-loop #6: filter orphaned pins inline. `to_db` takes
-        // `&self`, so we cannot call `gc_pinned()` here (which requires
-        // `&mut self`). Apply the same retain predicate as gc_pinned so
-        // persisted state is never polluted by dangling pins, even if
-        // an upstream mutation path forgot to call gc_pinned.
-        let user_ids: HashSet<UserMessageId> = self
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                Message::User(u) => Some(u.id.clone()),
-                _ => None,
-            })
-            .collect();
-        let resume_ids: HashSet<ResumeId> = self
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                Message::Resume(rid) => Some(*rid),
-                _ => None,
-            })
-            .collect();
-        let agent_ids: HashSet<AgentMessageId> = self
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                Message::Agent(a) => Some(a.id),
-                _ => None,
-            })
-            .collect();
+        // ST2 fix-loop #6 / r3 cleanup #2: filter orphaned pins inline.
+        // `to_db` takes `&self`, so we cannot call `gc_pinned()` here
+        // (which requires `&mut self`). Share the live-key rule via
+        // `live_pin_keys` so the predicate has one definition.
+        let live = self.live_pin_keys();
         let pinned: Vec<MessageRef> = self
             .pinned
             .iter()
-            .filter(|p| match &p.key {
-                PinnedMessageKey::User(id) => user_ids.contains(id),
-                PinnedMessageKey::Resume(rid) => resume_ids.contains(rid),
-                PinnedMessageKey::Agent(aid) => agent_ids.contains(aid),
-            })
+            .filter(|p| live.contains(&p.key))
             .cloned()
             .collect();
         let mut thread = DbThread {
@@ -2491,40 +2463,28 @@ impl Thread {
     /// pins never drift) and from `truncate()` / `auto_compact_context_with_zone()`
     /// (mutation paths that drop messages).
     pub fn gc_pinned(&mut self) {
-        let user_ids: HashSet<UserMessageId> = self
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                Message::User(u) => Some(u.id.clone()),
-                _ => None,
-            })
-            .collect();
-        let resume_ids: HashSet<ResumeId> = self
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                Message::Resume(rid) => Some(*rid),
-                _ => None,
-            })
-            .collect();
-        let agent_ids: HashSet<AgentMessageId> = self
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                Message::Agent(a) => Some(a.id),
-                _ => None,
-            })
-            .collect();
+        let live = self.live_pin_keys();
         let before = self.pinned.len();
-        self.pinned.retain(|p| match &p.key {
-            PinnedMessageKey::User(id) => user_ids.contains(id),
-            PinnedMessageKey::Resume(rid) => resume_ids.contains(rid),
-            PinnedMessageKey::Agent(aid) => agent_ids.contains(aid),
-        });
+        self.pinned.retain(|p| live.contains(&p.key));
         let dropped = before - self.pinned.len();
         if dropped > 0 {
             log::debug!("[st2] gc_pinned dropped {} orphaned pin(s)", dropped);
         }
+    }
+
+    /// Set of every `PinnedMessageKey` whose underlying message currently
+    /// exists in `self.messages`. Shared between `gc_pinned` (mutation
+    /// path) and `to_db` (serialization path) so the "is this pin still
+    /// alive?" rule has exactly one definition. ST2 r3 cleanup #2.
+    fn live_pin_keys(&self) -> HashSet<PinnedMessageKey> {
+        self.messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => Some(PinnedMessageKey::User(u.id.clone())),
+                Message::Resume(rid) => Some(PinnedMessageKey::Resume(*rid)),
+                Message::Agent(a) => Some(PinnedMessageKey::Agent(a.id)),
+            })
+            .collect()
     }
 
     /// Empty the pinned list. Called when seeding a subagent context;
