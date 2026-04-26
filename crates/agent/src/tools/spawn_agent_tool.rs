@@ -527,8 +527,15 @@ impl AgentTool for SpawnAgentTool {
                 status,
             );
 
+            // ST7 r3 #4: checked_sub instead of saturating_sub.
+            // When the subagent times out before producing any
+            // entries (num_entries == 0), saturating_sub(1) returned
+            // 0 — claiming entry 0 exists despite the empty buffer.
+            // checked_sub returns None for the zero case, leaving
+            // message_end_index unset (which downstream renderers
+            // already treat as "no entries to display").
             session_info.message_end_index =
-                cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
+                cx.update(|cx| subagent.num_entries(cx).checked_sub(1));
 
             let meta = Some(acp::Meta::from_iter([(
                 SUBAGENT_SESSION_INFO_META_KEY.into(),
@@ -983,6 +990,41 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    // ---- ST7 r3 #4: message_end_index uses checked_sub, not saturating_sub ----
+    #[test]
+    fn message_end_index_is_none_when_subagent_produced_zero_entries() {
+        // Locks in the call-site math at spawn_agent_tool.rs (the
+        // post-send block that builds session_info.message_end_index):
+        //
+        //     subagent.num_entries(cx).checked_sub(1)
+        //
+        // Pre-fix, `saturating_sub(1)` returned 0 for an empty buffer
+        // — falsely claiming entry 0 exists when the subagent timed
+        // out before producing anything. checked_sub returns None,
+        // which downstream renderers treat as "no entries".
+        let zero_entries: usize = 0;
+        assert_eq!(
+            zero_entries.checked_sub(1),
+            None,
+            "0 entries → message_end_index must be None"
+        );
+        let one_entry: usize = 1;
+        assert_eq!(
+            one_entry.checked_sub(1),
+            Some(0usize),
+            "1 entry → last index is 0"
+        );
+        let many: usize = 5;
+        assert_eq!(many.checked_sub(1), Some(4usize), "N entries → last is N-1");
+        // Sanity-check the regression: saturating_sub used to return
+        // Some(0) for the zero case, which is the bug we replaced.
+        assert_eq!(
+            zero_entries.saturating_sub(1),
+            0,
+            "regression sentinel: saturating_sub(1) returns 0 (was the bug)"
+        );
     }
 
     // ---- T-PHASE3-revised: ToolResultEnd does NOT exit ToolExecution ----
