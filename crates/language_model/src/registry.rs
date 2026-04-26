@@ -425,6 +425,21 @@ impl LanguageModelRegistry {
     ) {
         match err {
             LanguageModelCompletionError::RateLimitExceeded { retry_after, .. } => {
+                // Round-3 fix-loop #3: `NotAuthenticated` is sticky vs 429.
+                // Without this guard, a 429 arriving after a 401 (e.g. retry
+                // logic hits a rate limit on the unauthenticated request)
+                // would silently overwrite the cached `NotAuthenticated` with
+                // `RateLimited`, hiding the real "user must re-auth" signal
+                // behind a transient rate-limit UI for up to MAX_RETRY_AFTER
+                // / HEADERLESS_RATE_LIMIT_TTL.
+                {
+                    let cache = self.auth_cache.borrow();
+                    if let Some(existing) = cache.get(id)
+                        && matches!(existing.state, ProviderAuthState::NotAuthenticated { .. })
+                    {
+                        return;
+                    }
+                }
                 // fix-loop #7: hand the raw `retry_after` to `rate_limited()`;
                 // that constructor is the sole emitter of the over-cap
                 // `log::warn!`. The clamp on the `deadline` line below derives
