@@ -2274,17 +2274,20 @@ impl Thread {
         &self.pinned
     }
 
-    /// Resolve every pin to a position in `self.messages`. Used by ST3
-    /// compaction protection. Pins whose underlying message no longer
-    /// exists are skipped (see `gc_pinned` for permanent cleanup).
+    /// Returns sorted unique message positions. A message pinned for
+    /// multiple reasons appears once. Used by ST3 compaction-protection
+    /// budget calculation — the **set** semantics are part of that
+    /// contract: pinned-token budget must not double-count a multi-reason
+    /// pin. Pins whose underlying message no longer exists are skipped
+    /// (see `gc_pinned` for permanent cleanup).
     pub fn pinned_message_indices(&self) -> Vec<usize> {
-        let mut out = Vec::with_capacity(self.pinned.len());
+        let mut set: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for p in &self.pinned {
             if let Some(idx) = self.resolve_key_to_index(&p.key) {
-                out.push(idx);
+                set.insert(idx);
             }
         }
-        out
+        Vec::from_iter(set)
     }
 
     /// Drop pins whose underlying message no longer exists in `self.messages`.
@@ -9600,7 +9603,37 @@ mod st2_pinned_tests {
                 fixed_now(),
             );
             let indices = t.pinned_message_indices();
-            assert_eq!(indices, vec![0, 3, 2]);
+            assert_eq!(indices, vec![0, 2, 3]);
+        });
+    }
+
+    #[gpui::test]
+    async fn t_pinned_message_indices_deduplicates_multi_reason(cx: &mut TestAppContext) {
+        // ST2 fix-loop #1 (reviewer Correctness 3/4): a message pinned
+        // for multiple reasons must appear ONCE in the indices set.
+        // Plan v3.1 §5: pins are keyed by (key, reason); the budget
+        // calculation in ST3 must not double-count.
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let id = UserMessageId::new();
+            t.messages.push(Message::User(UserMessage {
+                id: id.clone(),
+                content: vec![],
+            }));
+            t.pin_at(
+                PinnedMessageKey::User(id.clone()),
+                PinReason::Manual,
+                fixed_now(),
+            );
+            t.pin_at(
+                PinnedMessageKey::User(id.clone()),
+                PinReason::FirstUser,
+                fixed_now(),
+            );
+            // Two pins on the same key — but only one index entry.
+            assert_eq!(t.pinned_refs().len(), 2);
+            let indices = t.pinned_message_indices();
+            assert_eq!(indices, vec![0]);
         });
     }
 
