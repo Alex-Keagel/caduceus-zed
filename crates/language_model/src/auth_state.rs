@@ -1,0 +1,442 @@
+//! `ProviderAuthState` and supporting types — ST1a (`caduceus-fix/st1-provider-auth-state`).
+//!
+//! Replaces the single boolean `LanguageModelProvider::is_authenticated()` with a 4-variant
+//! enum that distinguishes (a) never signed in, (b) rate-limited, (c) policy-disabled, and
+//! (d) authenticated. ST1a only delivers the data model + non-UI call-site migration; the
+//! selector redesign + click→action dispatcher land in ST1b.
+//!
+//! Security caveats (per plan v3.1 §B4):
+//!
+//! * **S1**: `RateLimited::retry_after` is clamped to `MAX_RETRY_AFTER` (24h) at construction
+//!   to prevent a malicious / buggy upstream from advertising a 1-year retry-after.
+//! * **S2**: `AuthAction::OpenUrl` only accepts a [`SafeUrl`], which rejects any scheme that
+//!   isn't `https://`. No `file://`, `javascript:`, or `data:` urls reach the dispatcher.
+//! * **S3**: `sanitize_provider_reason` is provided for callers that embed an upstream error
+//!   message into `DisabledByPolicy::reason`. It strips control characters, redacts common
+//!   token patterns (Bearer, sk-, gho_, ya29.), and truncates to 256 chars.
+
+use std::time::Duration;
+
+/// Cap on `RateLimited::retry_after` (24 hours). A server-supplied retry-after greater than
+/// this is silently clamped + logged; see `ProviderAuthState::rate_limited`.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 3600);
+
+/// Maximum length (in bytes) of a sanitized `DisabledByPolicy::reason` string.
+pub const MAX_REASON_LEN: usize = 256;
+
+/// The auth state of a [`LanguageModelProvider`](crate::LanguageModelProvider).
+///
+/// ST1a's central type. Replaces the single boolean `is_authenticated()` returned by every
+/// provider today. Each non-`Authenticated` variant carries enough information for the UI
+/// (in ST1b) to render an actionable affordance instead of silently hiding the provider.
+#[derive(Clone, Debug)]
+pub enum ProviderAuthState {
+    /// Provider is signed in and can serve completion requests.
+    Authenticated,
+    /// Provider has no usable credentials. `action` is the remediation the dispatcher
+    /// (ST1b) should take when the user clicks the row.
+    NotAuthenticated { action: AuthAction },
+    /// Provider returned HTTP 429 (or equivalent). `retry_after` is the server-supplied
+    /// duration, clamped to [`MAX_RETRY_AFTER`].
+    RateLimited {
+        retry_after: Option<Duration>,
+        action: AuthAction,
+    },
+    /// Provider is disabled by org/admin policy. `reason` is sanitized at construction so
+    /// it's safe to render verbatim in a tooltip.
+    DisabledByPolicy { reason: String },
+}
+
+impl ProviderAuthState {
+    /// Construct a `RateLimited` state, applying the S1 cap (24h) to the `retry_after`.
+    /// If the server-supplied value exceeds the cap, it's clamped and logged at WARN.
+    pub fn rate_limited(retry_after: Option<Duration>, action: AuthAction) -> Self {
+        let retry_after = retry_after.map(|d| {
+            if d > MAX_RETRY_AFTER {
+                log::warn!(
+                    "provider sent retry_after={:?}, clamping to MAX_RETRY_AFTER={:?}",
+                    d,
+                    MAX_RETRY_AFTER
+                );
+                MAX_RETRY_AFTER
+            } else {
+                d
+            }
+        });
+        Self::RateLimited {
+            retry_after,
+            action,
+        }
+    }
+
+    /// Construct a `DisabledByPolicy` state, sanitizing `reason` per S3.
+    pub fn disabled_by_policy(reason: impl Into<String>) -> Self {
+        Self::DisabledByPolicy {
+            reason: sanitize_provider_reason(&reason.into()),
+        }
+    }
+
+    /// True iff the provider can serve a completion request right now. This is the
+    /// "usability" predicate the deprecated `is_authenticated()` shim defers to.
+    pub fn can_provide_models(&self) -> bool {
+        matches!(self, Self::Authenticated)
+    }
+
+    /// True iff the provider is configured (has credentials). Rate-limited providers ARE
+    /// configured — they should not be shown an onboarding upsell. Disabled-by-policy is
+    /// NOT configured (admin would need to flip a flag).
+    pub fn is_configured(&self) -> bool {
+        matches!(self, Self::Authenticated | Self::RateLimited { .. })
+    }
+
+    /// Stable string discriminant for telemetry. Exactly four values, no PII.
+    pub fn telemetry_discriminant(&self) -> &'static str {
+        match self {
+            Self::Authenticated => "authenticated",
+            Self::NotAuthenticated { .. } => "not_authenticated",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::DisabledByPolicy { .. } => "disabled_by_policy",
+        }
+    }
+}
+
+/// What the UI should do when the user clicks/activates a non-`Authenticated` row.
+///
+/// ST1a only stores the discriminant; the dispatcher mapping `AuthAction` → real work
+/// (open browser, focus settings page, invoke `copilot_ui::initiate_sign_in`) lives in
+/// ST1b. ST1a guarantees the variants are populated correctly by every provider.
+#[derive(Clone, Debug)]
+pub enum AuthAction {
+    /// Provider has an in-process imperative sign-in flow that the dispatcher must
+    /// look up by provider id (e.g. Copilot's device-flow via
+    /// `copilot_ui::initiate_sign_in(Entity<Copilot>, &mut Window, &mut App)`).
+    /// We can't store a closure here because the trait method takes `&App`, not
+    /// `&mut App` + `&mut Window`. The dispatcher resolves the call by id.
+    SignInImperative,
+    /// Provider needs the user to enter an API key in Settings (anthropic / openai /
+    /// google / mistral / etc.).
+    EnterApiKeyInSettings,
+    /// Open an https url (docs, status page). The constructor enforces `scheme == https`.
+    OpenUrl(SafeUrl),
+    /// Rate-limited or policy-disabled — no user action is meaningful right now.
+    None,
+}
+
+/// New-type wrapper around a URL string. `SafeUrl::https` is the only constructor and it
+/// rejects any scheme other than `https`. Closes S2 (`file://`, `javascript:`, `data:`,
+/// `http://` cannot be embedded in an `AuthAction::OpenUrl`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafeUrl(String);
+
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum UnsafeUrlError {
+    #[error("url must use https:// scheme; got {0}")]
+    NonHttpsScheme(String),
+    #[error("url is empty")]
+    Empty,
+}
+
+impl SafeUrl {
+    /// Returns `Ok(SafeUrl)` iff `url` parses as `https://...`. We do a lightweight
+    /// scheme check rather than pulling in the `url` crate, which is not currently a
+    /// dependency of `language_model`. Validation is intentionally strict: lowercase
+    /// `https://` prefix, non-empty authority.
+    pub fn https(url: impl Into<String>) -> std::result::Result<Self, UnsafeUrlError> {
+        let url = url.into();
+        if url.is_empty() {
+            return Err(UnsafeUrlError::Empty);
+        }
+        let lower = url.to_ascii_lowercase();
+        if !lower.starts_with("https://") {
+            // Extract the would-be scheme for the error message. Cap to avoid logging
+            // very long or attacker-controlled prefixes.
+            let scheme: String = url.chars().take_while(|c| *c != ':').take(32).collect();
+            return Err(UnsafeUrlError::NonHttpsScheme(scheme));
+        }
+        // Reject `https://` with no authority (e.g. `https://`).
+        if url.len() <= "https://".len() {
+            return Err(UnsafeUrlError::Empty);
+        }
+        Ok(Self(url))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Sanitize a free-form provider error message before storing it in
+/// `DisabledByPolicy::reason` (S3). Three steps:
+///
+/// 1. Strip ASCII control characters (preserving spaces).
+/// 2. Redact tokens matching `Bearer\s+\S+`, `sk-[A-Za-z0-9_-]+`, `gho_[A-Za-z0-9]+`,
+///    `ya29\.[A-Za-z0-9_\-]+` with `<redacted>`.
+/// 3. Truncate to [`MAX_REASON_LEN`] bytes (UTF-8 safe).
+pub fn sanitize_provider_reason(input: &str) -> String {
+    // Step 1: drop control chars (keep tab & space).
+    let mut out: String = input
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\t' || *c == ' ')
+        .collect();
+
+    // Step 2: redact token-like substrings. We avoid pulling in the `regex` crate by
+    // doing a hand-rolled scan; performance is irrelevant (called rarely on errors).
+    out = redact_tokens(&out);
+
+    // Step 3: byte-truncate to MAX_REASON_LEN, snapping to a UTF-8 char boundary.
+    if out.len() > MAX_REASON_LEN {
+        let mut end = MAX_REASON_LEN;
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out.push_str("…");
+    }
+    out
+}
+
+/// Hand-rolled token redactor. Replaces matches of:
+///
+/// * `Bearer ` followed by non-whitespace
+/// * `sk-` followed by `[A-Za-z0-9_-]+`
+/// * `gho_` followed by `[A-Za-z0-9]+`
+/// * `ya29.` followed by `[A-Za-z0-9_-]+`
+///
+/// with the literal `<redacted>`.
+fn redact_tokens(s: &str) -> String {
+    const PLACEHOLDER: &str = "<redacted>";
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Try each prefix at the current byte position.
+        let rest = &s[i..];
+        let lower_rest_starts_with_bearer = rest
+            .get(..7)
+            .map(|p| p.eq_ignore_ascii_case("Bearer "))
+            .unwrap_or(false);
+        let starts_sk = rest.starts_with("sk-");
+        let starts_gho = rest.starts_with("gho_");
+        let starts_ya29 = rest.starts_with("ya29.");
+
+        if lower_rest_starts_with_bearer {
+            // "Bearer " + non-whitespace
+            let after = i + 7;
+            let token_end = bytes[after..]
+                .iter()
+                .position(|b| b.is_ascii_whitespace())
+                .map(|n| after + n)
+                .unwrap_or(bytes.len());
+            if token_end > after {
+                out.push_str(PLACEHOLDER);
+                i = token_end;
+                continue;
+            }
+        } else if starts_sk || starts_gho || starts_ya29 {
+            let prefix_len = if starts_sk {
+                3
+            } else if starts_gho {
+                4
+            } else {
+                5
+            };
+            let after = i + prefix_len;
+            let token_end = bytes[after..]
+                .iter()
+                .position(|&b| !is_token_char(b))
+                .map(|n| after + n)
+                .unwrap_or(bytes.len());
+            if token_end - after >= 4 {
+                // require at least 4 token chars to qualify
+                out.push_str(PLACEHOLDER);
+                i = token_end;
+                continue;
+            }
+        }
+
+        // No match at this position — copy one char.
+        let ch_len = utf8_char_len(bytes[i]);
+        out.push_str(&s[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+fn is_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.'
+}
+
+fn utf8_char_len(first_byte: u8) -> usize {
+    match first_byte {
+        b if b < 0x80 => 1,
+        b if b < 0xC0 => 1, // continuation byte (shouldn't be at boundary, but defensive)
+        b if b < 0xE0 => 2,
+        b if b < 0xF0 => 3,
+        _ => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T1: AC2 — can_provide_models truth table.
+    #[test]
+    fn auth_state_can_provide_models_truth_table() {
+        assert!(ProviderAuthState::Authenticated.can_provide_models());
+        assert!(!ProviderAuthState::NotAuthenticated {
+            action: AuthAction::None
+        }
+        .can_provide_models());
+        assert!(
+            !ProviderAuthState::rate_limited(Some(Duration::from_secs(10)), AuthAction::None)
+                .can_provide_models()
+        );
+        assert!(
+            !ProviderAuthState::disabled_by_policy("policy").can_provide_models()
+        );
+    }
+
+    // T1b: is_configured — Authenticated and RateLimited are configured; others not.
+    #[test]
+    fn auth_state_is_configured_truth_table() {
+        assert!(ProviderAuthState::Authenticated.is_configured());
+        assert!(
+            ProviderAuthState::rate_limited(None, AuthAction::None).is_configured()
+        );
+        assert!(!ProviderAuthState::NotAuthenticated {
+            action: AuthAction::EnterApiKeyInSettings
+        }
+        .is_configured());
+        assert!(!ProviderAuthState::disabled_by_policy("p").is_configured());
+    }
+
+    // T3: AC6 — telemetry discriminant strings are exactly the 4 documented values.
+    #[test]
+    fn auth_state_telemetry_discriminant_strings() {
+        assert_eq!(
+            ProviderAuthState::Authenticated.telemetry_discriminant(),
+            "authenticated"
+        );
+        assert_eq!(
+            ProviderAuthState::NotAuthenticated {
+                action: AuthAction::None
+            }
+            .telemetry_discriminant(),
+            "not_authenticated"
+        );
+        assert_eq!(
+            ProviderAuthState::rate_limited(None, AuthAction::None).telemetry_discriminant(),
+            "rate_limited"
+        );
+        assert_eq!(
+            ProviderAuthState::disabled_by_policy("p").telemetry_discriminant(),
+            "disabled_by_policy"
+        );
+    }
+
+    // T4: AC-SEC1 — `retry_after` is clamped to `MAX_RETRY_AFTER`.
+    #[test]
+    fn rate_limited_clamps_to_max_retry_after() {
+        let huge = Duration::from_secs(365 * 24 * 3600);
+        let state = ProviderAuthState::rate_limited(Some(huge), AuthAction::None);
+        match state {
+            ProviderAuthState::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, Some(MAX_RETRY_AFTER));
+            }
+            other => panic!("expected RateLimited, got {:?}", other),
+        }
+
+        // Below the cap, the value passes through unmodified.
+        let small = Duration::from_secs(42);
+        let state = ProviderAuthState::rate_limited(Some(small), AuthAction::None);
+        match state {
+            ProviderAuthState::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, Some(small));
+            }
+            _ => unreachable!(),
+        }
+
+        // None passes through.
+        let state = ProviderAuthState::rate_limited(None, AuthAction::None);
+        match state {
+            ProviderAuthState::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, None);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // T5: AC-SEC2 — `SafeUrl::https` rejects every non-https scheme.
+    #[test]
+    fn safe_url_rejects_non_https() {
+        for bad in [
+            "http://example.com",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,<script>",
+            "ftp://example.com",
+            "",
+            "https://", // no authority
+            "  https://example.com",
+        ] {
+            assert!(
+                SafeUrl::https(bad).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+        assert!(SafeUrl::https("https://example.com").is_ok());
+        assert!(SafeUrl::https("https://example.com/foo?bar=1").is_ok());
+        // Case is preserved on the path; only the scheme check is case-insensitive.
+        assert!(SafeUrl::https("HTTPS://example.com").is_ok());
+    }
+
+    // T6: AC-SEC3 — sanitizer redacts tokens, strips control chars, caps length.
+    #[test]
+    fn disabled_reason_sanitizer_redacts_tokens_and_caps_length() {
+        // Bearer redaction (case-insensitive prefix).
+        let s = sanitize_provider_reason("auth header was Bearer abc.def.ghi end");
+        assert!(s.contains("<redacted>"), "got {s}");
+        assert!(!s.contains("abc.def.ghi"));
+
+        let s = sanitize_provider_reason("got key sk-1234567890ABC then fail");
+        assert!(s.contains("<redacted>"), "got {s}");
+        assert!(!s.contains("sk-1234567890ABC"));
+
+        let s = sanitize_provider_reason("token gho_ABCDEF1234 was rejected");
+        assert!(s.contains("<redacted>"));
+        assert!(!s.contains("gho_ABCDEF1234"));
+
+        let s = sanitize_provider_reason("creds ya29.A0ARr-foo_bar-baz failed");
+        assert!(s.contains("<redacted>"));
+        assert!(!s.contains("ya29.A0ARr-foo_bar-baz"));
+
+        // Control chars are stripped; tabs and spaces preserved.
+        let s = sanitize_provider_reason("a\x00b\x07c\td e");
+        assert_eq!(s, "abc\td e");
+
+        // Length cap with char-boundary safety.
+        let long: String = "x".repeat(MAX_REASON_LEN + 100);
+        let s = sanitize_provider_reason(&long);
+        // After truncation we append "…"; total bytes <= MAX_REASON_LEN + len("…").
+        assert!(s.ends_with("…"));
+        assert!(s.len() <= MAX_REASON_LEN + "…".len());
+
+        // Multibyte chars at the boundary do not panic.
+        let s: String = std::iter::repeat("é").take(MAX_REASON_LEN).collect();
+        let _ = sanitize_provider_reason(&s);
+    }
+
+    // Ensure that DisabledByPolicy::reason actually goes through the sanitizer.
+    #[test]
+    fn disabled_by_policy_constructor_sanitizes_reason() {
+        let s = ProviderAuthState::disabled_by_policy("Bearer abcdefghijk denied");
+        match s {
+            ProviderAuthState::DisabledByPolicy { reason } => {
+                assert!(reason.contains("<redacted>"), "got {reason}");
+                assert!(!reason.contains("abcdefghijk"));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
