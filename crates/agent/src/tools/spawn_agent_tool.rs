@@ -209,6 +209,17 @@ impl SpawnAgentToolOutput {
     /// populating `failure_type` and `failure_details` from the typed
     /// payload while preserving `error` as a human-readable string for
     /// backward compat.
+    ///
+    /// **Fix-loop #5 (legacy refusal compat):** for
+    /// [`SubAgentFailure::ModelRefusal`], the legacy `error` string is
+    /// the bare refusal text (matching pre-ST7 behavior:
+    /// `anyhow!("The agent refused...").to_string()`), NOT
+    /// `failure.to_string()` which prepends `"model refusal: "`. This
+    /// preserves byte-equivalence for any pre-ST7 consumer that
+    /// substring-matched the refusal sentence in the `error` field.
+    /// The typed discriminant (`failure_type=ModelRefusal` plus
+    /// `failure_details.refusal_text`) is the new canonical surface;
+    /// the legacy string is purely additive backward-compat.
     pub fn from_failure(
         session_id: Option<acp::SessionId>,
         failure: &SubAgentFailure,
@@ -218,9 +229,13 @@ impl SpawnAgentToolOutput {
         let failure_details = serde_json::to_value(failure)
             .ok()
             .and_then(|v| v.get("details").cloned());
+        let error = match failure {
+            SubAgentFailure::ModelRefusal { refusal_text } => refusal_text.clone(),
+            other => other.to_string(),
+        };
         SpawnAgentToolOutput::Error {
             session_id,
-            error: failure.to_string(),
+            error,
             failure_type,
             failure_details,
             session_info,
@@ -683,6 +698,66 @@ mod tests {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
             }
             other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    // ---- Fix-loop #5: ModelRefusal preserves bare refusal text in `error` ----
+    #[test]
+    fn from_failure_model_refusal_preserves_legacy_error_string() {
+        // Pre-ST7 consumer reading `error` field saw the bare refusal
+        // sentence (anyhow!("The agent refused to process that prompt. Try
+        // again.").to_string()). After ST7 the typed Display impl
+        // prepends "model refusal: ", which would silently break any
+        // substring-matching consumer. Compat shim in from_failure
+        // emits the bare refusal_text in `error` while still populating
+        // failure_type=ModelRefusal + failure_details.refusal_text for
+        // typed consumers.
+        let failure = SubAgentFailure::ModelRefusal {
+            refusal_text: "The agent refused to process that prompt. Try again.".into(),
+        };
+        let out = SpawnAgentToolOutput::from_failure(None, &failure, None);
+        match &out {
+            SpawnAgentToolOutput::Error { error, failure_type, failure_details, .. } => {
+                assert_eq!(
+                    error,
+                    "The agent refused to process that prompt. Try again.",
+                    "legacy error field must be the bare refusal text (no 'model refusal: ' prefix)"
+                );
+                assert_eq!(failure_type.as_deref(), Some("ModelRefusal"));
+                assert_eq!(
+                    failure_details.as_ref().unwrap()["refusal_text"],
+                    "The agent refused to process that prompt. Try again."
+                );
+            }
+            _ => panic!("expected Error variant"),
+        }
+
+        // Round-trip through LanguageModelToolResultContent: the JSON
+        // shape MUST contain the bare refusal string in `error`.
+        let content: LanguageModelToolResultContent = out.into();
+        let s: String = match content {
+            LanguageModelToolResultContent::Text(t) => t.to_string(),
+            _ => panic!(),
+        };
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error"], "The agent refused to process that prompt. Try again.");
+        assert_eq!(v["failure_type"], "ModelRefusal");
+    }
+
+    #[test]
+    fn from_failure_non_refusal_uses_display_string() {
+        // Non-refusal variants continue to use Display (failure.to_string())
+        // as the error field — there's no pre-ST7 substring contract for
+        // those (they didn't exist).
+        let failure = SubAgentFailure::Timeout(TimeoutFailure::new(
+            901, 900, SubAgentPhase::ToolExecution, true,
+        ));
+        let out = SpawnAgentToolOutput::from_failure(None, &failure, None);
+        match out {
+            SpawnAgentToolOutput::Error { error, .. } => {
+                assert!(error.starts_with("sub-agent timeout:"));
+            }
+            _ => panic!(),
         }
     }
 
