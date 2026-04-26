@@ -1698,6 +1698,17 @@ enum SinkChoice {
 enum EmitterChoice {
     None,
     AutoDefault,
+    /// ST7 r3 #1: reuse a pre-existing emitter that callers built
+    /// outside the harness builder. Used by zed's subagent path,
+    /// where `Thread::new_subagent` seeds the emitter at construction
+    /// time so `SubagentHandle::events()` can return a live receiver
+    /// BEFORE `prompt()` runs the harness builder. Without this
+    /// variant, `AutoDefault` would create a second emitter and the
+    /// pump (subscribed to the seeded one) would observe nothing.
+    ///
+    /// Caller is responsible for draining the mpsc rx that pairs with
+    /// the seeded emitter (otherwise emit() trips Closed).
+    Reuse(caduceus_orchestrator::AgentEventEmitter),
 }
 
 enum InjectorChoice {
@@ -1773,6 +1784,26 @@ impl<'a> HarnessBuilder<'a> {
         self
     }
 
+    /// ST7 r3 #1: reuse a pre-existing AgentEventEmitter rather than
+    /// having the builder mint a fresh one. Used by zed's subagent
+    /// path, where the emitter must be live BEFORE the harness is
+    /// built so spawn_agent_tool can attach its phase-tracking pump
+    /// at `subagent.events(cx)` time (otherwise the pump task never
+    /// starts, leaving last_phase pinned at ModelSelection through
+    /// every timeout — a silent telemetry regression).
+    ///
+    /// The returned BuiltHarness carries this same emitter in
+    /// `emitter` and leaves `event_rx` as None — caller must have
+    /// already arranged a drain on the mpsc receiver paired with the
+    /// seeded emitter at construction time.
+    pub fn with_emitter_reuse(
+        mut self,
+        emitter: caduceus_orchestrator::AgentEventEmitter,
+    ) -> Self {
+        self.emitter = EmitterChoice::Reuse(emitter);
+        self
+    }
+
     pub fn injector(mut self, injector: Arc<dyn ContextInjector>) -> Self {
         self.injector = InjectorChoice::Custom(injector);
         self
@@ -1834,6 +1865,15 @@ impl<'a> HarnessBuilder<'a> {
                 let em_for_subscribe = em.clone();
                 base = base.with_emitter(em);
                 (Some(rx), Some(replay), Some(em_for_subscribe))
+            }
+            EmitterChoice::Reuse(em) => {
+                // ST7 r3 #1: caller already drains the mpsc rx that
+                // pairs with this emitter — return None for event_rx
+                // so we don't double-drain.
+                let replay = ReplayHandle::new(em.clone());
+                let em_for_subscribe = em.clone();
+                base = base.with_emitter(em);
+                (None, Some(replay), Some(em_for_subscribe))
             }
         };
 

@@ -1375,6 +1375,33 @@ impl Thread {
             depth: parent_thread.read(cx).depth() + 1,
         });
         thread.inherit_parent_settings(parent_thread, cx);
+        // ST7 r3 #1: seed `caduceus.emitter` eagerly so that
+        // `subagent_event_subscriber()` can return a live receiver
+        // BEFORE `prompt()` builds the harness. Without this seed,
+        // `spawn_agent_tool::run()` calls `subagent.events(cx)` at
+        // line ~458 (before `subagent.send()` runs) and gets None,
+        // so the phase-tracking pump task never starts — leaving
+        // last_phase pinned at ModelSelection / tools_started=false
+        // through every timeout.
+        //
+        // The mpsc rx returned by `AgentEventEmitter::channel(...)`
+        // would otherwise let the channel close as soon as `prompt()`
+        // attaches the harness. Drain it on a background task whose
+        // lifetime equals the (cloneable) emitter — i.e. as long as
+        // *any* clone of the emitter exists, the rx stays alive and
+        // `try_send` never trips Closed. The drain task ends when the
+        // last emitter clone drops (parent invalidates, thread drops).
+        //
+        // The harness builder later reuses this seeded emitter via
+        // `with_emitter_reuse(em)` (see thread.rs:~3707) so events
+        // emitted by the harness reach the same broadcast fan-out
+        // the pump is subscribed to.
+        let (em, mut rx) = caduceus_orchestrator::AgentEventEmitter::channel(
+            caduceus_bridge::orchestrator::OrchestratorBridge::DEFAULT_EVENT_CHANNEL_BUFFER,
+        );
+        thread.caduceus.emitter = Some(em);
+        cx.background_spawn(async move { while rx.recv().await.is_some() {} })
+            .detach();
         thread
     }
 
@@ -3636,12 +3663,20 @@ impl Thread {
                 caduceus_core::ProviderId::new(setup.model.provider_id().0.as_ref());
             let provider = std::sync::Arc::new(ZedLlmAdapter::new(provider_id, disp_handle.clone()))
                 as std::sync::Arc<dyn caduceus_providers::LlmAdapter>;
-            let built = setup
+            // ST7 r3 #1: prefer the pre-seeded emitter (subagent path
+            // — Thread::new_subagent seeded it so spawn_agent_tool's
+            // events() pump can attach BEFORE prompt() runs). When no
+            // emitter is seeded (parent thread, first turn) the
+            // builder mints a fresh one as before.
+            let mut harness_builder = setup
                 .bridge
-                .harness(provider, tool_registry, setup.system_prompt.clone())
-                .with_emitter()
-                .with_reducer_sink()
-                .build();
+                .harness(provider, tool_registry, setup.system_prompt.clone());
+            harness_builder = if let Some(em) = setup.emitter.clone() {
+                harness_builder.with_emitter_reuse(em)
+            } else {
+                harness_builder.with_emitter()
+            };
+            let built = harness_builder.with_reducer_sink().build();
 
             // FU#5 / emitter-mpsc-leak fix: HarnessBuilder hands us
             // `built.event_rx` — the single-consumer mpsc `Receiver`
@@ -3704,7 +3739,12 @@ impl Thread {
 
             this.update(cx, |this, _| {
                 this.caduceus.harness = Some(harness_arc.clone());
-                this.caduceus.emitter = Some(emitter.clone());
+                // ST7 r3 #1: get_or_insert — preserve the seeded
+                // emitter (subagent path) so already-attached pump
+                // subscribers keep observing the same broadcast
+                // channel. For non-seeded parent threads, this falls
+                // back to populating from the harness output.
+                this.caduceus.emitter.get_or_insert_with(|| emitter.clone());
                 this.caduceus.dispatcher = Some(disp_handle.clone());
                 this.caduceus.approval_tx = Some(approval_tx.clone());
             })?;
