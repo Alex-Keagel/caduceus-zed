@@ -1192,7 +1192,7 @@ impl NativeAgent {
                 NativeAgentConnection::handle_thread_events(
                     events,
                     acp_thread.downgrade(),
-                    Some(thread.downgrade()),
+                    thread.downgrade(),
                     None,
                     None,
                     cx,
@@ -1371,7 +1371,7 @@ impl NativeAgent {
                 NativeAgentConnection::handle_thread_events(
                     response_stream,
                     acp_thread.downgrade(),
-                    Some(thread.downgrade()),
+                    thread.downgrade(),
                     None,
                     None,
                     cx,
@@ -2043,7 +2043,7 @@ impl NativeAgentConnection {
         Self::handle_thread_events(
             response_stream,
             acp_thread.downgrade(),
-            Some(thread.downgrade()),
+            thread.downgrade(),
             Some(abort_rx),
             Some(auth_tasks),
             cx,
@@ -2053,7 +2053,7 @@ impl NativeAgentConnection {
     fn handle_thread_events(
         mut events: mpsc::UnboundedReceiver<Result<ThreadEvent>>,
         acp_thread: WeakEntity<AcpThread>,
-        thread_for_pins: Option<WeakEntity<Thread>>,
+        thread_for_pins: WeakEntity<Thread>,
         abort_rx: Option<watch::Receiver<bool>>,
         auth_tasks: Option<std::sync::Arc<std::sync::Mutex<Vec<Task<()>>>>>,
         cx: &App,
@@ -2162,31 +2162,9 @@ impl NativeAgentConnection {
                                 // ST2: SIBLING `thread.update` to record a
                                 // PlanUpdate pin on the most-recent agent
                                 // message (per plan v3.1 Fix 1).
-                                //
-                                // ST2 fix-loop #7: `thread_for_pins` is
-                                // `Option<WeakEntity<Thread>>` to support
-                                // transitional callers, but production
-                                // paths must always pass `Some(...)`.
-                                // `debug_assert!` traps regressions in
-                                // tests and a `warn!` records any release
-                                // build that hits the None path so the pin
-                                // drop is observable. (Follow-up SQL todo
-                                // `ST2-followup-drop-thread-for-pins-option`
-                                // tracks removing the `Option<>` once all
-                                // callers are confirmed to pass Some.)
-                                debug_assert!(
-                                    thread_for_pins.is_some(),
-                                    "thread_for_pins must be Some when handling ThreadEvent::Plan"
-                                );
-                                if let Some(thread_weak) = thread_for_pins.as_ref() {
-                                    let _ = thread_weak.update(cx, |t, cx| {
-                                        t.on_plan_event_emitted(cx);
-                                    });
-                                } else {
-                                    log::warn!(
-                                        "[st2] PlanUpdate pin dropped: thread_for_pins is None"
-                                    );
-                                }
+                                let _ = thread_for_pins.update(cx, |t, cx| {
+                                    t.on_plan_event_emitted(cx);
+                                });
                             }
                             ThreadEvent::SubagentSpawned(session_id) => {
                                 acp_thread.update(cx, |thread, cx| {
