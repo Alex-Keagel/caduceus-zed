@@ -3,8 +3,8 @@
 
 use caduceus_core::{AuditEntry, SessionId};
 use caduceus_storage::{
-    GitTrackableStore, MemoryRecord, SqliteStorage, StoredCost, StoredToolCall, TraceEvent,
-    TraceEventType, TrajectoryRecorder, WikiEngine, WikiIndex, WikiLinter, WikiPage,
+    GitTrackableStore, LintReport, MemoryRecord, SqliteStorage, StoredCost, StoredToolCall,
+    TraceEvent, TraceEventType, TrajectoryRecorder, WikiEngine, WikiIndex, WikiLinter, WikiPage,
 };
 use std::path::Path;
 
@@ -443,6 +443,28 @@ pub fn search_pages_no_init(project_root: &Path, query: &str) -> Result<Vec<Wiki
     wiki.search_pages(query).map_err(|e| e.to_string())
 }
 
+/// Run wiki maintenance (`WikiEngine::maintain`) without creating the wiki
+/// directory if it doesn't already exist.
+///
+/// Wave-2 wiki Phase D-2 (zed side) helper: the turn-end hook fires on every
+/// turn for every project, including projects that have never opted into the
+/// wiki. `WikiEngine::maintain` itself tolerates a missing wiki dir, but to
+/// keep parity with `search_pages_no_init` (and to avoid even the cost of
+/// constructing the linter on a no-op path) this wrapper short-circuits to
+/// `Ok(None)` when the wiki dir is absent.
+///
+/// Returns:
+/// - `Ok(None)` — wiki dir does not exist; nothing to do.
+/// - `Ok(Some(report))` — maintenance ran; report contains findings.
+/// - `Err(_)` — maintenance failed (I/O, parse error, etc.).
+pub fn maintain_wiki(project_root: &Path) -> Result<Option<LintReport>, String> {
+    let wiki = WikiEngine::new(project_root);
+    if !wiki.wiki_dir().exists() {
+        return Ok(None);
+    }
+    wiki.maintain().map(Some).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,5 +753,41 @@ mod tests {
             "expected rust-tips in matches, got {:?}",
             pages.iter().map(|p| &p.slug).collect::<Vec<_>>()
         );
+    }
+
+    // ─── wiki-D2z: maintain_wiki helper ──────────────────────────────────
+
+    #[test]
+    fn maintain_wiki_returns_none_when_wiki_dir_missing() {
+        // Turn-end hook contract: opting in on a wiki-less project must be a
+        // no-op, NOT a silent dir-creation.
+        let dir = tempfile::tempdir().unwrap();
+        let result = maintain_wiki(dir.path()).unwrap();
+        assert!(result.is_none());
+        assert!(
+            !dir.path().join(".caduceus").join("wiki").exists(),
+            "maintain_wiki must NOT create the wiki directory"
+        );
+    }
+
+    #[test]
+    fn maintain_wiki_returns_report_when_wiki_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = StorageBridge::open_in_memory().unwrap();
+        bridge
+            .write_page(dir.path(), "alpha", "# Alpha\n\nLinks to [[beta]].\n")
+            .unwrap();
+        bridge
+            .write_page(dir.path(), "beta", "# Beta\n\nLinks back to [[alpha]].\n")
+            .unwrap();
+        bridge
+            .write_page(dir.path(), "orphan", "# Orphan\n\nNo links anywhere.\n")
+            .unwrap();
+
+        let report = maintain_wiki(dir.path())
+            .expect("maintain_wiki ok")
+            .expect("report present when wiki exists");
+        assert!(report.pages_examined >= 3);
+        assert!(report.schema_version >= 1);
     }
 }

@@ -3763,6 +3763,51 @@ impl Thread {
                 match turn_result {
                     Ok(()) => {
                         log::debug!("Turn execution completed");
+                        // wiki-D2z: turn-end maintenance hook (default-off behind
+                        // CADUCEUS_WIKI_TURN_END_MAINT=1). Fire-and-forget on the
+                        // background executor so the user-visible turn ends with
+                        // send_stop below regardless of how long maintenance takes.
+                        // Skipped silently when the wiki dir doesn't exist, so
+                        // opting in on a wiki-less project is a no-op.
+                        if std::env::var("CADUCEUS_WIKI_TURN_END_MAINT")
+                            .ok()
+                            .as_deref()
+                            == Some("1")
+                        {
+                            let project_root = this
+                                .update(cx, |this, cx| caduceus_workspace_folder(&this.project, cx))
+                                .ok()
+                                .flatten();
+                            if let Some(root) = project_root {
+                                cx.background_spawn(async move {
+                                    match caduceus_bridge::storage::maintain_wiki(&root) {
+                                        Ok(Some(report)) => {
+                                            telemetry::event!(
+                                                "wiki.maintenance.runs",
+                                                trigger = "turn_end",
+                                                schema_version = report.schema_version,
+                                                pages_examined = report.pages_examined as u64,
+                                                findings_count = report.findings.len() as u64,
+                                                elapsed_ms = report.elapsed_ms,
+                                            );
+                                        }
+                                        Ok(None) => {
+                                            // Wiki dir absent — silent no-op.
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "[caduceus] turn-end wiki maintenance failed: {e}"
+                                            );
+                                            telemetry::event!(
+                                                "wiki.maintenance.failed",
+                                                trigger = "turn_end",
+                                            );
+                                        }
+                                    }
+                                })
+                                .detach();
+                            }
+                        }
                         event_stream.send_stop(acp::StopReason::EndTurn);
                     }
                     Err(error) => {
