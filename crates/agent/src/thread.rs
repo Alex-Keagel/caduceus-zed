@@ -2669,14 +2669,17 @@ impl Thread {
     /// contiguous agent segment after the most recent `Message::User` /
     /// `Message::Resume` boundary. `None` if no agent appears in the
     /// current turn (e.g. user just sent, no reply yet).
+    ///
+    /// Implementation note: agent messages within a single turn are
+    /// pushed contiguously, so the *last* `Message` in `self.messages`
+    /// is sufficient — if it's an `Agent` we have a current-turn target;
+    /// if it's a `User` or `Resume` we don't; if the thread is empty we
+    /// don't.
     fn current_turn_trailing_agent_id(&self) -> Option<AgentMessageId> {
-        for m in self.messages.iter().rev() {
-            match m {
-                Message::Agent(a) => return Some(a.id),
-                Message::User(_) | Message::Resume(_) => return None,
-            }
+        match self.messages.last()? {
+            Message::Agent(a) => Some(a.id),
+            Message::User(_) | Message::Resume(_) => None,
         }
-        None
     }
 
     /// ScopeExpansionActive auto-pin trigger: invoked from the native-loop
@@ -10210,6 +10213,169 @@ mod st2_pinned_tests {
                 cx,
             );
             t.on_plan_event_emitted(cx);
+            assert!(t
+                .pinned_refs()
+                .iter()
+                .all(|p| p.reason != PinReason::PlanUpdate));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_plan_update_pins_pending_message_when_present(cx: &mut TestAppContext) {
+        // Streaming-turn anchoring: a current-turn assistant message lives
+        // in `self.pending_message` (NOT yet flushed). PlanUpdate must pin
+        // THAT id, not a prior-turn historical Agent message.
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let user_id = UserMessageId::new();
+        let historical_agent_id = AgentMessageId::new();
+        let pending_agent_id = AgentMessageId::new();
+        thread.update(cx, |t, cx| {
+            // Prior turn: user + historical agent reply already flushed.
+            t.push_acp_user_block(
+                user_id,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.messages.push(Message::Agent(AgentMessage {
+                id: historical_agent_id,
+                content: vec![AgentMessageContent::Text("historical reply".into())],
+                ..Default::default()
+            }));
+            // Current turn: pending_message is in flight (not yet in messages).
+            t.pending_message = Some(AgentMessage {
+                id: pending_agent_id,
+                content: vec![AgentMessageContent::Text("streaming…".into())],
+                ..Default::default()
+            });
+            t.on_plan_event_emitted(cx);
+        });
+        thread.update(cx, |t, _| {
+            // Pin must land on the pending (current-turn) message.
+            assert!(t
+                .is_pinned(&PinnedMessageKey::Agent(pending_agent_id))
+                .contains(&PinReason::PlanUpdate));
+            // And NOT on the historical agent.
+            assert!(!t
+                .is_pinned(&PinnedMessageKey::Agent(historical_agent_id))
+                .contains(&PinReason::PlanUpdate));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_plan_update_pins_trailing_agent_segment_after_user(cx: &mut TestAppContext) {
+        // No pending_message. Thread shape: [Agent(0), User(1), Agent(2), Agent(3)].
+        // PlanUpdate must pin Agent(3) (trailing in current turn) and NOT
+        // Agent(0) (precedes the most recent User boundary).
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let agent_0 = AgentMessageId::new();
+        let user_1 = UserMessageId::new();
+        let agent_2 = AgentMessageId::new();
+        let agent_3 = AgentMessageId::new();
+        thread.update(cx, |t, cx| {
+            t.messages.push(Message::Agent(AgentMessage {
+                id: agent_0,
+                content: vec![AgentMessageContent::Text("pre-user agent".into())],
+                ..Default::default()
+            }));
+            t.push_acp_user_block(
+                user_1,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.messages.push(Message::Agent(AgentMessage {
+                id: agent_2,
+                content: vec![AgentMessageContent::Text("turn reply 1".into())],
+                ..Default::default()
+            }));
+            t.messages.push(Message::Agent(AgentMessage {
+                id: agent_3,
+                content: vec![AgentMessageContent::Text("turn reply 2".into())],
+                ..Default::default()
+            }));
+            assert!(t.pending_message.is_none());
+            t.on_plan_event_emitted(cx);
+        });
+        thread.update(cx, |t, _| {
+            assert!(t
+                .is_pinned(&PinnedMessageKey::Agent(agent_3))
+                .contains(&PinReason::PlanUpdate));
+            assert!(!t
+                .is_pinned(&PinnedMessageKey::Agent(agent_2))
+                .contains(&PinReason::PlanUpdate));
+            assert!(!t
+                .is_pinned(&PinnedMessageKey::Agent(agent_0))
+                .contains(&PinReason::PlanUpdate));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_plan_update_clears_stale_pin_when_no_current_target(cx: &mut TestAppContext) {
+        // Pre-existing PlanUpdate pin on a historical agent. A new turn
+        // begins (User pushed, no agent reply yet, no pending_message).
+        // Plan event fires — must REMOVE the stale pin rather than leave
+        // it dangling on the prior-turn agent.
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let stale_agent_id = AgentMessageId::new();
+        let prior_user_id = UserMessageId::new();
+        let new_user_id = UserMessageId::new();
+        thread.update(cx, |t, cx| {
+            // Prior turn complete: user + agent. Pre-pin the agent with PlanUpdate.
+            t.push_acp_user_block(
+                prior_user_id,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.messages.push(Message::Agent(AgentMessage {
+                id: stale_agent_id,
+                content: vec![AgentMessageContent::Text("prior reply".into())],
+                ..Default::default()
+            }));
+            t.pin_replace(
+                PinnedMessageKey::Agent(stale_agent_id),
+                PinReason::PlanUpdate,
+            );
+            assert!(t
+                .is_pinned(&PinnedMessageKey::Agent(stale_agent_id))
+                .contains(&PinReason::PlanUpdate));
+
+            // New turn: only a User message, no agent reply yet, no pending.
+            t.push_acp_user_block(
+                new_user_id,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            assert!(t.pending_message.is_none());
+
+            t.on_plan_event_emitted(cx);
+        });
+        thread.update(cx, |t, _| {
+            // Stale pin must have been proactively removed.
+            assert!(!t
+                .is_pinned(&PinnedMessageKey::Agent(stale_agent_id))
+                .contains(&PinReason::PlanUpdate));
+            // No PlanUpdate pin anywhere.
+            assert!(t
+                .pinned_refs()
+                .iter()
+                .all(|p| p.reason != PinReason::PlanUpdate));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_plan_update_no_op_when_thread_empty(cx: &mut TestAppContext) {
+        // Empty thread: no messages, no pending. PlanUpdate drops with WARN
+        // and leaves the pin set untouched (no stale pin to remove either).
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, cx| {
+            assert!(t.messages.is_empty());
+            assert!(t.pending_message.is_none());
+            let pins_before = t.pinned_refs().len();
+            t.on_plan_event_emitted(cx);
+            assert_eq!(t.pinned_refs().len(), pins_before);
             assert!(t
                 .pinned_refs()
                 .iter()
