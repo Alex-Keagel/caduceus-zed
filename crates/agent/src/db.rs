@@ -117,9 +117,51 @@ impl PinReasonProxy {
     }
 }
 
+/// Forward-compat proxy for `PinnedMessageKey`. A future build may add a
+/// new key variant this build doesn't know about (e.g., a `Tool(...)`
+/// pin). Unrecognized variants are caught by the trailing
+/// `Unknown(serde_json::Value)` arm via `#[serde(untagged)]` and
+/// quarantined (dropped with a `WARN`) by `deserialize_pinned_lossy`,
+/// so the rest of the thread loads cleanly. Mirrors the
+/// `PinReasonProxy` pattern (ST2 fix-loop #5).
+///
+/// Note: externally-tagged enums don't support `#[serde(other)]` for
+/// data-bearing variants (only unit variants), so we use the `untagged`
+/// + `Value` fallback idiom instead.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum PinnedMessageKeyProxy {
+    Known(PinnedMessageKeyKnown),
+    Unknown(serde_json::Value),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+enum PinnedMessageKeyKnown {
+    User(crate::UserMessageId),
+    Resume(crate::ResumeId),
+    Agent(crate::AgentMessageId),
+}
+
+impl PinnedMessageKeyProxy {
+    fn into_known(self) -> Option<crate::PinnedMessageKey> {
+        match self {
+            Self::Known(PinnedMessageKeyKnown::User(id)) => {
+                Some(crate::PinnedMessageKey::User(id))
+            }
+            Self::Known(PinnedMessageKeyKnown::Resume(rid)) => {
+                Some(crate::PinnedMessageKey::Resume(rid))
+            }
+            Self::Known(PinnedMessageKeyKnown::Agent(aid)) => {
+                Some(crate::PinnedMessageKey::Agent(aid))
+            }
+            Self::Unknown(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct MessageRefProxy {
-    key: crate::PinnedMessageKey,
+    key: PinnedMessageKeyProxy,
     reason: PinReasonProxy,
     pinned_at: chrono::DateTime<chrono::Utc>,
 }
@@ -131,21 +173,29 @@ where
     let proxies: Vec<MessageRefProxy> = Vec::deserialize(de)?;
     let total = proxies.len();
     let mut out = Vec::with_capacity(total);
-    let mut quarantined = 0usize;
+    let mut quarantined_reason = 0usize;
+    let mut quarantined_key = 0usize;
     for p in proxies {
-        match p.reason.into_known() {
-            Some(reason) => out.push(crate::MessageRef {
-                key: p.key,
-                reason,
-                pinned_at: p.pinned_at,
-            }),
-            None => quarantined += 1,
-        }
+        let Some(reason) = p.reason.into_known() else {
+            quarantined_reason += 1;
+            continue;
+        };
+        let Some(key) = p.key.into_known() else {
+            quarantined_key += 1;
+            continue;
+        };
+        out.push(crate::MessageRef {
+            key,
+            reason,
+            pinned_at: p.pinned_at,
+        });
     }
-    if quarantined > 0 {
+    if quarantined_reason > 0 || quarantined_key > 0 {
         log::warn!(
-            "[st2] quarantined {} pin entries with unknown PinReason ({} kept of {})",
-            quarantined,
+            "[st2] quarantined {} pin entries (unknown reason: {}, unknown key: {}; {} kept of {})",
+            quarantined_reason + quarantined_key,
+            quarantined_reason,
+            quarantined_key,
             out.len(),
             total
         );

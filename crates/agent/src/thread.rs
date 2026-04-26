@@ -10273,6 +10273,38 @@ mod st2_pinned_tests {
         assert_eq!(parsed.pinned[0].reason, PinReason::Manual);
     }
 
+    #[test]
+    fn t_unknown_pin_key_is_quarantined() {
+        // ST2 fix-loop #5: forward-compat for PinnedMessageKey. A future
+        // build may write `{"key": {"Tool": "..."}, ...}` — this build
+        // must drop that pin (with a WARN) and retain other pins.
+        let base = serde_json::json!({
+            "title": "x",
+            "messages": [],
+            "updated_at": fixed_now(),
+            "pinned": [
+                {
+                    "key": { "User": "00000000-0000-0000-0000-000000000001" },
+                    "reason": "Manual",
+                    "pinned_at": "2026-04-26T12:00:00Z"
+                },
+                {
+                    "key": { "FromTheFuture": "00000000-0000-0000-0000-000000000002" },
+                    "reason": "Manual",
+                    "pinned_at": "2026-04-26T12:00:00Z"
+                }
+            ]
+        });
+        let parsed: DbThread = serde_json::from_value(base)
+            .expect("DbThread with unknown pin key must parse");
+        assert_eq!(
+            parsed.pinned.len(),
+            1,
+            "Unknown key variant must be quarantined; only User pin retained"
+        );
+        assert!(matches!(parsed.pinned[0].key, PinnedMessageKey::User(_)));
+    }
+
     #[gpui::test]
     async fn t_to_db_round_trips_pinned(cx: &mut TestAppContext) {
         let (thread, _ev) = setup_thread_for_test(cx).await;
