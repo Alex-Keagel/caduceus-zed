@@ -81,12 +81,15 @@ pub fn classify_subagent_error(
     if msg == "User canceled" {
         return SubAgentFailure::UserCancel;
     }
-    if msg.contains("Maximum subagent depth") {
-        return SubAgentFailure::InternalError {
-            kind: "recursion_limit".into(),
-            message: msg,
-        };
-    }
+    // ST7 fix-loop #6: removed the legacy
+    // `if msg.contains("Maximum subagent depth")` branch. It returned
+    // `InternalError { kind: "recursion_limit", ... }`, which is the
+    // WRONG shape — `SubAgentFailure::RecursionLimitExceeded { current_depth,
+    // max_depth }` is the canonical typed variant. Since `agent.rs:2832`
+    // now emits the typed value via `anyhow!(SubAgentFailure::RecursionLimit
+    // Exceeded {...})`, the SubAgentFailure downcast above is the
+    // correct (and only) path. Keeping the string fallback would silently
+    // mis-shape the failure if the typed wrap ever regressed.
     if msg.contains("refused to process") {
         return SubAgentFailure::ModelRefusal { refusal_text: msg };
     }
@@ -680,6 +683,56 @@ mod tests {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
             }
             other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_subagent_error_typed_recursion_limit_preserves_shape() {
+        // Fix-loop #6: typed downcast is the ONLY canonical path for
+        // RecursionLimitExceeded. The string fallback was wrong-shape
+        // (returned InternalError{kind:"recursion_limit"} instead of
+        // the typed RecursionLimitExceeded{current_depth, max_depth})
+        // and has been removed.
+        let typed = SubAgentFailure::RecursionLimitExceeded {
+            current_depth: 4,
+            max_depth: 4,
+        };
+        let err = anyhow::Error::new(typed);
+        let out =
+            classify_subagent_error(&err, SubAgentPhase::ModelSelection, false, 0, 900);
+        match out {
+            SubAgentFailure::RecursionLimitExceeded {
+                current_depth,
+                max_depth,
+            } => {
+                assert_eq!(current_depth, 4);
+                assert_eq!(max_depth, 4);
+            }
+            other => panic!("expected RecursionLimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_subagent_error_raw_string_recursion_msg_no_longer_misshapes() {
+        // Fix-loop #6: a raw anyhow!("Maximum subagent depth ...") that
+        // somehow escapes the typed wrap at agent.rs:2832 must NOT
+        // silently classify as InternalError{kind:"recursion_limit"} —
+        // that's the wrong shape (canonical is the typed
+        // RecursionLimitExceeded variant). It now falls through to the
+        // generic InternalError{kind:"subagent_send_failed"} fallback,
+        // forcing any future regression to be visible (different kind
+        // string) instead of papered over.
+        let err = anyhow::anyhow!("Maximum subagent depth (4) reached");
+        let out =
+            classify_subagent_error(&err, SubAgentPhase::ModelSelection, false, 0, 900);
+        match out {
+            SubAgentFailure::InternalError { kind, .. } => {
+                assert_eq!(
+                    kind, "subagent_send_failed",
+                    "must NOT classify as the wrong-shape recursion_limit kind"
+                );
+            }
+            other => panic!("expected InternalError fallback, got {other:?}"),
         }
     }
 
