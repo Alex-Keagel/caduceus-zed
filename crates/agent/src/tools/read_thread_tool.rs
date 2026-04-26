@@ -160,7 +160,7 @@ pub(crate) fn render_thread_markdown(thread: &crate::db::DbThread) -> String {
         let role = match msg {
             crate::Message::User(_) => "User",
             crate::Message::Agent(_) => "Assistant",
-            crate::Message::Resume => "Resume",
+            crate::Message::Resume(_) => "Resume",
         };
         out.push_str(&format!("## {} (#{i})\n\n", role));
         out.push_str(&msg.to_markdown());
@@ -199,6 +199,7 @@ mod tests {
                 content: vec![UserMessageContent::Text(format!("user msg #{i}"))],
             }));
             messages.push(Message::Agent(AgentMessage {
+                id: crate::AgentMessageId::new(),
                 content: vec![AgentMessageContent::Text(format!(
                     "assistant reply to #{i}"
                 ))],
@@ -222,6 +223,7 @@ mod tests {
             thinking_enabled: false,
             thinking_effort: None,
             draft_prompt: None,
+            pinned: Vec::new(),
             ui_scroll_position: None,
         }
     }

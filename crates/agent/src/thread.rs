@@ -144,11 +144,63 @@ enum RetryStrategy {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Stable identity of a `Message::Resume` marker. Generated at push-time;
+/// invariant under truncation and compaction. Replaces the position-based
+/// `ResumeIndex` keying that silently retargeted pins after compaction
+/// removed earlier Resume markers (ST2 fix-loop #2).
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ResumeId(pub Uuid);
+
+impl ResumeId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for ResumeId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Message {
     User(UserMessage),
     Agent(AgentMessage),
-    Resume,
+    Resume(ResumeId),
+}
+
+impl<'de> Deserialize<'de> for Message {
+    /// Backward-compat: legacy DbThread JSON encodes `Message::Resume` as
+    /// the bare string `"Resume"` (unit variant). Newer DbThreads encode
+    /// it as `{"Resume": "<uuid>"}` (newtype variant). Accept both. A
+    /// legacy bare-string is deserialized with a freshly-allocated
+    /// `ResumeId`; the resulting id is unique within the loaded process
+    /// but is NOT round-trip-stable across the legacy boundary (which is
+    /// fine: legacy data has no Resume pins to invalidate).
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let v = serde_json::Value::deserialize(de).map_err(D::Error::custom)?;
+        if v == serde_json::Value::String("Resume".to_string()) {
+            return Ok(Message::Resume(ResumeId::new()));
+        }
+        #[derive(Deserialize)]
+        enum Helper {
+            User(UserMessage),
+            Agent(AgentMessage),
+            Resume(ResumeId),
+        }
+        let h: Helper = serde_json::from_value(v).map_err(D::Error::custom)?;
+        Ok(match h {
+            Helper::User(u) => Message::User(u),
+            Helper::Agent(a) => Message::Agent(a),
+            Helper::Resume(r) => Message::Resume(r),
+        })
+    }
 }
 
 impl Message {
@@ -169,7 +221,7 @@ impl Message {
                 }
             }
             Message::Agent(message) => message.to_request(),
-            Message::Resume => vec![LanguageModelRequestMessage {
+            Message::Resume(_) => vec![LanguageModelRequestMessage {
                 role: Role::User,
                 content: vec!["Continue where you left off".into()],
                 cache: false,
@@ -182,17 +234,88 @@ impl Message {
         match self {
             Message::User(message) => message.to_markdown(),
             Message::Agent(message) => message.to_markdown(),
-            Message::Resume => "[resume]\n".into(),
+            Message::Resume(_) => "[resume]\n".into(),
         }
     }
 
     pub fn role(&self) -> Role {
         match self {
-            Message::User(_) | Message::Resume => Role::User,
+            Message::User(_) | Message::Resume(_) => Role::User,
             Message::Agent(_) => Role::Assistant,
         }
     }
 }
+
+// ─── ST2: pinned messages ──────────────────────────────────────────
+//
+// `Thread::pinned` is a `Vec<MessageRef>` recording which messages must
+// survive compaction. ST2 ships the data model + auto-pin trigger sites
+// + persistence; ST3 consumes `pinned_message_indices()` to protect
+// pinned positions during compaction.
+//
+// Composite key: pins are uniquely identified by (PinnedMessageKey,
+// PinReason). Multiple reasons may coexist on the same key (e.g.
+// FirstUser + Manual on the same user message).
+//
+// ST2-INVARIANT: subagent threads MUST start with `pinned: vec![]`.
+// `Thread::new_internal` initializes pinned to empty; `Thread::from_db`
+// also clears pins when `subagent_context.is_some()` (belt-and-suspenders
+// against a maliciously-crafted DbThread JSON).
+
+/// Reason a message was pinned. Drives compaction protection priority
+/// in ST3 and surfaces in the UI in ST5.
+///
+/// **Forward-compat:** persisted via the `PinReasonProxy` enum in `db.rs`,
+/// which has `#[serde(other)] Unknown` so future variants from a newer
+/// build round-trip without breaking the legacy reader. `Unknown` entries
+/// are quarantined (dropped with a `WARN` log) at load time.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PinReason {
+    /// The first user message in the thread — the original task statement.
+    FirstUser,
+    /// A `Message::Resume` marker (explicit or implicit-continuation).
+    Resume,
+    /// Pinned because an `acp::Plan` event was emitted.
+    PlanUpdate,
+    /// Pinned because the agent requested scope expansion against this message.
+    /// (Auto-unpin on Granted/Denied is deferred to ST2.5.)
+    ScopeExpansionActive,
+    /// Operator-driven pin (no auto-trigger; API-only in ST2).
+    Manual,
+}
+
+/// Legacy 1-based Resume index — retained for compatibility with any
+/// external code that may still reference the type, but no longer used
+/// in `PinnedMessageKey` (ST2 fix-loop #2 replaced it with `ResumeId`).
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResumeIndex(pub u32);
+
+/// Identity of a pinned message. `Message::User` carries a stable
+/// `UserMessageId`; `Message::Resume` carries a `ResumeId(Uuid)`
+/// (generated at push-time — see ST2 fix-loop #2); `Message::Agent`
+/// carries an `AgentMessageId(Uuid)` (added in ST2 fix-loop #3 to
+/// support `PlanUpdate` pinning the most-recent agent message per
+/// plan v3.1 Fix 1). All three are invariant under truncation and
+/// compaction.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PinnedMessageKey {
+    User(UserMessageId),
+    Resume(ResumeId),
+    Agent(AgentMessageId),
+}
+
+/// A single pin entry. Insertion-order is preserved and is part of the contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessageRef {
+    pub key: PinnedMessageKey,
+    pub reason: PinReason,
+    pub pinned_at: DateTime<Utc>,
+}
+
+/// Resume coalescing cap: at most this many `Resume`-reason pins exist
+/// at once on a thread. When a new Resume pin pushes count above the cap,
+/// the oldest Resume pin is dropped.
+pub const MAX_RESUME_PINS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserMessage {
@@ -630,12 +753,50 @@ impl AgentMessage {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Stable identity of an `AgentMessage`. Generated at message construction;
+/// invariant under truncation/compaction. Added in ST2 fix-loop #3 so
+/// `PinReason::PlanUpdate` can pin the most-recent agent message (per
+/// plan v3.1 Fix 1) without retargeting under message-list mutations.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentMessageId(pub Uuid);
+
+impl AgentMessageId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for AgentMessageId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct AgentMessage {
+    /// Stable identity. `#[serde(default)]` auto-generates one on load
+    /// for legacy DbThread JSON written before this field existed —
+    /// pre-ST2 threads have no PlanUpdate pins so the synthetic id is
+    /// harmless. Excluded from `PartialEq` so tests that construct
+    /// expected `AgentMessage` values without specifying an id (or
+    /// using a fresh random one) still compare on semantic content.
+    #[serde(default)]
+    pub id: AgentMessageId,
     pub content: Vec<AgentMessageContent>,
     pub tool_results: IndexMap<LanguageModelToolUseId, LanguageModelToolResult>,
     pub reasoning_details: Option<serde_json::Value>,
 }
+
+impl PartialEq for AgentMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.content == other.content
+            && self.tool_results == other.tool_results
+            && self.reasoning_details == other.reasoning_details
+    }
+}
+
+impl Eq for AgentMessage {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentMessageContent {
@@ -1297,6 +1458,10 @@ pub struct Thread {
     /// out if the counter has advanced — preventing stale callbacks from
     /// the previous turn from clobbering state in a fresh turn.
     turn_generation: u64,
+    /// ST2: pinned messages that survive compaction. See `PinReason`,
+    /// `PinnedMessageKey`, `MessageRef`. Insertion-order preserved.
+    /// **ST2-INVARIANT**: subagent threads MUST start empty.
+    pub(crate) pinned: Vec<MessageRef>,
 }
 
 /// Grouped per-thread native-loop state (ST-B3). These seven fields share
@@ -1516,6 +1681,7 @@ impl Thread {
             turn_generation: 0,
             last_turn_cancelled: false,
             pulled_session_ids: Vec::new(),
+            pinned: Vec::new(),
         }
     }
 
@@ -1653,7 +1819,7 @@ impl Thread {
                         }
                     }
                 }
-                Message::Resume => {}
+                Message::Resume(_) => {}
             }
         }
         rx
@@ -1750,7 +1916,7 @@ impl Thread {
 
     pub fn from_db(
         id: acp::SessionId,
-        db_thread: DbThread,
+        mut db_thread: DbThread,
         project: Entity<Project>,
         project_context: Entity<ProjectContext>,
         context_server_registry: Entity<ContextServerRegistry>,
@@ -1789,6 +1955,23 @@ impl Thread {
             watch::channel(Self::prompt_capabilities(model.as_deref()));
 
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
+
+        // ST2: compute pins before moving fields out of db_thread.
+        // Subagents force-clear (belt-and-suspenders against a
+        // maliciously-crafted DbThread JSON setting both
+        // `subagent_context` and `pinned`).
+        let loaded_pinned = if db_thread.subagent_context.is_some() {
+            if !db_thread.pinned.is_empty() {
+                log::warn!(
+                    "[st2] DbThread has subagent_context AND non-empty pinned ({} entries); \
+                     clearing pins (subagent invariant)",
+                    db_thread.pinned.len()
+                );
+            }
+            Vec::new()
+        } else {
+            std::mem::take(&mut db_thread.pinned)
+        };
 
         Self {
             id,
@@ -1851,11 +2034,23 @@ impl Thread {
             turn_generation: 0,
             last_turn_cancelled: false,
             pulled_session_ids: Vec::new(),
+            pinned: loaded_pinned,
         }
     }
 
     pub fn to_db(&self, cx: &App) -> Task<DbThread> {
         let initial_project_snapshot = self.initial_project_snapshot.clone();
+        // ST2 fix-loop #6 / r3 cleanup #2: filter orphaned pins inline.
+        // `to_db` takes `&self`, so we cannot call `gc_pinned()` here
+        // (which requires `&mut self`). Share the live-key rule via
+        // `live_pin_keys` so the predicate has one definition.
+        let live = self.live_pin_keys();
+        let pinned: Vec<MessageRef> = self
+            .pinned
+            .iter()
+            .filter(|p| live.contains(&p.key))
+            .cloned()
+            .collect();
         let mut thread = DbThread {
             title: self.title().unwrap_or_default(),
             messages: self.messages.clone(),
@@ -1881,6 +2076,7 @@ impl Thread {
                     offset_in_item: lo.offset_in_item.as_f32(),
                 }
             }),
+            pinned,
         };
 
         cx.background_spawn(async move {
@@ -2142,6 +2338,337 @@ impl Thread {
         self.context_pins.list_pins()
     }
 
+    // ─── ST2: pinned-message API ──────────────────────────────────────
+    //
+    // See `MessageRef`, `PinReason`, `PinnedMessageKey` for the data model.
+    // Pins are keyed by `(PinnedMessageKey, PinReason)`; multiple reasons
+    // may coexist on the same key. Insertion order is preserved.
+
+    /// Pin a message. No-op if `(key, reason)` is already present.
+    /// Returns `true` if a new pin was inserted.
+    ///
+    /// `Resume`-reason pins are coalesced to `MAX_RESUME_PINS` — a new
+    /// Resume pin past the cap drops the oldest Resume pin.
+    pub fn pin(&mut self, key: PinnedMessageKey, reason: PinReason) -> bool {
+        self.pin_at(key, reason, Utc::now())
+    }
+
+    /// Test seam: pin with an explicit timestamp for deterministic assertions.
+    pub(crate) fn pin_at(
+        &mut self,
+        key: PinnedMessageKey,
+        reason: PinReason,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if self
+            .pinned
+            .iter()
+            .any(|p| p.key == key && p.reason == reason)
+        {
+            return false;
+        }
+        self.pinned.push(MessageRef {
+            key,
+            reason,
+            pinned_at: now,
+        });
+        if matches!(reason, PinReason::Resume) {
+            self.coalesce_resume_pins();
+        }
+        true
+    }
+
+    /// Replace the (singleton-by-reason) pin for `reason` with `(key, reason)`.
+    /// Returns the previous key if any. Used for `PlanUpdate` and
+    /// `ScopeExpansionActive`. Do NOT use for `Resume` (which is N-cap, not singleton).
+    pub fn pin_replace(
+        &mut self,
+        key: PinnedMessageKey,
+        reason: PinReason,
+    ) -> Option<PinnedMessageKey> {
+        debug_assert!(
+            !matches!(reason, PinReason::Resume),
+            "pin_replace must not be used for Resume (use pin + coalesce)"
+        );
+        let prev = self
+            .pinned
+            .iter()
+            .position(|p| p.reason == reason)
+            .map(|i| self.pinned.remove(i).key);
+        self.pin(key, reason);
+        prev
+    }
+
+    /// Drop every pin for the given key (all reasons). Returns count removed.
+    pub fn unpin(&mut self, key: &PinnedMessageKey) -> usize {
+        let before = self.pinned.len();
+        self.pinned.retain(|p| &p.key != key);
+        before - self.pinned.len()
+    }
+
+    /// Drop a single (key, reason) entry. Returns true if it was present.
+    pub fn unpin_reason(&mut self, key: &PinnedMessageKey, reason: PinReason) -> bool {
+        if let Some(idx) = self
+            .pinned
+            .iter()
+            .position(|p| &p.key == key && p.reason == reason)
+        {
+            self.pinned.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns every `PinReason` currently pinned on `key`, in insertion order.
+    /// Empty Vec means not pinned.
+    pub fn is_pinned(&self, key: &PinnedMessageKey) -> Vec<PinReason> {
+        self.pinned
+            .iter()
+            .filter(|p| &p.key == key)
+            .map(|p| p.reason)
+            .collect()
+    }
+
+    /// Lookup the first pin with the given key, if any.
+    pub fn pinned_ref(&self, key: &PinnedMessageKey) -> Option<&MessageRef> {
+        self.pinned.iter().find(|p| &p.key == key)
+    }
+
+    /// All pins, in insertion order.
+    pub fn pinned_refs(&self) -> &[MessageRef] {
+        &self.pinned
+    }
+
+    /// Returns sorted unique message positions. A message pinned for
+    /// multiple reasons appears once. Used by ST3 compaction-protection
+    /// budget calculation — the **set** semantics are part of that
+    /// contract: pinned-token budget must not double-count a multi-reason
+    /// pin. Pins whose underlying message no longer exists are skipped
+    /// (see `gc_pinned` for permanent cleanup).
+    pub fn pinned_message_indices(&self) -> Vec<usize> {
+        let mut set: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for p in &self.pinned {
+            if let Some(idx) = self.resolve_key_to_index(&p.key) {
+                set.insert(idx);
+            }
+        }
+        Vec::from_iter(set)
+    }
+
+    /// Drop pins whose underlying message no longer exists in `self.messages`.
+    /// Called by ST3 post-compaction. Idempotent.
+    ///
+    /// ST2 fix-loop #6: also called from `to_db()` (defensive — persisted
+    /// pins never drift) and from `truncate()` / `auto_compact_context_with_zone()`
+    /// (mutation paths that drop messages).
+    pub fn gc_pinned(&mut self) {
+        let live = self.live_pin_keys();
+        let before = self.pinned.len();
+        self.pinned.retain(|p| live.contains(&p.key));
+        let dropped = before - self.pinned.len();
+        if dropped > 0 {
+            log::debug!("[st2] gc_pinned dropped {} orphaned pin(s)", dropped);
+        }
+    }
+
+    /// Set of every `PinnedMessageKey` whose underlying message currently
+    /// exists in `self.messages`. Shared between `gc_pinned` (mutation
+    /// path) and `to_db` (serialization path) so the "is this pin still
+    /// alive?" rule has exactly one definition. ST2 r3 cleanup #2.
+    fn live_pin_keys(&self) -> HashSet<PinnedMessageKey> {
+        self.messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => Some(PinnedMessageKey::User(u.id.clone())),
+                Message::Resume(rid) => Some(PinnedMessageKey::Resume(*rid)),
+                Message::Agent(a) => Some(PinnedMessageKey::Agent(a.id)),
+            })
+            .chain(
+                self.pending_message
+                    .as_ref()
+                    .map(|m| PinnedMessageKey::Agent(m.id)),
+            )
+            .collect()
+    }
+
+    /// Empty the pinned list. Called when seeding a subagent context;
+    /// also used to reset state in tests.
+    pub fn clear_inherited_pins(&mut self) {
+        self.pinned.clear();
+    }
+
+    /// Look up a `PinnedMessageKey` to a slice index in `self.messages`.
+    /// Returns `None` if the key has no live message (e.g. user message
+    /// was truncated, or the Resume marker with that id is gone).
+    fn resolve_key_to_index(&self, key: &PinnedMessageKey) -> Option<usize> {
+        match key {
+            PinnedMessageKey::User(target) => self.messages.iter().position(|m| match m {
+                Message::User(u) => &u.id == target,
+                _ => false,
+            }),
+            PinnedMessageKey::Resume(target) => self.messages.iter().position(|m| match m {
+                Message::Resume(rid) => rid == target,
+                _ => false,
+            }),
+            PinnedMessageKey::Agent(target) => self.messages.iter().position(|m| match m {
+                Message::Agent(a) => &a.id == target,
+                _ => false,
+            }),
+        }
+    }
+
+    /// Return the `ResumeId` of the most-recently pushed `Message::Resume`
+    /// in the thread, or `None` if no Resume marker exists. Used by
+    /// `auto_pin_resume` immediately after pushing the marker.
+    fn last_resume_id(&self) -> Option<ResumeId> {
+        self.messages.iter().rev().find_map(|m| match m {
+            Message::Resume(rid) => Some(*rid),
+            _ => None,
+        })
+    }
+
+    /// Coalesce Resume pins to at most `MAX_RESUME_PINS`. Drops oldest first.
+    fn coalesce_resume_pins(&mut self) {
+        let resume_indices: Vec<usize> = self
+            .pinned
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(p.reason, PinReason::Resume))
+            .map(|(i, _)| i)
+            .collect();
+        if resume_indices.len() <= MAX_RESUME_PINS {
+            return;
+        }
+        let to_drop = resume_indices.len() - MAX_RESUME_PINS;
+        // Vec is in insertion order; drop the first `to_drop` Resume entries.
+        let drop_set: HashSet<usize> = resume_indices.into_iter().take(to_drop).collect();
+        let mut idx = 0;
+        self.pinned.retain(|_| {
+            let keep = !drop_set.contains(&idx);
+            idx += 1;
+            keep
+        });
+    }
+
+    /// FirstUser auto-pin trigger: if there is exactly one user message
+    /// in the thread (just inserted), pin it with `PinReason::FirstUser`.
+    /// Called from both `Thread::send` and `Thread::push_acp_user_block`
+    /// — idempotent because of the `count == 1` guard.
+    fn maybe_auto_pin_first_user(&mut self, id: UserMessageId) {
+        let user_count = self
+            .messages
+            .iter()
+            .filter(|m| matches!(m, Message::User(_)))
+            .count();
+        if user_count == 1 {
+            self.pin(PinnedMessageKey::User(id), PinReason::FirstUser);
+        }
+    }
+
+    /// Resume auto-pin trigger: pin the most recently pushed Resume marker
+    /// (by its stable `ResumeId`) with `PinReason::Resume`. Honors
+    /// `MAX_RESUME_PINS` via `coalesce_resume_pins`.
+    fn auto_pin_resume(&mut self) {
+        let Some(rid) = self.last_resume_id() else {
+            return;
+        };
+        self.pin(PinnedMessageKey::Resume(rid), PinReason::Resume);
+    }
+
+    /// PlanUpdate hook: called from `agent.rs` (legacy ACP dispatcher) when
+    /// `ThreadEvent::Plan` is observed, and from the native-loop consumer
+    /// task on `T::PlanStep` / `T::PlanAmended`. Pins the **current-turn**
+    /// agent message (by stable `AgentMessageId`) with `PinReason::PlanUpdate`.
+    ///
+    /// Target selection (ST2 r3 Fix 1) — order matters because plan events
+    /// fire mid-stream, before `flush_pending_message` has moved the
+    /// in-flight assistant content into `self.messages`:
+    ///   1. If `self.pending_message` is `Some`, use its `id` — that is
+    ///      the live current-turn assistant message.
+    ///   2. Otherwise, walk `self.messages` from the end backwards, stopping
+    ///      at the most recent `Message::User` or `Message::Resume` (the
+    ///      current-turn boundary). Pin the latest `Message::Agent` seen
+    ///      after that boundary (the trailing agent in the current turn).
+    ///   3. If neither exists (plan event emitted before any current-turn
+    ///      agent target), drop any stale `PinReason::PlanUpdate` pin so
+    ///      we don't leave a dangling reference to a prior turn, and emit
+    ///      a `WARN` log (per AC6).
+    ///
+    /// Earlier code (ST2 fix-loop #3) only scanned `self.messages` for the
+    /// last `Message::Agent`, which during a streamed turn either pinned a
+    /// HISTORICAL agent message (wrong target) or silently no-op'd. v3.1
+    /// Fix 1 mandates the **current-turn** agent message as the anchor.
+    pub fn on_plan_event_emitted(&mut self, _cx: &mut Context<Self>) {
+        let target = if let Some(pending) = self.pending_message.as_ref() {
+            Some(pending.id)
+        } else {
+            self.current_turn_trailing_agent_id()
+        };
+        let Some(id) = target else {
+            // No current-turn agent target available. Proactively drop any
+            // stale PlanUpdate pin so we don't carry a pin from a prior
+            // turn forward.
+            let stale_idx = self
+                .pinned
+                .iter()
+                .position(|p| p.reason == PinReason::PlanUpdate);
+            if let Some(i) = stale_idx {
+                self.pinned.remove(i);
+                log::warn!(
+                    "[st2] plan event emitted with no current-turn agent target; \
+                     stale PlanUpdate pin removed"
+                );
+            } else {
+                log::warn!(
+                    "[st2] plan event emitted before any current-turn agent message; \
+                     PlanUpdate pin dropped"
+                );
+            }
+            return;
+        };
+        self.pin_replace(PinnedMessageKey::Agent(id), PinReason::PlanUpdate);
+    }
+
+    /// Returns the id of the latest `Message::Agent` in the trailing
+    /// contiguous agent segment after the most recent `Message::User` /
+    /// `Message::Resume` boundary. `None` if no agent appears in the
+    /// current turn (e.g. user just sent, no reply yet).
+    ///
+    /// Implementation note: agent messages within a single turn are
+    /// pushed contiguously, so the *last* `Message` in `self.messages`
+    /// is sufficient — if it's an `Agent` we have a current-turn target;
+    /// if it's a `User` or `Resume` we don't; if the thread is empty we
+    /// don't.
+    fn current_turn_trailing_agent_id(&self) -> Option<AgentMessageId> {
+        match self.messages.last()? {
+            Message::Agent(a) => Some(a.id),
+            Message::User(_) | Message::Resume(_) => None,
+        }
+    }
+
+    /// ScopeExpansionActive auto-pin trigger: invoked from the native-loop
+    /// consumer task on `AgentEvent::ScopeExpansionRequested`. Pins the
+    /// most-recent user message (the one whose tool call triggered the
+    /// expansion). Replacement semantics: a new request supersedes the
+    /// prior `ScopeExpansionActive` pin via `pin_replace`.
+    ///
+    /// Auto-unpin on Granted/Denied is **deferred to ST2.5** — the
+    /// permission lifecycle event is not bridged onto `AgentEvent` today.
+    pub fn on_scope_expansion_requested(&mut self) {
+        let target = self.messages.iter().rev().find_map(|m| match m {
+            Message::User(u) => Some(u.id.clone()),
+            _ => None,
+        });
+        let Some(id) = target else {
+            log::warn!(
+                "[st2] scope expansion requested before any user message; pin dropped"
+            );
+            return;
+        };
+        self.pin_replace(PinnedMessageKey::User(id), PinReason::ScopeExpansionActive);
+    }
+
     pub(crate) fn message_count(&self) -> usize {
         self.messages.len()
     }
@@ -2229,7 +2756,7 @@ impl Thread {
                 Message::Agent(a) => {
                     caduceus_bridge::orchestrator::count_tokens_exact(&a.to_markdown())
                 }
-                Message::Resume => 0,
+                Message::Resume(_) => 0,
             })
             .sum();
         self.cached_token_estimate.set(Some(total));
@@ -2479,7 +3006,7 @@ impl Thread {
                         CompactMessage::new("assistant", text)
                     }
                 }
-                Message::Resume => CompactMessage::new("system", "[session resumed]"),
+                Message::Resume(_) => CompactMessage::new("system", "[session resumed]"),
             })
             .collect();
 
@@ -2568,6 +3095,11 @@ impl Thread {
                 ))],
             }),
         );
+        // ST2 fix-loop #6: drop pins whose target messages were just
+        // evicted by the drain above. Pins on surviving messages keep
+        // their semantic meaning; pins on evicted messages are stale
+        // and must not leak to disk via to_db.
+        self.gc_pinned();
         self.invalidate_token_cache();
 
         log::info!(
@@ -2912,7 +3444,7 @@ impl Thread {
                 Message::User(message) => {
                     self.request_token_usage.remove(&message.id);
                 }
-                Message::Agent(_) | Message::Resume => {}
+                Message::Agent(_) | Message::Resume(_) => {}
             }
         }
         if evicted_count > 0 {
@@ -2923,6 +3455,12 @@ impl Thread {
                 },
             );
         }
+        // ST2 fix-loop #6: drop pins that target messages no longer in
+        // the live message vec. Without this, `pinned_message_indices`
+        // could silently lose entries (resolve_key_to_index returns
+        // None) but the orphaned pins would persist in `self.pinned`
+        // and eventually be written to disk.
+        self.gc_pinned();
         self.invalidate_token_cache();
         self.clear_summary();
         cx.notify();
@@ -3002,7 +3540,9 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
-        self.messages.push(Message::Resume);
+        self.messages.push(Message::Resume(ResumeId::new()));
+        // ST2: auto-pin Resume marker (explicit-resume trigger site).
+        self.auto_pin_resume();
         self.invalidate_token_cache();
         cx.notify();
 
@@ -3025,8 +3565,11 @@ impl Thread {
         let content = content.into_iter().map(Into::into).collect::<Vec<_>>();
         log::debug!("Thread::send content: {:?}", content);
 
+        let id_for_pin = id.clone();
         self.messages
             .push(Message::User(UserMessage { id, content }));
+        // ST2: auto-pin if this is the FIRST user message in the thread.
+        self.maybe_auto_pin_first_user(id_for_pin);
         self.invalidate_token_cache();
         cx.notify();
 
@@ -3059,8 +3602,11 @@ impl Thread {
             .into_iter()
             .map(|block| UserMessageContent::from_content_block(block, path_style))
             .collect::<Vec<_>>();
+        let id_for_pin = id.clone();
         self.messages
             .push(Message::User(UserMessage { id, content }));
+        // ST2: auto-pin if this is the FIRST user message (alt insert path).
+        self.maybe_auto_pin_first_user(id_for_pin);
         self.invalidate_token_cache();
         cx.notify();
     }
@@ -3392,7 +3938,9 @@ impl Thread {
                     if let Some(Message::Agent(message)) = this.messages.last() {
                         if message.tool_results.is_empty() {
                             intent = CompletionIntent::UserPrompt;
-                            this.messages.push(Message::Resume);
+                            this.messages.push(Message::Resume(ResumeId::new()));
+                            // ST2: auto-pin implicit-continuation Resume.
+                            this.auto_pin_resume();
                         }
                     }
                 })?;
@@ -3511,7 +4059,7 @@ impl Thread {
                 .rev()
                 .find_map(|m| match m {
                     Message::User(u) => Some(u.to_markdown()),
-                    Message::Resume => Some("Continue where you left off.".to_string()),
+                    Message::Resume(_) => Some("Continue where you left off.".to_string()),
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -3823,6 +4371,10 @@ impl Thread {
         // has its own unit tests. Consumer just drives observe_* /
         // finalize from the event loop.
         let enabled_tools_for_consumer = setup.enabled_tools.clone();
+        // ST2: capture weak Thread for ScopeExpansion auto-pin from the
+        // consumer task. Native-loop only; legacy path emits no
+        // TranslatedThreadEvent::ScopeExpansion.
+        let thread_for_pins = this.clone();
         let consumer_task = cx.spawn(async move |cx_cons| {
             use caduceus_bridge::event_translator::{
                 ToolInputAggregator, TranslatedThreadEvent as T,
@@ -3858,6 +4410,25 @@ impl Thread {
                         );
                         continue;
                     }
+                }
+                // ST2: pin most-recent user message on scope expansion request.
+                if matches!(ev, T::ScopeExpansion { .. }) {
+                    let _ = thread_for_pins.update(cx_cons, |t, _cx| {
+                        t.on_scope_expansion_requested();
+                    });
+                }
+                // ST2 fix-loop #4: native-loop PlanUpdate hook. PlanStep and
+                // PlanAmended are deltas (not snapshots), but pin_replace is
+                // idempotent per (key, reason) so calling on each delta is
+                // safe — at most one PlanUpdate pin survives, on the
+                // most-recent agent message at the time of the latest delta.
+                // Plan v3.1 §4 acknowledged this hook as deferred to G1d, but
+                // adding it now closes the convergent reviewer finding that
+                // PlanUpdate fires only on the legacy ACP path.
+                if matches!(ev, T::PlanStep { .. } | T::PlanAmended { .. }) {
+                    let _ = thread_for_pins.update(cx_cons, |t, cx| {
+                        t.on_plan_event_emitted(cx);
+                    });
                 }
                 let handled_fully = handle_native_tool_lifecycle(
                     &ev,
@@ -4685,7 +5256,7 @@ impl Thread {
             .find_map(|message| match message {
                 Message::User(user_message) => Some(user_message),
                 Message::Agent(_) => None,
-                Message::Resume => None,
+                Message::Resume(_) => None,
             })
     }
 
@@ -5383,7 +5954,7 @@ impl Thread {
             match message {
                 Message::User(_) => markdown.push_str("## User\n\n"),
                 Message::Agent(_) => markdown.push_str("## Assistant\n\n"),
-                Message::Resume => {}
+                Message::Resume(_) => {}
             }
             markdown.push_str(&message.to_markdown());
         }
@@ -9044,5 +9615,1021 @@ mod native_tool_lifecycle_tests {
             }
             other => panic!("expected ToolCallUpdate::UpdateFields, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod st2_pinned_tests {
+    //! ST2 pinned-message tests. Plan v3.1 §8.
+    //!
+    //! API-level (no gpui): pin/unpin/replace/gc/coalesce semantics, key
+    //! identity, Resume index resolution, persistence proxy round-trip,
+    //! forward-compat quarantine.
+    //!
+    //! Trigger-level (gpui): FirstUser auto-pin via `push_acp_user_block`;
+    //! Resume auto-pin via direct `auto_pin_resume` after pushing a Resume
+    //! marker; PlanUpdate via `on_plan_event_emitted`; ScopeExpansionActive
+    //! via `on_scope_expansion_requested`. (Native-loop wiring is exercised
+    //! in `caduceus_native_loop_tests`; here we test the Thread-side hook.)
+    use super::*;
+    use chrono::TimeZone;
+    use futures::channel::mpsc;
+    use gpui::TestAppContext;
+    use project::Project;
+
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 26, 12, 0, 0).unwrap()
+    }
+
+    fn user_key() -> PinnedMessageKey {
+        PinnedMessageKey::User(UserMessageId::new())
+    }
+
+    /// Fresh, unique Resume key. Use when the test only cares that keys
+    /// differ (e.g. cap/coalesce tests, orphan-gc tests).
+    fn resume_key_new() -> PinnedMessageKey {
+        PinnedMessageKey::Resume(ResumeId::new())
+    }
+
+    /// Collect the `ResumeId`s from the thread's messages, in push-order.
+    /// Used by tests that need to pin a *specific* Resume marker.
+    #[allow(dead_code)]
+    fn resume_ids(t: &Thread) -> Vec<ResumeId> {
+        t.messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Resume(rid) => Some(*rid),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn setup_thread_for_test(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Thread>, ThreadEventStream) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        let templates = Templates::new();
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        cx.update(|cx| {
+            let project_context = cx.new(|_cx| prompt_store::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| ContextServerRegistry::new(context_server_store, cx));
+
+            let thread = cx.new(|cx| {
+                Thread::new(
+                    project,
+                    project_context,
+                    context_server_registry,
+                    templates,
+                    None,
+                    cx,
+                )
+            });
+
+            let (event_tx, _event_rx) = mpsc::unbounded();
+            let event_stream = ThreadEventStream(event_tx);
+
+            (thread, event_stream)
+        })
+    }
+
+    // ─── API-level: pin / unpin / is_pinned ───────────────────────
+
+    #[gpui::test]
+    async fn t_pin_idempotent_same_reason(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let k = user_key();
+            assert!(t.pin_at(k.clone(), PinReason::Manual, fixed_now()));
+            assert!(!t.pin_at(k.clone(), PinReason::Manual, fixed_now()));
+            assert_eq!(t.pinned_refs().len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn t_pin_allows_multiple_reasons_per_key(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let k = user_key();
+            assert!(t.pin_at(k.clone(), PinReason::FirstUser, fixed_now()));
+            assert!(t.pin_at(k.clone(), PinReason::Manual, fixed_now()));
+            let reasons = t.is_pinned(&k);
+            assert_eq!(reasons.len(), 2);
+            assert!(reasons.contains(&PinReason::FirstUser));
+            assert!(reasons.contains(&PinReason::Manual));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_is_pinned_returns_all_reasons(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let k = user_key();
+            t.pin_at(k.clone(), PinReason::FirstUser, fixed_now());
+            t.pin_at(k.clone(), PinReason::PlanUpdate, fixed_now());
+            t.pin_at(k.clone(), PinReason::Manual, fixed_now());
+            assert_eq!(t.is_pinned(&k).len(), 3);
+            assert!(t.is_pinned(&user_key()).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn t_unpin_removes_all_reasons_for_key(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let k = user_key();
+            t.pin_at(k.clone(), PinReason::FirstUser, fixed_now());
+            t.pin_at(k.clone(), PinReason::PlanUpdate, fixed_now());
+            assert_eq!(t.unpin(&k), 2);
+            assert!(t.is_pinned(&k).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn t_unpin_reason_removes_only_that_reason(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let k = user_key();
+            t.pin_at(k.clone(), PinReason::FirstUser, fixed_now());
+            t.pin_at(k.clone(), PinReason::Manual, fixed_now());
+            assert!(t.unpin_reason(&k, PinReason::Manual));
+            assert_eq!(t.is_pinned(&k), vec![PinReason::FirstUser]);
+            assert!(!t.unpin_reason(&k, PinReason::Manual));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_unpin_nonexistent_is_noop(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            assert_eq!(t.unpin(&user_key()), 0);
+            assert!(!t.unpin_reason(&user_key(), PinReason::Manual));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_pinned_refs_insertion_order(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let a = user_key();
+            let b = user_key();
+            let c = user_key();
+            t.pin_at(a.clone(), PinReason::FirstUser, fixed_now());
+            t.pin_at(b.clone(), PinReason::Manual, fixed_now());
+            t.pin_at(c.clone(), PinReason::PlanUpdate, fixed_now());
+            let keys: Vec<&PinnedMessageKey> =
+                t.pinned_refs().iter().map(|p| &p.key).collect();
+            assert_eq!(keys, vec![&a, &b, &c]);
+        });
+    }
+
+    // ─── pin_replace (singleton-by-reason) ────────────────────────
+
+    #[gpui::test]
+    async fn t_pin_replace_supersedes_old(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let a = user_key();
+            let b = user_key();
+            t.pin_at(a.clone(), PinReason::ScopeExpansionActive, fixed_now());
+            let prev = t.pin_replace(b.clone(), PinReason::ScopeExpansionActive);
+            assert_eq!(prev, Some(a));
+            // exactly one ScopeExpansionActive pin remains, on `b`.
+            let count = t
+                .pinned_refs()
+                .iter()
+                .filter(|p| p.reason == PinReason::ScopeExpansionActive)
+                .count();
+            assert_eq!(count, 1);
+            assert_eq!(t.is_pinned(&b), vec![PinReason::ScopeExpansionActive]);
+        });
+    }
+
+    // ─── Resume cap + coalescing ──────────────────────────────────
+
+    #[gpui::test]
+    async fn t_resume_pin_cap_3(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            // 5 distinct Resume ids — coalesce drops the oldest 2.
+            let mut ids: Vec<ResumeId> = Vec::new();
+            for _ in 0..5 {
+                let rid = ResumeId::new();
+                ids.push(rid);
+                t.pin_at(
+                    PinnedMessageKey::Resume(rid),
+                    PinReason::Resume,
+                    fixed_now(),
+                );
+            }
+            let kept: Vec<ResumeId> = t
+                .pinned_refs()
+                .iter()
+                .filter_map(|p| match (&p.key, p.reason) {
+                    (PinnedMessageKey::Resume(r), PinReason::Resume) => Some(*r),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(kept.len(), MAX_RESUME_PINS);
+            // newest 3 retained (insertion order)
+            assert_eq!(kept, ids[2..].to_vec());
+        });
+    }
+
+    // ─── gc_pinned ────────────────────────────────────────────────
+
+    #[gpui::test]
+    async fn t_gc_drops_orphans_keeps_live(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            // live user message
+            let live_id = UserMessageId::new();
+            t.messages.push(Message::User(UserMessage {
+                id: live_id.clone(),
+                content: vec![],
+            }));
+            // orphan user pin
+            let orphan = UserMessageId::new();
+            t.pin_at(
+                PinnedMessageKey::User(live_id.clone()),
+                PinReason::Manual,
+                fixed_now(),
+            );
+            t.pin_at(
+                PinnedMessageKey::User(orphan),
+                PinReason::Manual,
+                fixed_now(),
+            );
+            // orphan resume pin (random ResumeId, no matching marker in messages)
+            t.pin_at(resume_key_new(), PinReason::Resume, fixed_now());
+            assert_eq!(t.pinned_refs().len(), 3);
+            t.gc_pinned();
+            assert_eq!(t.pinned_refs().len(), 1);
+            assert!(t
+                .is_pinned(&PinnedMessageKey::User(live_id))
+                .contains(&PinReason::Manual));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_gc_after_full_truncate_empties_pinned(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            t.pin_at(user_key(), PinReason::Manual, fixed_now());
+            t.pin_at(resume_key_new(), PinReason::Resume, fixed_now());
+            // messages stays empty -> all pins orphan
+            t.gc_pinned();
+            assert!(t.pinned_refs().is_empty());
+        });
+    }
+
+    // ─── pinned_message_indices / resolve_key ─────────────────────
+
+    #[gpui::test]
+    async fn t_pinned_message_indices_returns_positions(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let id_a = UserMessageId::new();
+            let id_b = UserMessageId::new();
+            let r1 = ResumeId::new();
+            let r2 = ResumeId::new();
+            t.messages.push(Message::User(UserMessage {
+                id: id_a.clone(),
+                content: vec![],
+            }));
+            t.messages.push(Message::Resume(r1));
+            t.messages.push(Message::User(UserMessage {
+                id: id_b.clone(),
+                content: vec![],
+            }));
+            t.messages.push(Message::Resume(r2));
+            t.pin_at(
+                PinnedMessageKey::User(id_a),
+                PinReason::FirstUser,
+                fixed_now(),
+            );
+            t.pin_at(PinnedMessageKey::Resume(r2), PinReason::Resume, fixed_now());
+            t.pin_at(
+                PinnedMessageKey::User(id_b),
+                PinReason::Manual,
+                fixed_now(),
+            );
+            let indices = t.pinned_message_indices();
+            assert_eq!(indices, vec![0, 2, 3]);
+        });
+    }
+
+    #[gpui::test]
+    async fn t_pinned_message_indices_deduplicates_multi_reason(cx: &mut TestAppContext) {
+        // ST2 fix-loop #1 (reviewer Correctness 3/4): a message pinned
+        // for multiple reasons must appear ONCE in the indices set.
+        // Plan v3.1 §5: pins are keyed by (key, reason); the budget
+        // calculation in ST3 must not double-count.
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let id = UserMessageId::new();
+            t.messages.push(Message::User(UserMessage {
+                id: id.clone(),
+                content: vec![],
+            }));
+            t.pin_at(
+                PinnedMessageKey::User(id.clone()),
+                PinReason::Manual,
+                fixed_now(),
+            );
+            t.pin_at(
+                PinnedMessageKey::User(id.clone()),
+                PinReason::FirstUser,
+                fixed_now(),
+            );
+            // Two pins on the same key — but only one index entry.
+            assert_eq!(t.pinned_refs().len(), 2);
+            let indices = t.pinned_message_indices();
+            assert_eq!(indices, vec![0]);
+        });
+    }
+
+    #[gpui::test]
+    async fn t_resume_index_stable_across_user_message_edits(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let r = ResumeId::new();
+            t.messages.push(Message::Resume(r)); // resume at idx 0
+            t.pin_at(PinnedMessageKey::Resume(r), PinReason::Resume, fixed_now());
+            assert_eq!(t.pinned_message_indices(), vec![0]);
+
+            // inserting/removing user messages around the resume marker
+            // does not invalidate the resume pin (id-keyed, not position-keyed).
+            t.messages.insert(
+                0,
+                Message::User(UserMessage {
+                    id: UserMessageId::new(),
+                    content: vec![],
+                }),
+            );
+            assert_eq!(t.pinned_message_indices(), vec![1]);
+        });
+    }
+
+    // ─── clear_inherited_pins / subagent invariant ────────────────
+
+    #[gpui::test]
+    async fn t_clear_inherited_pins(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            t.pin_at(user_key(), PinReason::Manual, fixed_now());
+            t.pin_at(user_key(), PinReason::Manual, fixed_now());
+            t.clear_inherited_pins();
+            assert!(t.pinned_refs().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn t_subagent_constructor_initializes_empty_pinned(cx: &mut TestAppContext) {
+        let (parent, _ev) = setup_thread_for_test(cx).await;
+        parent.update(cx, |t, _| {
+            t.pin_at(user_key(), PinReason::Manual, fixed_now());
+            assert_eq!(t.pinned_refs().len(), 1);
+        });
+        let subagent = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent, cx)));
+        subagent.update(cx, |t, _| {
+            assert!(t.pinned_refs().is_empty(), "subagent must start with empty pinned");
+        });
+    }
+
+    // ─── trigger sites ────────────────────────────────────────────
+
+    #[gpui::test]
+    async fn t_first_user_auto_pinned_via_acp_block(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let id = UserMessageId::new();
+        thread.update(cx, |t, cx| {
+            t.push_acp_user_block(
+                id.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+        });
+        thread.update(cx, |t, _| {
+            assert_eq!(
+                t.is_pinned(&PinnedMessageKey::User(id)),
+                vec![PinReason::FirstUser]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn t_first_user_not_repinned_on_second_user_message(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let id1 = UserMessageId::new();
+        let id2 = UserMessageId::new();
+        thread.update(cx, |t, cx| {
+            t.push_acp_user_block(
+                id1.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.push_acp_user_block(
+                id2.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+        });
+        thread.update(cx, |t, _| {
+            assert_eq!(
+                t.is_pinned(&PinnedMessageKey::User(id1)),
+                vec![PinReason::FirstUser]
+            );
+            assert!(t.is_pinned(&PinnedMessageKey::User(id2)).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn t_resume_auto_pin_pins_marker_id(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let r1 = ResumeId::new();
+            t.messages.push(Message::Resume(r1));
+            t.auto_pin_resume();
+            assert_eq!(
+                t.is_pinned(&PinnedMessageKey::Resume(r1)),
+                vec![PinReason::Resume]
+            );
+
+            let r2 = ResumeId::new();
+            t.messages.push(Message::Resume(r2));
+            t.auto_pin_resume();
+            let pins: Vec<ResumeId> = t
+                .pinned_refs()
+                .iter()
+                .filter_map(|p| match (&p.key, p.reason) {
+                    (PinnedMessageKey::Resume(r), PinReason::Resume) => Some(*r),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(pins, vec![r1, r2]);
+        });
+    }
+
+    #[gpui::test]
+    async fn t_resume_pin_after_resume_removal_does_not_redirect(cx: &mut TestAppContext) {
+        // ST2 fix-loop #2 (reviewer Correctness 3/4): with the legacy
+        // `ResumeIndex` keying, removing Resume #1 silently retargeted
+        // a `Resume(2)` pin to the now-second-position Resume #3 — the
+        // wrong message. After moving to `ResumeId(Uuid)` identity, the
+        // pin tracks the *original* Resume #2 by id; if Resume #1 is
+        // removed, the pin still resolves to the original Resume #2
+        // (now at a different position), NOT to Resume #3.
+        // Plan v3.1 §5 (Fix 2 — `PinnedMessageKey` upfront).
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let r1 = ResumeId::new();
+            let r2 = ResumeId::new();
+            let r3 = ResumeId::new();
+            t.messages.push(Message::Resume(r1)); // pos 0
+            t.messages.push(Message::Resume(r2)); // pos 1
+            t.messages.push(Message::Resume(r3)); // pos 2
+
+            // Pin Resume #2 (the middle one).
+            t.pin_at(PinnedMessageKey::Resume(r2), PinReason::Resume, fixed_now());
+            assert_eq!(t.pinned_message_indices(), vec![1]);
+
+            // Remove Resume #1.
+            t.messages.remove(0);
+            // r2 now at pos 0, r3 at pos 1.
+
+            // The pin must still resolve to r2 (now at pos 0), NOT r3 at pos 1.
+            assert_eq!(t.pinned_message_indices(), vec![0]);
+            // And by identity:
+            let pinned_pos = t.pinned_message_indices()[0];
+            match &t.messages[pinned_pos] {
+                Message::Resume(id) => assert_eq!(
+                    *id, r2,
+                    "Resume pin must still target original r2, not r3"
+                ),
+                other => panic!("expected Resume marker at pinned pos, got {other:?}"),
+            }
+
+            // gc_pinned must NOT drop the live pin.
+            t.gc_pinned();
+            assert_eq!(t.pinned_refs().len(), 1);
+            assert!(t
+                .is_pinned(&PinnedMessageKey::Resume(r2))
+                .contains(&PinReason::Resume));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_plan_update_pins_most_recent_agent_message(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let user_id = UserMessageId::new();
+        let agent_id_1 = AgentMessageId::new();
+        let agent_id_2 = AgentMessageId::new();
+        thread.update(cx, |t, cx| {
+            t.push_acp_user_block(
+                user_id,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.messages.push(Message::Agent(AgentMessage {
+                id: agent_id_1,
+                content: vec![AgentMessageContent::Text("first reply".into())],
+                ..Default::default()
+            }));
+            t.messages.push(Message::Agent(AgentMessage {
+                id: agent_id_2,
+                content: vec![AgentMessageContent::Text("second reply".into())],
+                ..Default::default()
+            }));
+            t.on_plan_event_emitted(cx);
+        });
+        thread.update(cx, |t, _| {
+            assert!(t
+                .is_pinned(&PinnedMessageKey::Agent(agent_id_2))
+                .contains(&PinReason::PlanUpdate));
+            assert!(!t
+                .is_pinned(&PinnedMessageKey::Agent(agent_id_1))
+                .contains(&PinReason::PlanUpdate));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_plan_update_with_no_agent_message_drops(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let user_id = UserMessageId::new();
+        thread.update(cx, |t, cx| {
+            // Only a user message — no agent reply yet. PlanUpdate should
+            // drop the pin and emit a WARN log per AC6.
+            t.push_acp_user_block(
+                user_id,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.on_plan_event_emitted(cx);
+            assert!(t
+                .pinned_refs()
+                .iter()
+                .all(|p| p.reason != PinReason::PlanUpdate));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_plan_update_pins_pending_message_when_present(cx: &mut TestAppContext) {
+        // Streaming-turn anchoring: a current-turn assistant message lives
+        // in `self.pending_message` (NOT yet flushed). PlanUpdate must pin
+        // THAT id, not a prior-turn historical Agent message.
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let user_id = UserMessageId::new();
+        let historical_agent_id = AgentMessageId::new();
+        let pending_agent_id = AgentMessageId::new();
+        thread.update(cx, |t, cx| {
+            // Prior turn: user + historical agent reply already flushed.
+            t.push_acp_user_block(
+                user_id,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.messages.push(Message::Agent(AgentMessage {
+                id: historical_agent_id,
+                content: vec![AgentMessageContent::Text("historical reply".into())],
+                ..Default::default()
+            }));
+            // Current turn: pending_message is in flight (not yet in messages).
+            t.pending_message = Some(AgentMessage {
+                id: pending_agent_id,
+                content: vec![AgentMessageContent::Text("streaming…".into())],
+                ..Default::default()
+            });
+            t.on_plan_event_emitted(cx);
+        });
+        thread.update(cx, |t, _| {
+            // Pin must land on the pending (current-turn) message.
+            assert!(t
+                .is_pinned(&PinnedMessageKey::Agent(pending_agent_id))
+                .contains(&PinReason::PlanUpdate));
+            // And NOT on the historical agent.
+            assert!(!t
+                .is_pinned(&PinnedMessageKey::Agent(historical_agent_id))
+                .contains(&PinReason::PlanUpdate));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_plan_update_pins_trailing_agent_segment_after_user(cx: &mut TestAppContext) {
+        // No pending_message. Thread shape: [Agent(0), User(1), Agent(2), Agent(3)].
+        // PlanUpdate must pin Agent(3) (trailing in current turn) and NOT
+        // Agent(0) (precedes the most recent User boundary).
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let agent_0 = AgentMessageId::new();
+        let user_1 = UserMessageId::new();
+        let agent_2 = AgentMessageId::new();
+        let agent_3 = AgentMessageId::new();
+        thread.update(cx, |t, cx| {
+            t.messages.push(Message::Agent(AgentMessage {
+                id: agent_0,
+                content: vec![AgentMessageContent::Text("pre-user agent".into())],
+                ..Default::default()
+            }));
+            t.push_acp_user_block(
+                user_1,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.messages.push(Message::Agent(AgentMessage {
+                id: agent_2,
+                content: vec![AgentMessageContent::Text("turn reply 1".into())],
+                ..Default::default()
+            }));
+            t.messages.push(Message::Agent(AgentMessage {
+                id: agent_3,
+                content: vec![AgentMessageContent::Text("turn reply 2".into())],
+                ..Default::default()
+            }));
+            assert!(t.pending_message.is_none());
+            t.on_plan_event_emitted(cx);
+        });
+        thread.update(cx, |t, _| {
+            assert!(t
+                .is_pinned(&PinnedMessageKey::Agent(agent_3))
+                .contains(&PinReason::PlanUpdate));
+            assert!(!t
+                .is_pinned(&PinnedMessageKey::Agent(agent_2))
+                .contains(&PinReason::PlanUpdate));
+            assert!(!t
+                .is_pinned(&PinnedMessageKey::Agent(agent_0))
+                .contains(&PinReason::PlanUpdate));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_plan_update_clears_stale_pin_when_no_current_target(cx: &mut TestAppContext) {
+        // Pre-existing PlanUpdate pin on a historical agent. A new turn
+        // begins (User pushed, no agent reply yet, no pending_message).
+        // Plan event fires — must REMOVE the stale pin rather than leave
+        // it dangling on the prior-turn agent.
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let stale_agent_id = AgentMessageId::new();
+        let prior_user_id = UserMessageId::new();
+        let new_user_id = UserMessageId::new();
+        thread.update(cx, |t, cx| {
+            // Prior turn complete: user + agent. Pre-pin the agent with PlanUpdate.
+            t.push_acp_user_block(
+                prior_user_id,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.messages.push(Message::Agent(AgentMessage {
+                id: stale_agent_id,
+                content: vec![AgentMessageContent::Text("prior reply".into())],
+                ..Default::default()
+            }));
+            t.pin_replace(
+                PinnedMessageKey::Agent(stale_agent_id),
+                PinReason::PlanUpdate,
+            );
+            assert!(t
+                .is_pinned(&PinnedMessageKey::Agent(stale_agent_id))
+                .contains(&PinReason::PlanUpdate));
+
+            // New turn: only a User message, no agent reply yet, no pending.
+            t.push_acp_user_block(
+                new_user_id,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            assert!(t.pending_message.is_none());
+
+            t.on_plan_event_emitted(cx);
+        });
+        thread.update(cx, |t, _| {
+            // Stale pin must have been proactively removed.
+            assert!(!t
+                .is_pinned(&PinnedMessageKey::Agent(stale_agent_id))
+                .contains(&PinReason::PlanUpdate));
+            // No PlanUpdate pin anywhere.
+            assert!(t
+                .pinned_refs()
+                .iter()
+                .all(|p| p.reason != PinReason::PlanUpdate));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_plan_update_no_op_when_thread_empty(cx: &mut TestAppContext) {
+        // Empty thread: no messages, no pending. PlanUpdate drops with WARN
+        // and leaves the pin set untouched (no stale pin to remove either).
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, cx| {
+            assert!(t.messages.is_empty());
+            assert!(t.pending_message.is_none());
+            let pins_before = t.pinned_refs().len();
+            t.on_plan_event_emitted(cx);
+            assert_eq!(t.pinned_refs().len(), pins_before);
+            assert!(t
+                .pinned_refs()
+                .iter()
+                .all(|p| p.reason != PinReason::PlanUpdate));
+        });
+    }
+
+    #[gpui::test]
+    async fn t_scope_expansion_pin_replace_supersedes(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let id1 = UserMessageId::new();
+        let id2 = UserMessageId::new();
+        thread.update(cx, |t, cx| {
+            t.push_acp_user_block(
+                id1,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.on_scope_expansion_requested();
+            t.push_acp_user_block(
+                id2.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.on_scope_expansion_requested();
+        });
+        thread.update(cx, |t, _| {
+            let count = t
+                .pinned_refs()
+                .iter()
+                .filter(|p| p.reason == PinReason::ScopeExpansionActive)
+                .count();
+            assert_eq!(count, 1);
+            assert!(t
+                .is_pinned(&PinnedMessageKey::User(id2))
+                .contains(&PinReason::ScopeExpansionActive));
+        });
+    }
+
+    // ─── persistence: round-trip + forward-compat ─────────────────
+
+    #[test]
+    fn t_pin_uniqueness_invariant_50_iter() {
+        // Property check: 50 random sequences of pin/unpin maintain
+        // uniqueness on (key, reason).
+        use std::collections::HashSet;
+        for seed in 0..50u32 {
+            let mut pinned: Vec<MessageRef> = Vec::new();
+            // synthesize a sequence
+            let keys: Vec<PinnedMessageKey> = (0..5).map(|_| user_key()).collect();
+            let reasons = [
+                PinReason::FirstUser,
+                PinReason::Manual,
+                PinReason::PlanUpdate,
+            ];
+            for i in 0..20 {
+                let k = keys[((seed as usize + i) * 7) % keys.len()].clone();
+                let r = reasons[(i + seed as usize) % reasons.len()];
+                let dup = pinned.iter().any(|p| p.key == k && p.reason == r);
+                if !dup {
+                    pinned.push(MessageRef {
+                        key: k,
+                        reason: r,
+                        pinned_at: fixed_now(),
+                    });
+                }
+            }
+            let set: HashSet<(String, PinReason)> = pinned
+                .iter()
+                .map(|p| (format!("{:?}", p.key), p.reason))
+                .collect();
+            assert_eq!(set.len(), pinned.len(), "uniqueness violated for seed {seed}");
+        }
+    }
+
+    #[test]
+    fn t_message_ref_serde_round_trip() {
+        let r = MessageRef {
+            key: user_key(),
+            reason: PinReason::FirstUser,
+            pinned_at: fixed_now(),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: MessageRef = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn t_legacy_resume_message_deserializes_with_synthetic_id() {
+        // ST2 fix-loop #2: legacy DbThread JSON encodes Message::Resume
+        // as the bare string "Resume". The custom Deserialize impl on
+        // Message must accept this and synthesize a fresh ResumeId, so
+        // pre-ST2 threads on disk continue to load.
+        let legacy = serde_json::json!("Resume");
+        let m: Message = serde_json::from_value(legacy).expect("legacy Resume must deserialize");
+        match m {
+            Message::Resume(_) => {}
+            other => panic!("expected Message::Resume(_), got {other:?}"),
+        }
+
+        // And new shape round-trips.
+        let r = ResumeId::new();
+        let m2 = Message::Resume(r);
+        let s = serde_json::to_string(&m2).unwrap();
+        let back: Message = serde_json::from_str(&s).unwrap();
+        assert_eq!(m2, back);
+    }
+
+    #[test]
+    fn t_legacy_db_thread_without_pinned_field_defaults_empty() {
+        // Simulate a v1 DbThread JSON missing the `pinned` field.
+        // Only the three required fields are supplied; everything else
+        // (including `pinned`) must default.
+        let json = serde_json::json!({
+            "title": "x",
+            "messages": [],
+            "updated_at": fixed_now(),
+        });
+        let parsed: DbThread =
+            serde_json::from_value(json).expect("legacy DbThread must deserialize");
+        assert!(parsed.pinned.is_empty());
+    }
+
+    #[test]
+    fn t_unknown_pin_reason_is_quarantined() {
+        // Build a DbThread JSON with one valid + one Unknown variant pin.
+        let base = serde_json::json!({
+            "title": "x",
+            "messages": [],
+            "updated_at": fixed_now(),
+            "pinned": [
+                {
+                    "key": { "User": "00000000-0000-0000-0000-000000000001" },
+                    "reason": "Manual",
+                    "pinned_at": "2026-04-26T12:00:00Z"
+                },
+                {
+                    "key": { "User": "00000000-0000-0000-0000-000000000002" },
+                    "reason": "FromTheFuture",
+                    "pinned_at": "2026-04-26T12:00:00Z"
+                }
+            ]
+        });
+        let parsed: DbThread =
+            serde_json::from_value(base).expect("DbThread with unknown pin reason must parse");
+        assert_eq!(
+            parsed.pinned.len(),
+            1,
+            "Unknown reason variant must be quarantined; only Manual pin retained"
+        );
+        assert_eq!(parsed.pinned[0].reason, PinReason::Manual);
+    }
+
+    #[test]
+    fn t_unknown_pin_key_is_quarantined() {
+        // ST2 fix-loop #5: forward-compat for PinnedMessageKey. A future
+        // build may write `{"key": {"Tool": "..."}, ...}` — this build
+        // must drop that pin (with a WARN) and retain other pins.
+        let base = serde_json::json!({
+            "title": "x",
+            "messages": [],
+            "updated_at": fixed_now(),
+            "pinned": [
+                {
+                    "key": { "User": "00000000-0000-0000-0000-000000000001" },
+                    "reason": "Manual",
+                    "pinned_at": "2026-04-26T12:00:00Z"
+                },
+                {
+                    "key": { "FromTheFuture": "00000000-0000-0000-0000-000000000002" },
+                    "reason": "Manual",
+                    "pinned_at": "2026-04-26T12:00:00Z"
+                }
+            ]
+        });
+        let parsed: DbThread = serde_json::from_value(base)
+            .expect("DbThread with unknown pin key must parse");
+        assert_eq!(
+            parsed.pinned.len(),
+            1,
+            "Unknown key variant must be quarantined; only User pin retained"
+        );
+        assert!(matches!(parsed.pinned[0].key, PinnedMessageKey::User(_)));
+    }
+
+    #[gpui::test]
+    async fn t_to_db_round_trips_pinned(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let id = UserMessageId::new();
+        let k = PinnedMessageKey::User(id.clone());
+        thread.update(cx, |t, cx| {
+            // Push a real user message so the pin's target survives the
+            // ST2 fix-loop #6 orphan filter inside to_db.
+            t.push_acp_user_block(
+                id,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.pin_at(k.clone(), PinReason::Manual, fixed_now());
+        });
+        let db = cx
+            .update(|cx| thread.read(cx).to_db(cx))
+            .await;
+        // The pushed user message also auto-pins as FirstUser, so we
+        // expect 2 pins (Manual + FirstUser) — not orphaned.
+        assert_eq!(db.pinned.len(), 2);
+        assert!(db.pinned.iter().any(|p| p.key == k && p.reason == PinReason::Manual));
+        assert!(db.pinned.iter().any(|p| p.key == k && p.reason == PinReason::FirstUser));
+    }
+
+    #[gpui::test]
+    async fn t_to_db_filters_orphaned_pins(cx: &mut TestAppContext) {
+        // ST2 fix-loop #6: persistence must never include pins whose
+        // target message is no longer present. Add a pin with a key
+        // that doesn't correspond to any live message; assert to_db
+        // drops it.
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            // Orphan pin — no live message with this UserMessageId.
+            let orphan = PinnedMessageKey::User(UserMessageId::new());
+            t.pin_at(orphan, PinReason::Manual, fixed_now());
+        });
+        let db = cx
+            .update(|cx| thread.read(cx).to_db(cx))
+            .await;
+        assert!(
+            db.pinned.is_empty(),
+            "to_db must filter orphaned pins; got {:?}",
+            db.pinned
+        );
+    }
+
+    #[gpui::test]
+    async fn t_truncate_runs_gc_pinned(cx: &mut TestAppContext) {
+        // ST2 fix-loop #6: truncate must call gc_pinned so pins on
+        // truncated messages are cleared.
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let id1 = UserMessageId::new();
+        let id2 = UserMessageId::new();
+        thread.update(cx, |t, cx| {
+            t.push_acp_user_block(
+                id1.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.push_acp_user_block(
+                id2.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.pin_at(
+                PinnedMessageKey::User(id1.clone()),
+                PinReason::Manual,
+                fixed_now(),
+            );
+            t.pin_at(
+                PinnedMessageKey::User(id2.clone()),
+                PinReason::Manual,
+                fixed_now(),
+            );
+            // Truncate to id2 — drops messages from id2 onward.
+            t.truncate(id2.clone(), cx)
+                .expect("truncate to id2 must succeed");
+        });
+        thread.update(cx, |t, _| {
+            // id2's message is gone; its pin must have been GC'd. id1
+            // still lives and remains pinned.
+            assert!(
+                t.is_pinned(&PinnedMessageKey::User(id2.clone())).is_empty(),
+                "pin on truncated message must be gc'd"
+            );
+            assert!(
+                !t.is_pinned(&PinnedMessageKey::User(id1.clone())).is_empty(),
+                "pin on surviving message must remain"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn t_empty_pinned_round_trip(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let db = cx
+            .update(|cx| thread.read(cx).to_db(cx))
+            .await;
+        assert!(db.pinned.is_empty());
     }
 }
