@@ -26,6 +26,10 @@ pub struct FakeLanguageModelProvider {
     /// Counts every call to `auth_state(cx)`. Used by registry cache tests
     /// (AC-PERF1) to prove a fan-out render frame causes ≤1 underlying call.
     auth_state_call_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Optional real `Entity<()>` so `observable_entity()` can return `Some(_)`.
+    /// Tests that need to drive the registry's `Event::ProviderStateChanged`
+    /// subscription path (T11) install one via `with_observable_entity`.
+    observable: Option<Entity<()>>,
 }
 
 impl Default for FakeLanguageModelProvider {
@@ -36,6 +40,7 @@ impl Default for FakeLanguageModelProvider {
             models: vec![Arc::new(FakeLanguageModel::default())],
             auth_state_override: Arc::new(Mutex::new(None)),
             auth_state_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            observable: None,
         }
     }
 }
@@ -44,7 +49,7 @@ impl LanguageModelProviderState for FakeLanguageModelProvider {
     type ObservableEntity = ();
 
     fn observable_entity(&self) -> Option<Entity<Self::ObservableEntity>> {
-        None
+        self.observable.clone()
     }
 }
 
@@ -104,7 +109,17 @@ impl FakeLanguageModelProvider {
             models: vec![Arc::new(FakeLanguageModel::default())],
             auth_state_override: Arc::new(Mutex::new(None)),
             auth_state_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            observable: None,
         }
+    }
+
+    /// Install an observable entity so the registry's `subscribe` path can fire
+    /// when the entity emits `cx.notify()`. Used by T11 to exercise the real
+    /// `Event::ProviderStateChanged` path (rather than calling
+    /// `invalidate_auth_cache` manually).
+    pub fn with_observable_entity(mut self, entity: Entity<()>) -> Self {
+        self.observable = Some(entity);
+        self
     }
 
     pub fn with_models(mut self, models: Vec<Arc<dyn LanguageModel>>) -> Self {

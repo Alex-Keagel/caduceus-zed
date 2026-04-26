@@ -846,40 +846,52 @@ mod tests {
     /// T11 (AC-CACHE): a `ProviderStateChanged` event drops the cached entry. We
     /// trigger this by mutating the provider entity, which the registry's subscription
     /// watches.
+    /// T11 (plan v3.1 §4 cache invalidation, AC-CACHE2): the registry's
+    /// `register_provider` subscription on `observable_entity` MUST drop the
+    /// cache entry when the entity emits `cx.notify()` — without any manual
+    /// `invalidate_auth_cache` call. The pre-fix-loop version of this test
+    /// short-circuited via `invalidate_auth_cache(...)` because
+    /// FakeLanguageModelProvider had no observable_entity. Per plan v3.1
+    /// review item, this version drives the REAL subscription path.
     #[gpui::test]
     fn registry_invalidates_on_provider_state_changed_event(cx: &mut App) {
-        // FakeLanguageModelProvider's observable_entity is None, so its `subscribe`
-        // returns None — meaning the registry's subscription path can't fire for it.
-        // Instead, we exercise the equivalent code path by calling the public
-        // `invalidate_auth_cache` API which the subscription handler also calls. This
-        // proves the invalidation primitive; integration of subscribe→drop is covered
-        // by the test_register_providers smoke.
+        // Build a Fake provider that DOES expose an observable Entity<()>; the
+        // registry's `subscribe` path will then install a `cx.observe(...)`.
+        let observable: Entity<()> = cx.new(|_| ());
         let registry = cx.new(|_| LanguageModelRegistry::default());
-        let provider = Arc::new(FakeLanguageModelProvider::default());
+        let provider = Arc::new(
+            FakeLanguageModelProvider::default().with_observable_entity(observable.clone()),
+        );
         let id = provider.id();
         registry.update(cx, |registry, cx| {
             registry.register_provider(provider.clone(), cx);
         });
 
         // Prime the cache.
-        let r = registry.read(cx);
-        let _ = r.cached_auth_state(&id, cx);
+        let _ = registry.read(cx).cached_auth_state(&id, cx);
         provider.set_auth_state(Some(ProviderAuthState::disabled_by_policy("test")));
 
-        // Cached value still reflects the old state.
+        // Cached value still reflects the OLD state (Authenticated): no notify
+        // has fired yet.
         assert!(matches!(
-            r.cached_auth_state(&id, cx),
+            registry.read(cx).cached_auth_state(&id, cx),
             ProviderAuthState::Authenticated
         ));
 
-        // Simulate the subscription dropping the entry on ProviderStateChanged.
-        r.invalidate_auth_cache(&id);
+        // Fire a real notify on the observable entity. The registry's
+        // subscription closure runs on the registry's cx (an `&mut App`
+        // dispatch), drops the cache entry, and emits ProviderStateChanged.
+        observable.update(cx, |_, cx| cx.notify());
 
-        // Subsequent read sees the new state.
-        assert!(matches!(
-            r.cached_auth_state(&id, cx),
-            ProviderAuthState::DisabledByPolicy(_)
-        ));
+        // No manual invalidation: the next read must reflect the new state.
+        assert!(
+            matches!(
+                registry.read(cx).cached_auth_state(&id, cx),
+                ProviderAuthState::DisabledByPolicy(_)
+            ),
+            "T11: real Event::ProviderStateChanged subscription failed to drop \
+             cached auth-state entry on observable.notify()"
+        );
     }
 
     /// T12 (AC-CACHE): a cached `RateLimited` entry whose `rate_limited_until`
