@@ -1192,6 +1192,7 @@ impl NativeAgent {
                 NativeAgentConnection::handle_thread_events(
                     events,
                     acp_thread.downgrade(),
+                    Some(thread.downgrade()),
                     None,
                     None,
                     cx,
@@ -1370,6 +1371,7 @@ impl NativeAgent {
                 NativeAgentConnection::handle_thread_events(
                     response_stream,
                     acp_thread.downgrade(),
+                    Some(thread.downgrade()),
                     None,
                     None,
                     cx,
@@ -2034,13 +2036,14 @@ impl NativeAgentConnection {
         };
         log::debug!("Found session for: {}", session_id);
 
-        let response_stream = match f(thread, cx) {
+        let response_stream = match f(thread.clone(), cx) {
             Ok(stream) => stream,
             Err(err) => return Task::ready(Err(err)),
         };
         Self::handle_thread_events(
             response_stream,
             acp_thread.downgrade(),
+            Some(thread.downgrade()),
             Some(abort_rx),
             Some(auth_tasks),
             cx,
@@ -2050,6 +2053,7 @@ impl NativeAgentConnection {
     fn handle_thread_events(
         mut events: mpsc::UnboundedReceiver<Result<ThreadEvent>>,
         acp_thread: WeakEntity<AcpThread>,
+        thread_for_pins: Option<WeakEntity<Thread>>,
         abort_rx: Option<watch::Receiver<bool>>,
         auth_tasks: Option<std::sync::Arc<std::sync::Mutex<Vec<Task<()>>>>>,
         cx: &App,
@@ -2155,6 +2159,16 @@ impl NativeAgentConnection {
                             }
                             ThreadEvent::Plan(plan) => {
                                 acp_thread.update(cx, |thread, cx| thread.update_plan(plan, cx))?;
+                                // ST2: SIBLING `thread.update` to record a
+                                // PlanUpdate pin on the most-recent user
+                                // message. `thread_for_pins` is `None` only
+                                // for transitional callers; production paths
+                                // always pass `Some`.
+                                if let Some(thread_weak) = thread_for_pins.as_ref() {
+                                    let _ = thread_weak.update(cx, |t, cx| {
+                                        t.on_plan_event_emitted(cx);
+                                    });
+                                }
                             }
                             ThreadEvent::SubagentSpawned(session_id) => {
                                 acp_thread.update(cx, |thread, cx| {
