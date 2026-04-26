@@ -2,7 +2,7 @@ use acp_thread::{SUBAGENT_SESSION_INFO_META_KEY, SubagentSessionInfo};
 use agent_client_protocol as acp;
 use anyhow::Result;
 use caduceus_core::{SubAgentFailure, SubAgentPhase, TimeoutFailure};
-use gpui::{App, SharedString, Task};
+use gpui::{App, AppContext, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -102,6 +102,29 @@ pub fn classify_subagent_error(
     SubAgentFailure::InternalError {
         kind: "subagent_send_failed".into(),
         message: msg,
+    }
+}
+
+/// ST7 fix-loop #3: apply one observed `AgentEvent` to the per-spawn
+/// `(last_phase, tools_started)` state. Pure & sync — extracted from
+/// the `run()` event-pump task so it can be unit-tested without the
+/// gpui executor or a full subagent.
+///
+/// Contract:
+/// - Phase transitions via [`SubAgentPhase::next_phase`] (the v3.1 Fix 2
+///   table — ToolResultEnd does NOT exit ToolExecution).
+/// - `tools_started` is monotonic: set to `true` on the first
+///   `ToolCallStart` and never reset (matches `TimeoutFailure`'s
+///   semantics — "did this subagent ever start a tool?").
+pub(crate) fn apply_event_to_phase_state(
+    state: &std::sync::Mutex<(SubAgentPhase, bool)>,
+    event: &caduceus_core::AgentEvent,
+) {
+    let mut guard = state.lock().unwrap();
+    let (phase, tools) = &mut *guard;
+    *phase = phase.next_phase(event);
+    if matches!(event, caduceus_core::AgentEvent::ToolCallStart { .. }) {
+        *tools = true;
     }
 }
 
@@ -402,9 +425,23 @@ impl AgentTool for SpawnAgentTool {
             })?;
 
             // ST7 fix-loop #4: per-spawn local closure state (NOT a
-            // shared map). Phase tracking now wires the AgentEvent
-            // stream from the spawned subagent (see fix #3 in
-            // SubagentHandle::events_for_test).
+            // shared map).
+            //
+            // ST7 fix-loop #3: wire AgentEvent → phase mutation. The
+            // `SubagentHandle::events()` trait method (added in this
+            // commit) returns a fresh broadcast::Receiver scoped to
+            // this subagent. We pump events on a background task that
+            // updates `phase_state` via `SubAgentPhase::next_phase`,
+            // and sets `tools_started` on `ToolCallStart`. Both are
+            // read at the timeout / classify-error sites below so
+            // `TimeoutFailure.last_phase` and `tools_started` reflect
+            // observed events instead of the static `ModelSelection /
+            // false` defaults that pre-fix tests revealed.
+            //
+            // Threading: `Arc<Mutex<...>>` (not Rc) so the pump can
+            // run on `background_spawn` (Send) — the broadcast Receiver
+            // is itself Send + 'static. Mutex contention is negligible
+            // (one writer, one reader, both at low frequency).
             //
             // CLOCK: use gpui's BackgroundExecutor::now() so mock-clock
             // tests (`executor.advance_clock(900s)`) see the elapsed
@@ -412,8 +449,33 @@ impl AgentTool for SpawnAgentTool {
             // clock entirely, leaving elapsed_secs ≈ 0 in
             // mock-clock timeout tests (reviewer must-fix #4).
             let started_at = cx.background_executor().now();
-            let last_phase = SubAgentPhase::ModelSelection;
-            let tools_started = false;
+            let phase_state: Arc<std::sync::Mutex<(SubAgentPhase, bool)>> =
+                Arc::new(std::sync::Mutex::new((SubAgentPhase::ModelSelection, false)));
+
+            // Drop guard: when this task is dropped (timeout / completion / cancel),
+            // the receiver is dropped, the pump's `recv()` returns `Closed`, and
+            // the pump exits. We hold it in `_pump_task` so it lives for the spawn.
+            let _pump_task = if let Some(mut events) = subagent.events(cx) {
+                let phase_state = phase_state.clone();
+                Some(cx.background_spawn(async move {
+                    use tokio::sync::broadcast::error::RecvError;
+                    loop {
+                        match events.recv().await {
+                            Ok(event) => apply_event_to_phase_state(&phase_state, &event),
+                            Err(RecvError::Lagged(_)) => {
+                                // Lagged events would not retroactively
+                                // change the phase trajectory in a way
+                                // that's worth replaying for timeout
+                                // diagnostics. Skip and keep pumping.
+                                continue;
+                            }
+                            Err(RecvError::Closed) => break,
+                        }
+                    }
+                }))
+            } else {
+                None
+            };
 
             // ST7: race the `subagent.send()` future against the
             // configured spawn timeout via biased `select!` — timeout
@@ -437,6 +499,11 @@ impl AgentTool for SpawnAgentTool {
                             .now()
                             .saturating_duration_since(started_at)
                             .as_secs();
+                        // ST7 fix-loop #3: snapshot pump-mutated state.
+                        let (last_phase, tools_started) = {
+                            let g = phase_state.lock().unwrap();
+                            (g.0, g.1)
+                        };
                         let timeout_failure = SubAgentFailure::Timeout(TimeoutFailure::new(
                             elapsed,
                             spawn_timeout.as_secs(),
@@ -484,6 +551,12 @@ impl AgentTool for SpawnAgentTool {
                         .now()
                         .saturating_duration_since(started_at)
                         .as_secs();
+                    // ST7 fix-loop #3: snapshot pump-mutated state so
+                    // classifier sees the actual phase trajectory.
+                    let (last_phase, tools_started) = {
+                        let g = phase_state.lock().unwrap();
+                        (g.0, g.1)
+                    };
                     let failure = classify_subagent_error(
                         &e,
                         last_phase,
@@ -952,5 +1025,111 @@ mod tests {
             max_tokens: 100,
         });
         assert_eq!(p, SubAgentPhase::ContextManagement);
+    }
+
+    // ---- Fix-loop #3: phase pump mutates state from observed events ----
+    #[test]
+    fn fix3_apply_event_mutates_phase_and_tools_started() {
+        use caduceus_core::{AgentEvent, ToolCallId};
+        let state = std::sync::Mutex::new((SubAgentPhase::ModelSelection, false));
+
+        // Provider event flips ModelSelection -> ProviderCall, no tools.
+        apply_event_to_phase_state(
+            &state,
+            &AgentEvent::ThinkingStarted { iteration: 0 },
+        );
+        {
+            let g = state.lock().unwrap();
+            assert_eq!(g.0, SubAgentPhase::ProviderCall);
+            assert!(!g.1, "tools_started must stay false before any ToolCallStart");
+        }
+
+        // ToolCallStart: phase -> ToolExecution AND tools_started=true.
+        apply_event_to_phase_state(
+            &state,
+            &AgentEvent::ToolCallStart {
+                id: ToolCallId::new("t1"),
+                name: "read_file".into(),
+            },
+        );
+        {
+            let g = state.lock().unwrap();
+            assert_eq!(g.0, SubAgentPhase::ToolExecution);
+            assert!(g.1, "tools_started must flip on ToolCallStart");
+        }
+
+        // ToolResultEnd MUST NOT exit ToolExecution (v3.1 Fix 2 invariant).
+        apply_event_to_phase_state(
+            &state,
+            &AgentEvent::ToolResultEnd {
+                id: ToolCallId::new("t1"),
+                content: String::new(),
+                is_error: false,
+            },
+        );
+        {
+            let g = state.lock().unwrap();
+            assert_eq!(
+                g.0,
+                SubAgentPhase::ToolExecution,
+                "ToolResultEnd must stay in ToolExecution"
+            );
+        }
+
+        // Next provider-side event transitions back to ProviderCall, but
+        // tools_started stays true (monotonic).
+        apply_event_to_phase_state(&state, &AgentEvent::TextDelta { text: "x".into() });
+        {
+            let g = state.lock().unwrap();
+            assert_eq!(g.0, SubAgentPhase::ProviderCall);
+            assert!(
+                g.1,
+                "tools_started is monotonic — must remain true after later events"
+            );
+        }
+    }
+
+    // ---- Fix-loop #3: TimeoutFailure built from pump-mutated state
+    //      reflects the observed phase trajectory, not the static
+    //      ModelSelection / false defaults. This is the regression test
+    //      for the reviewer's "phase tracking is dead" finding. ----
+    #[test]
+    fn fix3_timeout_failure_reads_pump_mutated_state() {
+        use caduceus_core::{AgentEvent, ToolCallId};
+        let state = std::sync::Mutex::new((SubAgentPhase::ModelSelection, false));
+        // Simulate a representative event sequence the pump would
+        // apply during a real spawn before timing out.
+        for ev in [
+            AgentEvent::ThinkingStarted { iteration: 0 },
+            AgentEvent::ToolCallStart {
+                id: ToolCallId::new("t1"),
+                name: "grep".into(),
+            },
+        ] {
+            apply_event_to_phase_state(&state, &ev);
+        }
+        // Snapshot at timeout (mirrors the run() timer arm).
+        let (last_phase, tools_started) = {
+            let g = state.lock().unwrap();
+            (g.0, g.1)
+        };
+        let failure =
+            SubAgentFailure::Timeout(TimeoutFailure::new(901, 900, last_phase, tools_started));
+        match failure {
+            SubAgentFailure::Timeout(t) => {
+                assert_eq!(
+                    t.last_phase,
+                    SubAgentPhase::ToolExecution,
+                    "TimeoutFailure.last_phase must reflect the most recent observed event \
+                     (ToolCallStart) — pre-fix this was always ModelSelection"
+                );
+                assert!(
+                    t.tools_started,
+                    "TimeoutFailure.tools_started must reflect ToolCallStart having been seen \
+                     — pre-fix this was always false"
+                );
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
     }
 }

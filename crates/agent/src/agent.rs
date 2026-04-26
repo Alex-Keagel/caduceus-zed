@@ -3166,6 +3166,20 @@ impl SubagentHandle for NativeSubagentHandle {
             result
         })
     }
+
+    /// ST7 fix #3: subscribe to the spawned thread's caduceus
+    /// `AgentEventEmitter` so `spawn_agent_tool` can drive phase
+    /// tracking. Returns `None` when the harness is not yet built (no
+    /// emitter populated) — phase tracking then stays at the default
+    /// `ModelSelection`/`tools_started=false`, matching pre-fix
+    /// behavior.
+    fn events(
+        &self,
+        cx: &mut AsyncApp,
+    ) -> Option<tokio::sync::broadcast::Receiver<caduceus_core::AgentEvent>> {
+        self.subagent_thread
+            .read_with(cx, |thread, _cx| thread.subagent_event_subscriber())
+    }
 }
 
 pub struct AcpTerminalHandle {

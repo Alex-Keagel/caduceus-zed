@@ -664,6 +664,19 @@ pub trait SubagentHandle {
     fn num_entries(&self, cx: &App) -> usize;
     /// Runs a turn for a given message and returns both the response and the index of that output message.
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
+    /// ST7 fix #3: subscribe to the spawned subagent's `AgentEvent` stream
+    /// so `spawn_agent_tool` can drive phase tracking
+    /// (`SubAgentPhase::next_phase` + `tools_started`). Returns `None`
+    /// when no emitter is wired (e.g. legacy/non-caduceus paths). Each
+    /// call returns a fresh broadcast receiver that observes only events
+    /// emitted *after* this call. Default impl returns `None` so adding
+    /// this method is non-breaking for downstream `SubagentHandle` impls.
+    fn events(
+        &self,
+        _cx: &mut AsyncApp,
+    ) -> Option<tokio::sync::broadcast::Receiver<caduceus_core::AgentEvent>> {
+        None
+    }
 }
 
 /// Options for spawning a sub-agent. Allows the master to override inherited
@@ -1561,6 +1574,18 @@ impl Thread {
     /// Returns true if this thread was imported from a shared thread.
     pub fn is_imported(&self) -> bool {
         self.imported
+    }
+
+    /// ST7 fix #3: subscribe to the caduceus engine's `AgentEventEmitter`
+    /// for this thread, if a harness has been built. Returns `None` when
+    /// no emitter is wired (legacy code paths or pre-harness-build state).
+    /// Each call returns a fresh broadcast receiver scoped to events
+    /// emitted *after* this call (use the emitter's retention ring for
+    /// replay if needed).
+    pub fn subagent_event_subscriber(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<caduceus_core::AgentEvent>> {
+        self.caduceus.emitter.as_ref().map(|e| e.subscribe())
     }
 
     pub fn replay(
