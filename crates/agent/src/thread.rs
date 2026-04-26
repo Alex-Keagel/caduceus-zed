@@ -2040,6 +2040,45 @@ impl Thread {
 
     pub fn to_db(&self, cx: &App) -> Task<DbThread> {
         let initial_project_snapshot = self.initial_project_snapshot.clone();
+        // ST2 fix-loop #6: filter orphaned pins inline. `to_db` takes
+        // `&self`, so we cannot call `gc_pinned()` here (which requires
+        // `&mut self`). Apply the same retain predicate as gc_pinned so
+        // persisted state is never polluted by dangling pins, even if
+        // an upstream mutation path forgot to call gc_pinned.
+        let user_ids: HashSet<UserMessageId> = self
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => Some(u.id.clone()),
+                _ => None,
+            })
+            .collect();
+        let resume_ids: HashSet<ResumeId> = self
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Resume(rid) => Some(*rid),
+                _ => None,
+            })
+            .collect();
+        let agent_ids: HashSet<AgentMessageId> = self
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Agent(a) => Some(a.id),
+                _ => None,
+            })
+            .collect();
+        let pinned: Vec<MessageRef> = self
+            .pinned
+            .iter()
+            .filter(|p| match &p.key {
+                PinnedMessageKey::User(id) => user_ids.contains(id),
+                PinnedMessageKey::Resume(rid) => resume_ids.contains(rid),
+                PinnedMessageKey::Agent(aid) => agent_ids.contains(aid),
+            })
+            .cloned()
+            .collect();
         let mut thread = DbThread {
             title: self.title().unwrap_or_default(),
             messages: self.messages.clone(),
@@ -2065,7 +2104,7 @@ impl Thread {
                     offset_in_item: lo.offset_in_item.as_f32(),
                 }
             }),
-            pinned: self.pinned.clone(),
+            pinned,
         };
 
         cx.background_spawn(async move {
@@ -3046,6 +3085,11 @@ impl Thread {
                 ))],
             }),
         );
+        // ST2 fix-loop #6: drop pins whose target messages were just
+        // evicted by the drain above. Pins on surviving messages keep
+        // their semantic meaning; pins on evicted messages are stale
+        // and must not leak to disk via to_db.
+        self.gc_pinned();
         self.invalidate_token_cache();
 
         log::info!(
@@ -3401,6 +3445,12 @@ impl Thread {
                 },
             );
         }
+        // ST2 fix-loop #6: drop pins that target messages no longer in
+        // the live message vec. Without this, `pinned_message_indices`
+        // could silently lose entries (resolve_key_to_index returns
+        // None) but the orphaned pins would persist in `self.pinned`
+        // and eventually be written to disk.
+        self.gc_pinned();
         self.invalidate_token_cache();
         self.clear_summary();
         cx.notify();
@@ -10308,16 +10358,97 @@ mod st2_pinned_tests {
     #[gpui::test]
     async fn t_to_db_round_trips_pinned(cx: &mut TestAppContext) {
         let (thread, _ev) = setup_thread_for_test(cx).await;
-        let k = user_key();
-        thread.update(cx, |t, _| {
+        let id = UserMessageId::new();
+        let k = PinnedMessageKey::User(id.clone());
+        thread.update(cx, |t, cx| {
+            // Push a real user message so the pin's target survives the
+            // ST2 fix-loop #6 orphan filter inside to_db.
+            t.push_acp_user_block(
+                id,
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
             t.pin_at(k.clone(), PinReason::Manual, fixed_now());
         });
         let db = cx
             .update(|cx| thread.read(cx).to_db(cx))
             .await;
-        assert_eq!(db.pinned.len(), 1);
-        assert_eq!(db.pinned[0].key, k);
-        assert_eq!(db.pinned[0].reason, PinReason::Manual);
+        // The pushed user message also auto-pins as FirstUser, so we
+        // expect 2 pins (Manual + FirstUser) — not orphaned.
+        assert_eq!(db.pinned.len(), 2);
+        assert!(db.pinned.iter().any(|p| p.key == k && p.reason == PinReason::Manual));
+        assert!(db.pinned.iter().any(|p| p.key == k && p.reason == PinReason::FirstUser));
+    }
+
+    #[gpui::test]
+    async fn t_to_db_filters_orphaned_pins(cx: &mut TestAppContext) {
+        // ST2 fix-loop #6: persistence must never include pins whose
+        // target message is no longer present. Add a pin with a key
+        // that doesn't correspond to any live message; assert to_db
+        // drops it.
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            // Orphan pin — no live message with this UserMessageId.
+            let orphan = PinnedMessageKey::User(UserMessageId::new());
+            t.pin_at(orphan, PinReason::Manual, fixed_now());
+        });
+        let db = cx
+            .update(|cx| thread.read(cx).to_db(cx))
+            .await;
+        assert!(
+            db.pinned.is_empty(),
+            "to_db must filter orphaned pins; got {:?}",
+            db.pinned
+        );
+    }
+
+    #[gpui::test]
+    async fn t_truncate_runs_gc_pinned(cx: &mut TestAppContext) {
+        // ST2 fix-loop #6: truncate must call gc_pinned so pins on
+        // truncated messages are cleared.
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        let id1 = UserMessageId::new();
+        let id2 = UserMessageId::new();
+        thread.update(cx, |t, cx| {
+            t.push_acp_user_block(
+                id1.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.push_acp_user_block(
+                id2.clone(),
+                std::iter::empty::<acp::ContentBlock>(),
+                util::paths::PathStyle::local(),
+                cx,
+            );
+            t.pin_at(
+                PinnedMessageKey::User(id1.clone()),
+                PinReason::Manual,
+                fixed_now(),
+            );
+            t.pin_at(
+                PinnedMessageKey::User(id2.clone()),
+                PinReason::Manual,
+                fixed_now(),
+            );
+            // Truncate to id2 — drops messages from id2 onward.
+            t.truncate(id2.clone(), cx)
+                .expect("truncate to id2 must succeed");
+        });
+        thread.update(cx, |t, _| {
+            // id2's message is gone; its pin must have been GC'd. id1
+            // still lives and remains pinned.
+            assert!(
+                t.is_pinned(&PinnedMessageKey::User(id2.clone())).is_empty(),
+                "pin on truncated message must be gc'd"
+            );
+            assert!(
+                !t.is_pinned(&PinnedMessageKey::User(id1.clone())).is_empty(),
+                "pin on surviving message must remain"
+            );
+        });
     }
 
     #[gpui::test]
