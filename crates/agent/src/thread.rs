@@ -2660,8 +2660,11 @@ impl Thread {
     /// expansion). Replacement semantics: a new request supersedes the
     /// prior `ScopeExpansionActive` pin via `pin_replace`.
     ///
-    /// Auto-unpin on Granted/Denied is **deferred to ST2.5** — the
-    /// permission lifecycle event is not bridged onto `AgentEvent` today.
+    /// Auto-unpin on Granted/Denied is handled by [`Self::on_turn_complete_unpin_scope_expansion`]:
+    /// the pin's purpose is to keep the triggering user message in context
+    /// while the expansion is being resolved by the user; once the turn that
+    /// owns it ends — whether the agent retried after grant, gave up after
+    /// deny, or the request was abandoned — the pin's job is done.
     pub fn on_scope_expansion_requested(&mut self) {
         let target = self.messages.iter().rev().find_map(|m| match m {
             Message::User(u) => Some(u.id.clone()),
@@ -2674,6 +2677,48 @@ impl Thread {
             return;
         };
         self.pin_replace(PinnedMessageKey::User(id), PinReason::ScopeExpansionActive);
+    }
+
+    /// ST2.5: clear any `ScopeExpansionActive` pin and emit a duration
+    /// telemetry event. Called from the native-loop consumer task on
+    /// `T::TurnComplete` (turn lifecycle terminator). Idempotent: returns
+    /// silently when no such pin exists.
+    ///
+    /// Why turn-scoped (not Granted/Denied-scoped):
+    /// - `caduceus_permissions::PermissionEvent::ScopeExpansionGranted/Denied`
+    ///   exist as type variants but are never *emitted* in the orchestrator
+    ///   today (envelope is locked at harness construction).
+    /// - The pin's only purpose is to keep the triggering user message in
+    ///   context for the turn that requested expansion. Whether the user
+    ///   grants, denies, or ignores the request, the turn ends and the pin
+    ///   is no longer needed — the next turn will re-emit
+    ///   `ScopeExpansionRequested` if a new tool hits the envelope wall.
+    /// - Idempotent + bounded: at most one ScopeExpansionActive pin at a
+    ///   time (singleton-by-reason via pin_replace), so this is O(pins).
+    pub fn on_scope_expansion_resolved(&mut self) {
+        // Snapshot pin metadata before mutation so we can compute duration.
+        let to_clear: Vec<(PinnedMessageKey, chrono::DateTime<chrono::Utc>)> = self
+            .pinned
+            .iter()
+            .filter(|p| p.reason == PinReason::ScopeExpansionActive)
+            .map(|p| (p.key.clone(), p.pinned_at))
+            .collect();
+        if to_clear.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now();
+        for (key, pinned_at) in to_clear {
+            let duration_ms = now
+                .signed_duration_since(pinned_at)
+                .num_milliseconds()
+                .max(0) as u64;
+            self.unpin_reason(&key, PinReason::ScopeExpansionActive);
+            telemetry::event!(
+                "pin.scope_expansion_active.duration_ms",
+                thread_id = self.id.to_string(),
+                duration_ms = duration_ms
+            );
+        }
     }
 
     pub(crate) fn message_count(&self) -> usize {
@@ -4422,6 +4467,16 @@ impl Thread {
                 if matches!(ev, T::ScopeExpansion { .. }) {
                     let _ = thread_for_pins.update(cx_cons, |t, _cx| {
                         t.on_scope_expansion_requested();
+                    });
+                }
+                // ST2.5: clear ScopeExpansionActive pin when the turn that
+                // owned it ends. The pin's purpose is bounded to the
+                // requesting turn — once TurnComplete fires (granted, denied,
+                // budget-exceeded, or otherwise), the pin is no longer needed.
+                // Idempotent: no-op when no such pin exists.
+                if matches!(ev, T::TurnComplete { .. }) {
+                    let _ = thread_for_pins.update(cx_cons, |t, _cx| {
+                        t.on_scope_expansion_resolved();
                     });
                 }
                 // ST2 fix-loop #4: native-loop PlanUpdate hook. PlanStep and
@@ -9937,6 +9992,50 @@ mod st2_pinned_tests {
         thread.update(cx, |t, _| {
             assert_eq!(t.unpin(&user_key()), 0);
             assert!(!t.unpin_reason(&user_key(), PinReason::Manual));
+        });
+    }
+
+    // ── ST2.5: on_scope_expansion_resolved auto-unpin ──────────────────
+    #[gpui::test]
+    async fn st25_on_scope_expansion_resolved_clears_active_pin(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let k = user_key();
+            t.pin_at(k.clone(), PinReason::ScopeExpansionActive, fixed_now());
+            assert_eq!(t.is_pinned(&k), vec![PinReason::ScopeExpansionActive]);
+            t.on_scope_expansion_resolved();
+            assert!(
+                t.is_pinned(&k).is_empty(),
+                "ScopeExpansionActive pin must be cleared on resolve"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn st25_on_scope_expansion_resolved_is_noop_when_no_pin(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            // No prior pin; resolve must not panic or error.
+            t.on_scope_expansion_resolved();
+            assert!(t.pinned_refs().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn st25_on_scope_expansion_resolved_preserves_other_reasons(cx: &mut TestAppContext) {
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let k = user_key();
+            t.pin_at(k.clone(), PinReason::FirstUser, fixed_now());
+            t.pin_at(k.clone(), PinReason::ScopeExpansionActive, fixed_now());
+            t.pin_at(k.clone(), PinReason::PlanUpdate, fixed_now());
+            t.on_scope_expansion_resolved();
+            // Only ScopeExpansionActive removed; FirstUser + PlanUpdate
+            // remain (independent pin lifecycles).
+            let remaining = t.is_pinned(&k);
+            assert!(remaining.contains(&PinReason::FirstUser));
+            assert!(remaining.contains(&PinReason::PlanUpdate));
+            assert!(!remaining.contains(&PinReason::ScopeExpansionActive));
         });
     }
 
