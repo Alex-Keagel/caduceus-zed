@@ -42,9 +42,38 @@ pub enum ProviderAuthState {
         retry_after: Option<Duration>,
         action: AuthAction,
     },
-    /// Provider is disabled by org/admin policy. `reason` is sanitized at construction so
-    /// it's safe to render verbatim in a tooltip.
-    DisabledByPolicy { reason: String },
+    /// Provider is disabled by org/admin policy. Wrap the reason in [`SanitizedReason`]
+    /// so it cannot be constructed without going through the S3 sanitizer.
+    DisabledByPolicy(SanitizedReason),
+}
+
+/// Newtype around a sanitized reason string. The inner `String` is private — the only
+/// way to construct one is [`SanitizedReason::new`] (or, transitively,
+/// [`ProviderAuthState::disabled_by_policy`]), both of which run
+/// [`sanitize_provider_reason`]. Pattern matches outside the crate must use
+/// [`SanitizedReason::as_str`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SanitizedReason(String);
+
+impl SanitizedReason {
+    /// Construct from any string-ish input, applying [`sanitize_provider_reason`].
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self(sanitize_provider_reason(&reason.into()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SanitizedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 impl ProviderAuthState {
@@ -71,9 +100,7 @@ impl ProviderAuthState {
 
     /// Construct a `DisabledByPolicy` state, sanitizing `reason` per S3.
     pub fn disabled_by_policy(reason: impl Into<String>) -> Self {
-        Self::DisabledByPolicy {
-            reason: sanitize_provider_reason(&reason.into()),
-        }
+        Self::DisabledByPolicy(SanitizedReason::new(reason))
     }
 
     /// True iff the provider can serve a completion request right now. This is the
@@ -95,7 +122,7 @@ impl ProviderAuthState {
             Self::Authenticated => "authenticated",
             Self::NotAuthenticated { .. } => "not_authenticated",
             Self::RateLimited { .. } => "rate_limited",
-            Self::DisabledByPolicy { .. } => "disabled_by_policy",
+            Self::DisabledByPolicy(_) => "disabled_by_policy",
         }
     }
 }
@@ -410,11 +437,23 @@ mod tests {
     fn disabled_by_policy_constructor_sanitizes_reason() {
         let s = ProviderAuthState::disabled_by_policy("Bearer abcdefghijk denied");
         match s {
-            ProviderAuthState::DisabledByPolicy { reason } => {
-                assert!(reason.contains("<redacted>"), "got {reason}");
-                assert!(!reason.contains("abcdefghijk"));
+            ProviderAuthState::DisabledByPolicy(reason) => {
+                assert!(reason.as_str().contains("<redacted>"), "got {}", reason);
+                assert!(!reason.as_str().contains("abcdefghijk"));
             }
             _ => unreachable!(),
         }
+    }
+
+    // fix-loop #6: SanitizedReason has no public constructor that bypasses the
+    // sanitizer. The only way in is `SanitizedReason::new` (or transitively
+    // `ProviderAuthState::disabled_by_policy`), both of which sanitize.
+    #[test]
+    fn sanitized_reason_only_constructible_via_sanitizer() {
+        let r = SanitizedReason::new("Bearer abcdefghijk leaked");
+        assert!(r.as_str().contains("<redacted>"));
+        assert!(!r.as_str().contains("abcdefghijk"));
+        // Round-trip via Display + into_string preserves sanitized content.
+        assert_eq!(r.to_string(), r.clone().into_string());
     }
 }

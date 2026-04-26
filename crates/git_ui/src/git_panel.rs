@@ -2728,7 +2728,7 @@ impl GitPanel {
                         }
                         ProviderAuthState::Authenticated
                         | ProviderAuthState::RateLimited { .. }
-                        | ProviderAuthState::DisabledByPolicy { .. } => None,
+                        | ProviderAuthState::DisabledByPolicy(_) => None,
                     }
                 }) {
                     task.await.log_err();

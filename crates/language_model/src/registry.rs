@@ -311,8 +311,8 @@ impl LanguageModelRegistry {
             ProviderAuthState::RateLimited { retry_after, .. } => Some(
                 ConfigurationError::ProviderRateLimited(model.provider, retry_after),
             ),
-            ProviderAuthState::DisabledByPolicy { reason } => Some(
-                ConfigurationError::ProviderDisabledByPolicy(model.provider, reason),
+            ProviderAuthState::DisabledByPolicy(reason) => Some(
+                ConfigurationError::ProviderDisabledByPolicy(model.provider, reason.into_string()),
             ),
         }
     }
@@ -870,7 +870,7 @@ mod tests {
         // Subsequent read sees the new state.
         assert!(matches!(
             r.cached_auth_state(&id, cx),
-            ProviderAuthState::DisabledByPolicy { .. }
+            ProviderAuthState::DisabledByPolicy(_)
         ));
     }
 
