@@ -81,6 +81,76 @@ pub struct DbThread {
     pub draft_prompt: Option<Vec<acp::ContentBlock>>,
     #[serde(default)]
     pub ui_scroll_position: Option<SerializedScrollPosition>,
+    /// ST2: pinned messages. `#[serde(default)]` for backward-compat
+    /// (legacy DbThread JSON without this field deserializes as `vec![]`).
+    /// Forward-compat: deserialized via `PinReasonProxy` which has
+    /// `#[serde(other)] Unknown` so future variants quarantine cleanly.
+    #[serde(default, deserialize_with = "deserialize_pinned_lossy")]
+    pub pinned: Vec<crate::MessageRef>,
+}
+
+/// Forward-compat proxy: a future build may write a `PinReason` variant
+/// this build doesn't know about. `#[serde(other)] Unknown` quarantines
+/// such values; they are filtered out (with a `WARN`) by
+/// `deserialize_pinned_lossy` so the rest of the thread loads cleanly.
+#[derive(Debug, Clone, Copy, Deserialize)]
+enum PinReasonProxy {
+    FirstUser,
+    Resume,
+    PlanUpdate,
+    ScopeExpansionActive,
+    Manual,
+    #[serde(other)]
+    Unknown,
+}
+
+impl PinReasonProxy {
+    fn into_known(self) -> Option<crate::PinReason> {
+        match self {
+            Self::FirstUser => Some(crate::PinReason::FirstUser),
+            Self::Resume => Some(crate::PinReason::Resume),
+            Self::PlanUpdate => Some(crate::PinReason::PlanUpdate),
+            Self::ScopeExpansionActive => Some(crate::PinReason::ScopeExpansionActive),
+            Self::Manual => Some(crate::PinReason::Manual),
+            Self::Unknown => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MessageRefProxy {
+    key: crate::PinnedMessageKey,
+    reason: PinReasonProxy,
+    pinned_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn deserialize_pinned_lossy<'de, D>(de: D) -> Result<Vec<crate::MessageRef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let proxies: Vec<MessageRefProxy> = Vec::deserialize(de)?;
+    let total = proxies.len();
+    let mut out = Vec::with_capacity(total);
+    let mut quarantined = 0usize;
+    for p in proxies {
+        match p.reason.into_known() {
+            Some(reason) => out.push(crate::MessageRef {
+                key: p.key,
+                reason,
+                pinned_at: p.pinned_at,
+            }),
+            None => quarantined += 1,
+        }
+    }
+    if quarantined > 0 {
+        log::warn!(
+            "[st2] quarantined {} pin entries with unknown PinReason ({} kept of {})",
+            quarantined,
+            out.len(),
+            total
+        );
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -130,6 +200,7 @@ impl SharedThread {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            pinned: Vec::new(),
         }
     }
 
@@ -309,6 +380,7 @@ impl DbThread {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            pinned: Vec::new(),
         })
     }
 }
@@ -694,6 +766,7 @@ mod tests {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            pinned: Vec::new(),
         }
     }
 
