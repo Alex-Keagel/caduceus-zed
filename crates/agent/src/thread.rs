@@ -4357,6 +4357,19 @@ impl Thread {
                         t.on_scope_expansion_requested();
                     });
                 }
+                // ST2 fix-loop #4: native-loop PlanUpdate hook. PlanStep and
+                // PlanAmended are deltas (not snapshots), but pin_replace is
+                // idempotent per (key, reason) so calling on each delta is
+                // safe — at most one PlanUpdate pin survives, on the
+                // most-recent agent message at the time of the latest delta.
+                // Plan v3.1 §4 acknowledged this hook as deferred to G1d, but
+                // adding it now closes the convergent reviewer finding that
+                // PlanUpdate fires only on the legacy ACP path.
+                if matches!(ev, T::PlanStep { .. } | T::PlanAmended { .. }) {
+                    let _ = thread_for_pins.update(cx_cons, |t, cx| {
+                        t.on_plan_event_emitted(cx);
+                    });
+                }
                 let handled_fully = handle_native_tool_lifecycle(
                     &ev,
                     &mut input_agg,
