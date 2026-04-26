@@ -3375,7 +3375,7 @@ impl Thread {
                 attempt += 1;
                 let retry = this.update(cx, |this, cx| {
                     let user_store = this.user_store.read(cx);
-                    this.handle_completion_error(error, attempt, user_store.plan())
+                    this.handle_completion_error(error, attempt, user_store.plan(), cx)
                 })??;
                 let timer = cx.background_executor().timer(retry.duration);
                 event_stream.send_retry(retry);
@@ -3974,10 +3974,21 @@ impl Thread {
         error: LanguageModelCompletionError,
         attempt: u8,
         plan: Option<Plan>,
+        cx: &mut Context<Self>,
     ) -> Result<acp_thread::RetryStatus> {
         let Some(model) = self.model.as_ref() else {
             return Err(anyhow!(error));
         };
+
+        // ST1a fix-loop #2: feed completion errors into the registry's auth-state
+        // cache so a 401 invalidates `Authenticated` and a 429 records `RateLimited`.
+        // Plan v3.1 §4 (cache invalidation table — "AuthenticationError (HTTP 401)"
+        // and "RateLimitExceeded { retry_after }" rows). Without this the cache only
+        // sees errors from tests.
+        let provider_id = model.provider_id();
+        LanguageModelRegistry::global(cx).update(cx, |registry, _cx| {
+            registry.note_completion_error(&provider_id, &error);
+        });
 
         let auto_retry = if model.provider_id() == ZED_CLOUD_PROVIDER_ID {
             plan.is_some()

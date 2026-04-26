@@ -1,4 +1,5 @@
 mod api_key;
+mod auth_state;
 mod model;
 mod registry;
 mod request;
@@ -17,6 +18,7 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 
 pub use crate::api_key::{ApiKey, ApiKeyState};
+pub use crate::auth_state::*;
 pub use crate::model::*;
 pub use crate::registry::*;
 pub use crate::request::{LanguageModelImageExt, gpui_size_to_image_size, image_size_to_gpui};
@@ -290,7 +292,20 @@ pub trait LanguageModelProvider: 'static {
     fn recommended_models(&self, _cx: &App) -> Vec<Arc<dyn LanguageModel>> {
         Vec::new()
     }
-    fn is_authenticated(&self, cx: &App) -> bool;
+    /// Returns the auth state of this provider. Replaces the boolean `is_authenticated()`
+    /// in ST1a (`caduceus-fix/st1-provider-auth-state`); see `ProviderAuthState` for the
+    /// 4-variant enum and per-provider mapping. Note the `&App` (not `&mut App`)
+    /// constraint — implementations must read state without mutation.
+    fn auth_state(&self, cx: &App) -> ProviderAuthState;
+    /// Back-compat shim. Returns `auth_state(cx).can_provide_models()`. Deprecated; use
+    /// `auth_state(cx)` and match on the variant. Removed in ST1b once selector + every
+    /// caller has been migrated.
+    #[deprecated(
+        note = "ST1a: use auth_state(cx) and inspect the variant. Shim removed in ST1b."
+    )]
+    fn is_authenticated(&self, cx: &App) -> bool {
+        self.auth_state(cx).can_provide_models()
+    }
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>>;
     fn configuration_view(
         &self,

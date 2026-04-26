@@ -1,8 +1,8 @@
 use crate::{
-    AuthenticateError, ConfigurationViewTargetAgent, LanguageModel, LanguageModelCompletionError,
-    LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
-    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
-    LanguageModelRequest, LanguageModelToolChoice,
+    AuthenticateError, ConfigurationViewTargetAgent, LanguageModel,
+    LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelId,
+    LanguageModelName, LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
+    LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice, ProviderAuthState,
 };
 use anyhow::anyhow;
 use futures::{FutureExt, channel::mpsc, future::BoxFuture, stream::BoxStream, stream::StreamExt};
@@ -19,6 +19,17 @@ pub struct FakeLanguageModelProvider {
     id: LanguageModelProviderId,
     name: LanguageModelProviderName,
     models: Vec<Arc<dyn LanguageModel>>,
+    /// Override `auth_state()` for tests that need a non-`Authenticated` value. Wrapped in
+    /// `Arc<Mutex<>>` so `&self`-only `auth_state(cx)` can read it and tests can mutate via
+    /// `set_auth_state`.
+    auth_state_override: Arc<Mutex<Option<ProviderAuthState>>>,
+    /// Counts every call to `auth_state(cx)`. Used by registry cache tests
+    /// (AC-PERF1) to prove a fan-out render frame causes ≤1 underlying call.
+    auth_state_call_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Optional real `Entity<()>` so `observable_entity()` can return `Some(_)`.
+    /// Tests that need to drive the registry's `Event::ProviderStateChanged`
+    /// subscription path (T11) install one via `with_observable_entity`.
+    observable: Option<Entity<()>>,
 }
 
 impl Default for FakeLanguageModelProvider {
@@ -27,6 +38,9 @@ impl Default for FakeLanguageModelProvider {
             id: LanguageModelProviderId::from("fake".to_string()),
             name: LanguageModelProviderName::from("Fake".to_string()),
             models: vec![Arc::new(FakeLanguageModel::default())],
+            auth_state_override: Arc::new(Mutex::new(None)),
+            auth_state_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            observable: None,
         }
     }
 }
@@ -35,7 +49,7 @@ impl LanguageModelProviderState for FakeLanguageModelProvider {
     type ObservableEntity = ();
 
     fn observable_entity(&self) -> Option<Entity<Self::ObservableEntity>> {
-        None
+        self.observable.clone()
     }
 }
 
@@ -60,8 +74,13 @@ impl LanguageModelProvider for FakeLanguageModelProvider {
         self.models.clone()
     }
 
-    fn is_authenticated(&self, _: &App) -> bool {
-        true
+    fn auth_state(&self, _: &App) -> ProviderAuthState {
+        self.auth_state_call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.auth_state_override
+            .lock()
+            .clone()
+            .unwrap_or(ProviderAuthState::Authenticated)
     }
 
     fn authenticate(&self, _: &mut App) -> Task<Result<(), AuthenticateError>> {
@@ -88,12 +107,37 @@ impl FakeLanguageModelProvider {
             id,
             name,
             models: vec![Arc::new(FakeLanguageModel::default())],
+            auth_state_override: Arc::new(Mutex::new(None)),
+            auth_state_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            observable: None,
         }
+    }
+
+    /// Install an observable entity so the registry's `subscribe` path can fire
+    /// when the entity emits `cx.notify()`. Used by T11 to exercise the real
+    /// `Event::ProviderStateChanged` path (rather than calling
+    /// `invalidate_auth_cache` manually).
+    pub fn with_observable_entity(mut self, entity: Entity<()>) -> Self {
+        self.observable = Some(entity);
+        self
     }
 
     pub fn with_models(mut self, models: Vec<Arc<dyn LanguageModel>>) -> Self {
         self.models = models;
         self
+    }
+
+    /// Override the value returned by `auth_state(cx)`. Pass `None` to revert to the
+    /// `Authenticated` default. Used by tests that exercise the non-authenticated paths.
+    pub fn set_auth_state(&self, state: Option<ProviderAuthState>) {
+        *self.auth_state_override.lock() = state;
+    }
+
+    /// Number of times `auth_state(cx)` has been called. Used by the registry's
+    /// AC-PERF1 cache test to verify fan-out callers go through `cached_auth_state`.
+    pub fn auth_state_call_count(&self) -> usize {
+        self.auth_state_call_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn test_model(&self) -> FakeLanguageModel {

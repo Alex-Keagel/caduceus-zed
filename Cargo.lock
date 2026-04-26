@@ -9792,9 +9792,11 @@ dependencies = [
  "language_model_core",
  "log",
  "parking_lot",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+ "url",
  "util",
 ]
 

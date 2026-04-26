@@ -6,6 +6,7 @@ use futures::{Stream, TryFutureExt, stream};
 use gpui::{AnyView, App, AsyncApp, Context, CursorStyle, Entity, Task};
 use http_client::HttpClient;
 use language_model::{
+    AuthAction, ProviderAuthState,
     ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
     LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
     LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
@@ -301,8 +302,14 @@ impl LanguageModelProvider for OllamaLanguageModelProvider {
         models
     }
 
-    fn is_authenticated(&self, cx: &App) -> bool {
-        self.state.read(cx).is_authenticated()
+    fn auth_state(&self, cx: &App) -> ProviderAuthState {
+        if self.state.read(cx).is_authenticated() {
+            ProviderAuthState::Authenticated
+        } else {
+            ProviderAuthState::NotAuthenticated {
+                action: AuthAction::None,
+            }
+        }
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {

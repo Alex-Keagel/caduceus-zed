@@ -26,9 +26,10 @@ use gpui::{
 use indoc::indoc;
 use language_model::{
     CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelProviderName, LanguageModelRegistry, LanguageModelRequest,
-    LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, MessageContent, Role, StopReason, TokenUsage,
+    LanguageModelId, LanguageModelProviderId, LanguageModelProviderName, LanguageModelRegistry,
+    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelToolResult,
+    LanguageModelToolSchemaFormat, LanguageModelToolUse, MessageContent, ProviderAuthState, Role,
+    StopReason, TokenUsage,
     fake_provider::FakeLanguageModel,
 };
 use pretty_assertions::assert_eq;
@@ -3670,6 +3671,85 @@ async fn test_send_retry_on_error(cx: &mut TestAppContext) {
     });
 }
 
+/// ST1a fix-loop #2: a 401 / `AuthenticationError` returned by a provider during a
+/// completion call must invalidate the registry's auth-state cache for that provider
+/// id (plan v3.1 §4 cache-invalidation table). This drives a real 401 through a Fake
+/// provider via the same `handle_completion_error` path the production retry loop
+/// uses, then reads `cached_auth_state` to confirm the cache was touched.
+#[gpui::test]
+async fn test_completion_auth_error_invalidates_registry_cache(cx: &mut TestAppContext) {
+    let ThreadTest { thread, model, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+    let provider_id = LanguageModelProviderId::from("fake".to_string());
+
+    // Prime the registry's auth-cache with a stale `Authenticated` entry so we can
+    // observe a 401 invalidate it. The Fake model is not registered as a provider in
+    // the registry, but `note_completion_error` operates purely on the auth_cache
+    // map keyed by id, so we can still observe invalidation.
+    cx.update(|cx| {
+        let registry = LanguageModelRegistry::global(cx);
+        registry.read(cx).invalidate_auth_cache(&provider_id);
+    });
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(UserMessageId::new(), ["Hi"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Drive a 429 first — we expect the retry path to feed this into the cache.
+    fake_model.send_last_completion_stream_error(LanguageModelCompletionError::RateLimitExceeded {
+        provider: LanguageModelProviderName::new("Fake"),
+        retry_after: Some(Duration::from_secs(7)),
+    });
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Cache should now hold `RateLimited` for the provider id (set via
+    // `note_completion_error` on the retry path).
+    cx.update(|cx| {
+        let registry = LanguageModelRegistry::global(cx);
+        let state = registry.read(cx).cached_auth_state(&provider_id, cx);
+        assert!(
+            matches!(state, ProviderAuthState::RateLimited { retry_after: Some(d), .. } if d == Duration::from_secs(7)),
+            "expected RateLimited after 429; got {:?}",
+            state
+        );
+    });
+
+    // Advance past retry, then drive a 401 → cache should be invalidated.
+    cx.executor().advance_clock(Duration::from_secs(7));
+    cx.run_until_parked();
+    fake_model.send_last_completion_stream_error(LanguageModelCompletionError::AuthenticationError {
+        provider: LanguageModelProviderName::new("Fake"),
+        message: "401 unauthorized".into(),
+    });
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        // After 401, `note_completion_error` removes the cache entry. Reading it
+        // again falls through to providers.get() → no provider registered → returns
+        // the documented fallback `NotAuthenticated { action: None }`. The point is
+        // simply that the prior `RateLimited` entry is gone.
+        let registry = LanguageModelRegistry::global(cx);
+        let state = registry.read(cx).cached_auth_state(&provider_id, cx);
+        assert!(
+            !matches!(state, ProviderAuthState::RateLimited { .. }),
+            "401 should have evicted RateLimited entry; got {:?}",
+            state
+        );
+    });
+
+    // Drain any remaining events.
+    while let Some(Ok(event)) = events.next().await {
+        if matches!(event, ThreadEvent::Stop(..)) {
+            break;
+        }
+    }
+}
+
 #[gpui::test]
 async fn test_send_retry_finishes_tool_calls_on_error(cx: &mut TestAppContext) {
     let ThreadTest { thread, model, .. } = setup(cx, TestModel::Fake).await;
@@ -4096,7 +4176,12 @@ async fn setup(cx: &mut TestAppContext, model: TestModel) -> ThreadTest {
         settings::init(cx);
 
         match model {
-            TestModel::Fake => {}
+            TestModel::Fake => {
+                // ST1a fix-loop #2: handle_completion_error now feeds completion errors
+                // into LanguageModelRegistry's auth-state cache. The registry must be
+                // initialized for that path even in Fake-model tests.
+                language_model::init(cx);
+            }
             TestModel::Sonnet4 => {
                 gpui_tokio::init(cx);
                 let http_client = ReqwestClient::user_agent("agent tests").unwrap();

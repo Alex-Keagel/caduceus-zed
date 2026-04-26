@@ -1180,7 +1180,12 @@ impl ConversationView {
                         && LanguageModelRegistry::global(cx)
                             .read(cx)
                             .provider(&provider_id)
-                            .map_or(false, |provider| provider.is_authenticated(cx))
+                            // ST1a (C7): usability-check — only reset when the provider
+                            // becomes fully usable. `can_provide_models()` is the
+                            // direct replacement for `is_authenticated()` here.
+                            .map_or(false, |provider| {
+                                provider.auth_state(cx).can_provide_models()
+                            })
                     {
                         this.update(cx, |this, cx| {
                             this.reset(window, cx);

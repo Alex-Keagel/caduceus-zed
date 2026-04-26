@@ -20,12 +20,13 @@ use gpui::{AnyView, App, AsyncApp, Entity, Subscription, Task};
 use http_client::StatusCode;
 use language::language_settings::all_language_settings;
 use language_model::{
-    AuthenticateError, CompletionIntent, IconOrSvg, LanguageModel, LanguageModelCompletionError,
-    LanguageModelCompletionEvent, LanguageModelCostInfo, LanguageModelEffortLevel, LanguageModelId,
-    LanguageModelName, LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
-    LanguageModelProviderState, LanguageModelRequest, LanguageModelRequestMessage,
-    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, MessageContent, RateLimiter, Role, StopReason, TokenUsage,
+    AuthAction, AuthenticateError, CompletionIntent, IconOrSvg, LanguageModel,
+    LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelCostInfo,
+    LanguageModelEffortLevel, LanguageModelId, LanguageModelName, LanguageModelProvider,
+    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
+    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelToolChoice,
+    LanguageModelToolResultContent, LanguageModelToolSchemaFormat, LanguageModelToolUse,
+    MessageContent, ProviderAuthState, RateLimiter, Role, StopReason, TokenUsage,
 };
 use settings::SettingsStore;
 use ui::prelude::*;
@@ -136,12 +137,32 @@ impl LanguageModelProvider for CopilotChatLanguageModelProvider {
             .collect()
     }
 
-    fn is_authenticated(&self, cx: &App) -> bool {
-        self.state.read(cx).is_authenticated(cx)
+    fn auth_state(&self, cx: &App) -> ProviderAuthState {
+        // ST1a (F8): map Copilot's auth/Status enum onto `ProviderAuthState`.
+        // Authenticated iff `CopilotChat::global(cx).is_authenticated()`. Otherwise
+        // distinguish `Status::Disabled` (org policy) from other unauth states; both
+        // route through `SignInImperative` for ST1b's dispatcher except the
+        // policy-disabled case.
+        if self.state.read(cx).is_authenticated(cx) {
+            return ProviderAuthState::Authenticated;
+        }
+        // ST1a (F8): inspect the Copilot Status to distinguish org-policy `Disabled` from
+        // every other unauth state. We can't call `GlobalCopilotAuth::try_global(&mut)`
+        // here because `auth_state` only has `&App`; read the global directly.
+        if let Some(copilot) = cx.try_global::<GlobalCopilotAuth>().cloned() {
+            if matches!(copilot.0.read(cx).status(), Status::Disabled) {
+                return ProviderAuthState::disabled_by_policy(
+                    "Copilot is disabled. Enable Copilot in your organization settings to use Copilot Chat.",
+                );
+            }
+        }
+        ProviderAuthState::NotAuthenticated {
+            action: AuthAction::SignInImperative,
+        }
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
-        if self.is_authenticated(cx) {
+        if self.auth_state(cx).can_provide_models() {
             return Task::ready(Ok(()));
         };
 

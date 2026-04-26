@@ -29,6 +29,7 @@ use gpui::{
 use gpui_tokio::Tokio;
 use http_client::HttpClient;
 use language_model::{
+    AuthAction, ProviderAuthState,
     AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCacheConfiguration,
     LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelId, LanguageModelName,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
@@ -497,8 +498,19 @@ impl LanguageModelProvider for BedrockLanguageModelProvider {
             .collect()
     }
 
-    fn is_authenticated(&self, cx: &App) -> bool {
-        self.state.read(cx).is_authenticated()
+    fn auth_state(&self, cx: &App) -> ProviderAuthState {
+        // Plan v3 §3 (AuthAction taxonomy) and §B4 risk #1 — AWS Bedrock auth comes
+        // from IAM/STS profiles (env vars, ~/.aws/credentials, IMDS); there is no
+        // in-app remediation flow (no API key field, no device-code sign-in). We bias
+        // to NotAuthenticated with action=None and document that the user must fix
+        // their AWS environment outside of Zed.
+        if self.state.read(cx).is_authenticated() {
+            ProviderAuthState::Authenticated
+        } else {
+            ProviderAuthState::NotAuthenticated {
+                action: AuthAction::None,
+            }
+        }
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {

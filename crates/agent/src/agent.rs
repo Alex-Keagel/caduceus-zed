@@ -132,7 +132,10 @@ impl LanguageModels {
             .read(cx)
             .visible_providers()
             .into_iter()
-            .filter(|provider| provider.is_authenticated(cx))
+            // ST1a (C10): usability-check — AgentModelList shows currently-usable
+            // providers. ST5 may revisit (variant-direct so rate-limited shows in list
+            // with badge), but for ST1a preserves today's behavior.
+            .filter(|provider| provider.auth_state(cx).can_provide_models())
             .collect::<Vec<_>>();
 
         let mut language_model_list = IndexMap::default();

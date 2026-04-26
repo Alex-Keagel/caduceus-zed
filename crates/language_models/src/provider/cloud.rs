@@ -9,9 +9,9 @@ use futures::future::BoxFuture;
 use gpui::AsyncApp;
 use gpui::{AnyElement, AnyView, App, Context, Entity, Subscription, Task};
 use language_model::{
-    AuthenticateError, IconOrSvg, LanguageModel, LanguageModelProvider, LanguageModelProviderId,
-    LanguageModelProviderName, LanguageModelProviderState, ZED_CLOUD_PROVIDER_ID,
-    ZED_CLOUD_PROVIDER_NAME,
+    AuthAction, AuthenticateError, IconOrSvg, LanguageModel, LanguageModelProvider,
+    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
+    ProviderAuthState, ZED_CLOUD_PROVIDER_ID, ZED_CLOUD_PROVIDER_NAME,
 };
 use language_models_cloud::{CloudLlmTokenProvider, CloudModelProvider};
 use release_channel::AppVersion;
@@ -248,9 +248,15 @@ impl LanguageModelProvider for CloudLanguageModelProvider {
             .collect()
     }
 
-    fn is_authenticated(&self, cx: &App) -> bool {
+    fn auth_state(&self, cx: &App) -> ProviderAuthState {
         let state = self.state.read(cx);
-        !state.is_signed_out(cx)
+        if state.is_signed_out(cx) {
+            ProviderAuthState::NotAuthenticated {
+                action: AuthAction::SignInImperative,
+            }
+        } else {
+            ProviderAuthState::Authenticated
+        }
     }
 
     fn authenticate(&self, _cx: &mut App) -> Task<Result<(), AuthenticateError>> {

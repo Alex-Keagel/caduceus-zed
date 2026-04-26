@@ -7,6 +7,7 @@ use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use gpui::{AnyView, App, AsyncApp, Context, CursorStyle, Entity, Subscription, Task};
 use http_client::HttpClient;
 use language_model::{
+    AuthAction, ProviderAuthState,
     ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
     LanguageModelCompletionEvent, LanguageModelToolChoice, LanguageModelToolResultContent,
     LanguageModelToolUse, MessageContent, StopReason, TokenUsage, env_var,
@@ -295,8 +296,14 @@ impl LanguageModelProvider for LmStudioLanguageModelProvider {
             .collect()
     }
 
-    fn is_authenticated(&self, cx: &App) -> bool {
-        self.state.read(cx).is_authenticated()
+    fn auth_state(&self, cx: &App) -> ProviderAuthState {
+        if self.state.read(cx).is_authenticated() {
+            ProviderAuthState::Authenticated
+        } else {
+            ProviderAuthState::NotAuthenticated {
+                action: AuthAction::None,
+            }
+        }
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
