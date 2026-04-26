@@ -438,6 +438,25 @@ mod tests {
         let s = sanitize_provider_reason("a\x00b\x07c\td e");
         assert_eq!(s, "a b c d e");
 
+        // Round-3 regression (R2 must-fix #1+#2): control-char separators
+        // (\n, \r, \x0b) between a token prefix and the secret previously
+        // bypassed redaction because step-1 stripped the separator before
+        // the regex saw it. Lock that in.
+        for (input, leaked) in [
+            ("Bearer\nabc.def.ghi tail", "abc.def.ghi"),
+            ("prev\nBearer abc.def.ghi", "abc.def.ghi"),
+            ("word\rsk-SECRETKEY end", "SECRETKEY"),
+            ("leak\x0bya29.SECRET end", "ya29.SECRET"),
+            ("line1\ngho_REALTOKEN line2", "gho_REALTOKEN"),
+        ] {
+            let s = sanitize_provider_reason(input);
+            assert!(
+                !s.contains(leaked),
+                "control-separator leak: input={input:?} → output={s:?} still contains {leaked:?}",
+            );
+            assert!(s.contains("<redacted>"), "no redaction marker: {s:?}");
+        }
+
         // Length cap with char-boundary safety.
         let long: String = "x".repeat(MAX_REASON_LEN + 100);
         let s = sanitize_provider_reason(&long);
