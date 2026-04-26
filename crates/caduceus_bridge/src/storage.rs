@@ -422,6 +422,27 @@ pub struct StoredMessage {
     pub tokens: Option<u32>,
 }
 
+/// Search wiki pages for `query` without creating the wiki directory if it
+/// doesn't already exist.
+///
+/// Wave-2 wiki Phase D-1 helper: the auto-inject path runs on every turn for
+/// every project, including projects that have never opted into the wiki.
+/// `StorageBridge::search_pages` calls `WikiEngine::init()`, which creates
+/// `.caduceus/wiki/raw`, `index.md`, and `log.md` as a side effect — a poor
+/// trade for a feature that's default-off and read-only.
+///
+/// This free function returns `Ok(Vec::new())` when the wiki directory is
+/// absent and only invokes the underlying linear scan when there's something
+/// to scan. Matches the `caduceus_bridge::memory::get` free-function pattern
+/// already used at the auto-inject site.
+pub fn search_pages_no_init(project_root: &Path, query: &str) -> Result<Vec<WikiPage>, String> {
+    let wiki = WikiEngine::new(project_root);
+    if !wiki.wiki_dir().exists() {
+        return Ok(Vec::new());
+    }
+    wiki.search_pages(query).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,5 +698,38 @@ mod tests {
         let storage = StorageBridge::open_in_memory().unwrap();
         let result = storage.import_trajectory("not json");
         assert!(result.is_err());
+    }
+
+    // ─── wiki-D1: search_pages_no_init helper ────────────────────────────
+
+    #[test]
+    fn search_pages_no_init_returns_empty_when_wiki_dir_missing() {
+        // Auto-inject contract: opting in on a wiki-less project must be a
+        // no-op, NOT a silent dir-creation. Confirms we don't accidentally
+        // route through StorageBridge::search_pages (which calls init()).
+        let dir = tempfile::tempdir().unwrap();
+        let pages = search_pages_no_init(dir.path(), "anything").unwrap();
+        assert!(pages.is_empty());
+        assert!(
+            !dir.path().join(".caduceus").join("wiki").exists(),
+            "search_pages_no_init must NOT create the wiki directory"
+        );
+    }
+
+    #[test]
+    fn search_pages_no_init_returns_matches_when_wiki_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = StorageBridge::open_in_memory().unwrap();
+        // Use the regular bridge once to set up the wiki dir + page.
+        bridge
+            .write_page(dir.path(), "rust-tips", "# Rust\n\nUse clippy daily.\n")
+            .unwrap();
+
+        let pages = search_pages_no_init(dir.path(), "clippy").unwrap();
+        assert!(
+            pages.iter().any(|p| p.slug == "rust-tips"),
+            "expected rust-tips in matches, got {:?}",
+            pages.iter().map(|p| &p.slug).collect::<Vec<_>>()
+        );
     }
 }
