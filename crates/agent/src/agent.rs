@@ -3029,6 +3029,22 @@ impl SubagentHandle for NativeSubagentHandle {
                     .latest_token_usage()
                     .map(|usage| usage.ratio());
 
+                // ST7 r3 #2: capture (provider, model) BEFORE the
+                // background_spawn so the classifier downstream can
+                // populate ClassifyContext. The background future
+                // can't read `thread` (no AsyncApp in scope), so we
+                // read here and move the IDs into the closure.
+                let classify_ctx = {
+                    let t = thread.read(cx);
+                    let model = t.model();
+                    let provider = model.map(|m| {
+                        caduceus_core::ProviderId::new(m.provider_id().0.as_ref())
+                    });
+                    let model_id = model
+                        .map(|m| caduceus_core::ModelId::new(m.id().0.as_ref()));
+                    caduceus_core::ClassifyContext::new(provider, model_id)
+                };
+
                 parent_thread
                     .update(cx, |parent_thread, cx| {
                         parent_thread.register_running_subagent(thread.downgrade(), cx)
@@ -3097,14 +3113,17 @@ impl SubagentHandle for NativeSubagentHandle {
                                     } else if let Some(cd_err) =
                                         error.downcast_ref::<caduceus_core::CaduceusError>()
                                     {
-                                        // Empty context at this boundary: the
-                                        // (provider, model) pair is not in scope
-                                        // here. ST8 will populate this when the
-                                        // dispatcher emits CaduceusError directly
-                                        // through the harness (see plan V3 §A).
+                                        // ST7 r3 #2: ClassifyContext now
+                                        // populated from the subagent
+                                        // thread's configured model
+                                        // (captured outside the
+                                        // background_spawn). Provider /
+                                        // model are forwarded into
+                                        // ProviderErrorFailure for ST8's
+                                        // vendor-rerouting decision.
                                         let failure = caduceus_core::classify_caduceus_error(
                                             cd_err,
-                                            &caduceus_core::ClassifyContext::empty(),
+                                            &classify_ctx,
                                             caduceus_core::SubAgentPhase::Unknown,
                                             false,
                                             None,

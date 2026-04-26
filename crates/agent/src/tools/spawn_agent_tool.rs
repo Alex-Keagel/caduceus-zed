@@ -891,6 +891,77 @@ mod tests {
         }
     }
 
+    // ---- ST7 r3 #2: ClassifyContext is populated at agent.rs live path ----
+    #[test]
+    fn classify_caduceus_error_with_populated_context_surfaces_provider_and_model() {
+        // ST7 r3 #2 contract: the live error path at agent.rs:3105 now
+        // reads `thread.model()` BEFORE the background_spawn so it can
+        // build a populated ClassifyContext. This unit test locks in
+        // the downstream guarantee — when ctx carries (provider, model),
+        // ProviderErrorFailure must surface them so ST8's vendor-rerouter
+        // can branch correctly.
+        use caduceus_core::{
+            CaduceusError, ClassifyContext, ModelId, ProviderId, RetryClass, SubAgentFailure,
+            SubAgentPhase, classify_caduceus_error,
+        };
+        let provider = ProviderId::new("anthropic");
+        let model = ModelId::new("claude-opus-4.7");
+        let ctx = ClassifyContext::new(Some(provider.clone()), Some(model.clone()));
+
+        let err = CaduceusError::RateLimited { retry_after_secs: 30 };
+        match classify_caduceus_error(
+            &err,
+            &ctx,
+            SubAgentPhase::Unknown,
+            false,
+            None,
+            None,
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(
+                    p.provider,
+                    Some(provider),
+                    "provider must surface from ClassifyContext"
+                );
+                assert_eq!(
+                    p.model,
+                    Some(model),
+                    "model must surface from ClassifyContext"
+                );
+                assert_eq!(p.retry_class, RetryClass::Backoff);
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_with_empty_context_yields_none_for_provider_and_model() {
+        // Contrast test: pre-fix call sites used ClassifyContext::empty()
+        // and the result intentionally carried None for provider/model.
+        // Locks in that empty()-construction continues to leave the
+        // fields unpopulated — so a future regression that silently
+        // injects fake values would be caught.
+        use caduceus_core::{
+            CaduceusError, ClassifyContext, SubAgentFailure, SubAgentPhase,
+            classify_caduceus_error,
+        };
+        let err = CaduceusError::RateLimited { retry_after_secs: 30 };
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::Unknown,
+            false,
+            None,
+            None,
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert!(p.provider.is_none(), "empty ctx → provider None");
+                assert!(p.model.is_none(), "empty ctx → model None");
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
     // ---- Fix-loop #1: live path preserves CaduceusError -> typed ProviderError ----
     #[test]
     fn classify_subagent_error_downcasts_caduceus_error_ratelimit() {
