@@ -56,8 +56,8 @@ pub fn classify_subagent_error(
     err: &anyhow::Error,
     last_phase: SubAgentPhase,
     tools_started: bool,
-    elapsed_secs: u64,
-    timeout_secs: u64,
+    elapsed_secs: Option<u64>,
+    timeout_secs: Option<u64>,
 ) -> SubAgentFailure {
     if let Some(typed) = err.downcast_ref::<SubAgentFailure>() {
         return typed.clone();
@@ -401,8 +401,8 @@ impl AgentTool for SpawnAgentTool {
                         &err,
                         SubAgentPhase::ModelSelection,
                         false,
-                        0,
-                        spawn_timeout.as_secs(),
+                        None,
+                        Some(spawn_timeout.as_secs()),
                     );
                     SpawnAgentToolOutput::from_failure(None, &failure, None)
                 })?;
@@ -561,8 +561,8 @@ impl AgentTool for SpawnAgentTool {
                         &e,
                         last_phase,
                         tools_started,
-                        elapsed,
-                        spawn_timeout.as_secs(),
+                        Some(elapsed),
+                        Some(spawn_timeout.as_secs()),
                     );
                     let error = failure.to_string();
                     (
@@ -736,18 +736,18 @@ mod tests {
         use anyhow::anyhow;
         let err = anyhow!("User canceled");
         assert!(matches!(
-            classify_subagent_error(&err, SubAgentPhase::ModelSelection, false, 0, 900),
+            classify_subagent_error(&err, SubAgentPhase::ModelSelection, false, Some(0), Some(900)),
             SubAgentFailure::UserCancel
         ));
 
         let err = anyhow!("The agent refused to process that prompt. Try again.");
         assert!(matches!(
-            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, 0, 900),
+            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, Some(0), Some(900)),
             SubAgentFailure::ModelRefusal { .. }
         ));
 
         let err = anyhow!("synthetic random failure");
-        let f = classify_subagent_error(&err, SubAgentPhase::Unknown, false, 0, 900);
+        let f = classify_subagent_error(&err, SubAgentPhase::Unknown, false, Some(0), Some(900));
         match f {
             SubAgentFailure::InternalError { kind, .. } => {
                 assert_eq!(kind, "subagent_send_failed");
@@ -764,7 +764,7 @@ mod tests {
         p.http_status = Some(429);
         let typed = SubAgentFailure::ProviderError(p);
         let err = anyhow::Error::new(typed.clone());
-        let out = classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, 0, 900);
+        let out = classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, Some(0), Some(900));
         match out {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_after_secs, Some(30));
@@ -847,7 +847,7 @@ mod tests {
         };
         let err = anyhow::Error::new(typed);
         let out =
-            classify_subagent_error(&err, SubAgentPhase::ModelSelection, false, 0, 900);
+            classify_subagent_error(&err, SubAgentPhase::ModelSelection, false, Some(0), Some(900));
         match out {
             SubAgentFailure::RecursionLimitExceeded {
                 current_depth,
@@ -872,7 +872,7 @@ mod tests {
         // string) instead of papered over.
         let err = anyhow::anyhow!("Maximum subagent depth (4) reached");
         let out =
-            classify_subagent_error(&err, SubAgentPhase::ModelSelection, false, 0, 900);
+            classify_subagent_error(&err, SubAgentPhase::ModelSelection, false, Some(0), Some(900));
         match out {
             SubAgentFailure::InternalError { kind, .. } => {
                 assert_eq!(
@@ -897,7 +897,7 @@ mod tests {
             retry_after_secs: 30,
         });
         let out =
-            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, 0, 900);
+            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, Some(0), Some(900));
         match out {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
@@ -917,7 +917,7 @@ mod tests {
             context: "chat".into(),
         });
         let out =
-            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, 0, 900);
+            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, Some(0), Some(900));
         match out {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
@@ -931,7 +931,7 @@ mod tests {
         use caduceus_core::CaduceusError;
         let err = anyhow::Error::new(CaduceusError::Cancelled);
         let out =
-            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, 0, 900);
+            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, Some(0), Some(900));
         assert!(matches!(out, SubAgentFailure::UserCancel));
     }
 

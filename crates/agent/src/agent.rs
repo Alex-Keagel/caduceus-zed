@@ -3107,8 +3107,8 @@ impl SubagentHandle for NativeSubagentHandle {
                                             &caduceus_core::ClassifyContext::empty(),
                                             caduceus_core::SubAgentPhase::Unknown,
                                             false,
-                                            0,
-                                            0,
+                                            None,
+                                            None,
                                         );
                                         SubagentPromptResult::TypedError(failure)
                                     } else {
