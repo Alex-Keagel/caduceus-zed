@@ -21,6 +21,13 @@ use std::time::Duration;
 /// this is silently clamped + logged; see `ProviderAuthState::rate_limited`.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 3600);
 
+/// Bounded fallback TTL applied when a 429 response carries no `Retry-After` header.
+/// Without this, a headerless 429 would wedge the auth cache forever (no auto-expiry).
+/// Picked to be short enough that genuine recoveries land quickly, but long enough
+/// to absorb a typical token-bucket cooldown.
+/// Plan v3.1 review item #8.
+pub const HEADERLESS_RATE_LIMIT_TTL: Duration = Duration::from_secs(30);
+
 /// Maximum length (in bytes) of a sanitized `DisabledByPolicy::reason` string.
 pub const MAX_REASON_LEN: usize = 256;
 

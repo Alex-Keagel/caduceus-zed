@@ -425,9 +425,17 @@ impl LanguageModelRegistry {
     ) {
         match err {
             LanguageModelCompletionError::RateLimitExceeded { retry_after, .. } => {
-                let clamped = retry_after.map(|d| d.min(crate::MAX_RETRY_AFTER));
-                let state = ProviderAuthState::rate_limited(clamped, AuthAction::None);
-                let deadline = clamped.map(|d| Instant::now() + d);
+                // fix-loop #7: hand the raw `retry_after` to `rate_limited()`; that
+                // constructor is the SINGLE authority for clamping (and emits the
+                // log::warn! when an over-cap value is seen). Pre-clamping here
+                // suppressed those warnings and split the clamp logic across two sites.
+                let state = ProviderAuthState::rate_limited(*retry_after, AuthAction::None);
+                // fix-loop #8: headerless 429 (no Retry-After) must NOT poison the cache
+                // forever. Use a bounded fallback TTL so the entry auto-expires.
+                let deadline = match retry_after {
+                    Some(d) => Some(Instant::now() + (*d).min(crate::MAX_RETRY_AFTER)),
+                    None => Some(Instant::now() + crate::HEADERLESS_RATE_LIMIT_TTL),
+                };
                 self.auth_cache.borrow_mut().insert(
                     id.clone(),
                     CachedAuth {
@@ -959,7 +967,44 @@ mod tests {
         }
     }
 
-    /// T19 (AC4 — C1): `configuration_error()` maps `RateLimited` and
+    /// fix-loop #8: a 429 with NO `Retry-After` header must still get a bounded TTL,
+    /// so the cache entry auto-evicts. Without this, headerless 429s would wedge the
+    /// provider until process restart.
+    #[gpui::test]
+    fn headerless_rate_limit_evicts_via_fallback_ttl(cx: &mut App) {
+        let registry = cx.new(|_| LanguageModelRegistry::default());
+        let provider = Arc::new(FakeLanguageModelProvider::default());
+        let id = provider.id();
+        registry.update(cx, |registry, cx| {
+            registry.register_provider(provider.clone(), cx);
+        });
+
+        // Headerless 429.
+        let err = LanguageModelCompletionError::RateLimitExceeded {
+            provider: provider.name(),
+            retry_after: None,
+        };
+        registry.read(cx).note_completion_error(&id, &err);
+
+        // Cached as RateLimited with retry_after=None (the *state* doesn't lie about
+        // what the server told us).
+        match registry.read(cx).cached_auth_state(&id, cx) {
+            ProviderAuthState::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, None);
+            }
+            other => panic!("expected RateLimited, got {:?}", other),
+        }
+
+        // But the cache entry's deadline is bounded: rewind it to a moment past the
+        // fallback TTL and the next read must evict.
+        registry.read(cx).auth_cache.borrow_mut().get_mut(&id).unwrap()
+            .rate_limited_until = Some(Instant::now() - Duration::from_secs(1));
+        assert!(matches!(
+            registry.read(cx).cached_auth_state(&id, cx),
+            ProviderAuthState::Authenticated
+        ));
+    }
+
     /// `DisabledByPolicy` to the matching error variants instead of collapsing both
     /// to `ProviderNotAuthenticated`.
     #[gpui::test]
