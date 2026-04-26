@@ -162,7 +162,7 @@ pub(crate) fn render_thread_markdown(thread: &crate::db::DbThread) -> String {
         let role = match msg {
             crate::Message::User(_) => "User",
             crate::Message::Agent(_) => "Assistant",
-            crate::Message::Resume => "Resume",
+            crate::Message::Resume(_) => "Resume",
         };
         out.push_str(&format!("## {} (#{i})\n\n", role));
         out.push_str(&msg.to_markdown());

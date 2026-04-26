@@ -144,11 +144,63 @@ enum RetryStrategy {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Stable identity of a `Message::Resume` marker. Generated at push-time;
+/// invariant under truncation and compaction. Replaces the position-based
+/// `ResumeIndex` keying that silently retargeted pins after compaction
+/// removed earlier Resume markers (ST2 fix-loop #2).
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ResumeId(pub Uuid);
+
+impl ResumeId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for ResumeId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Message {
     User(UserMessage),
     Agent(AgentMessage),
-    Resume,
+    Resume(ResumeId),
+}
+
+impl<'de> Deserialize<'de> for Message {
+    /// Backward-compat: legacy DbThread JSON encodes `Message::Resume` as
+    /// the bare string `"Resume"` (unit variant). Newer DbThreads encode
+    /// it as `{"Resume": "<uuid>"}` (newtype variant). Accept both. A
+    /// legacy bare-string is deserialized with a freshly-allocated
+    /// `ResumeId`; the resulting id is unique within the loaded process
+    /// but is NOT round-trip-stable across the legacy boundary (which is
+    /// fine: legacy data has no Resume pins to invalidate).
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let v = serde_json::Value::deserialize(de).map_err(D::Error::custom)?;
+        if v == serde_json::Value::String("Resume".to_string()) {
+            return Ok(Message::Resume(ResumeId::new()));
+        }
+        #[derive(Deserialize)]
+        enum Helper {
+            User(UserMessage),
+            Agent(AgentMessage),
+            Resume(ResumeId),
+        }
+        let h: Helper = serde_json::from_value(v).map_err(D::Error::custom)?;
+        Ok(match h {
+            Helper::User(u) => Message::User(u),
+            Helper::Agent(a) => Message::Agent(a),
+            Helper::Resume(r) => Message::Resume(r),
+        })
+    }
 }
 
 impl Message {
@@ -169,7 +221,7 @@ impl Message {
                 }
             }
             Message::Agent(message) => message.to_request(),
-            Message::Resume => vec![LanguageModelRequestMessage {
+            Message::Resume(_) => vec![LanguageModelRequestMessage {
                 role: Role::User,
                 content: vec!["Continue where you left off".into()],
                 cache: false,
@@ -182,13 +234,13 @@ impl Message {
         match self {
             Message::User(message) => message.to_markdown(),
             Message::Agent(message) => message.to_markdown(),
-            Message::Resume => "[resume]\n".into(),
+            Message::Resume(_) => "[resume]\n".into(),
         }
     }
 
     pub fn role(&self) -> Role {
         match self {
-            Message::User(_) | Message::Resume => Role::User,
+            Message::User(_) | Message::Resume(_) => Role::User,
             Message::Agent(_) => Role::Assistant,
         }
     }
@@ -232,21 +284,22 @@ pub enum PinReason {
     Manual,
 }
 
-/// 1-based index of a Resume marker in the thread (1st Resume = `ResumeIndex(1)`).
-///
-/// Stable across edits to *user* messages. If a Resume itself is removed,
-/// subsequent indices shift; `gc_pinned()` drops any pin whose `Resume(idx)`
-/// exceeds the current Resume count.
+/// Legacy 1-based Resume index — retained for compatibility with any
+/// external code that may still reference the type, but no longer used
+/// in `PinnedMessageKey` (ST2 fix-loop #2 replaced it with `ResumeId`).
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResumeIndex(pub u32);
 
 /// Identity of a pinned message. `Message::User` carries a stable
-/// `UserMessageId`; `Message::Resume` has no id field today, so we key
-/// it by the 1-based occurrence index of Resume markers in the thread.
+/// `UserMessageId`; `Message::Resume` carries a `ResumeId(Uuid)`
+/// (generated at push-time — see ST2 fix-loop #2). Both are invariant
+/// under truncation and compaction, so a Resume pin can never silently
+/// retarget to a different Resume marker after an earlier Resume is
+/// removed.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PinnedMessageKey {
     User(UserMessageId),
-    Resume(ResumeIndex),
+    Resume(ResumeId),
 }
 
 /// A single pin entry. Insertion-order is preserved and is part of the contract.
@@ -1664,7 +1717,7 @@ impl Thread {
                         }
                     }
                 }
-                Message::Resume => {}
+                Message::Resume(_) => {}
             }
         }
         rx
@@ -2292,6 +2345,10 @@ impl Thread {
 
     /// Drop pins whose underlying message no longer exists in `self.messages`.
     /// Called by ST3 post-compaction. Idempotent.
+    ///
+    /// ST2 fix-loop #6: also called from `to_db()` (defensive — persisted
+    /// pins never drift) and from `truncate()` / `auto_compact_context_with_zone()`
+    /// (mutation paths that drop messages).
     pub fn gc_pinned(&mut self) {
         let user_ids: HashSet<UserMessageId> = self
             .messages
@@ -2301,15 +2358,18 @@ impl Thread {
                 _ => None,
             })
             .collect();
-        let resume_count = self
+        let resume_ids: HashSet<ResumeId> = self
             .messages
             .iter()
-            .filter(|m| matches!(m, Message::Resume))
-            .count() as u32;
+            .filter_map(|m| match m {
+                Message::Resume(rid) => Some(*rid),
+                _ => None,
+            })
+            .collect();
         let before = self.pinned.len();
         self.pinned.retain(|p| match &p.key {
             PinnedMessageKey::User(id) => user_ids.contains(id),
-            PinnedMessageKey::Resume(idx) => idx.0 >= 1 && idx.0 <= resume_count,
+            PinnedMessageKey::Resume(rid) => resume_ids.contains(rid),
         });
         let dropped = before - self.pinned.len();
         if dropped > 0 {
@@ -2325,38 +2385,28 @@ impl Thread {
 
     /// Look up a `PinnedMessageKey` to a slice index in `self.messages`.
     /// Returns `None` if the key has no live message (e.g. user message
-    /// was truncated, or `Resume(idx)` exceeds current Resume count).
+    /// was truncated, or the Resume marker with that id is gone).
     fn resolve_key_to_index(&self, key: &PinnedMessageKey) -> Option<usize> {
         match key {
             PinnedMessageKey::User(target) => self.messages.iter().position(|m| match m {
                 Message::User(u) => &u.id == target,
                 _ => false,
             }),
-            PinnedMessageKey::Resume(target) => {
-                let mut seen: u32 = 0;
-                for (i, m) in self.messages.iter().enumerate() {
-                    if matches!(m, Message::Resume) {
-                        seen += 1;
-                        if seen == target.0 {
-                            return Some(i);
-                        }
-                    }
-                }
-                None
-            }
+            PinnedMessageKey::Resume(target) => self.messages.iter().position(|m| match m {
+                Message::Resume(rid) => rid == target,
+                _ => false,
+            }),
         }
     }
 
-    /// Compute the 1-based `ResumeIndex` for the most recently pushed
-    /// `Message::Resume` (i.e. counts every Resume in the thread).
-    /// Caller MUST invoke after pushing the Resume marker.
-    fn current_resume_index(&self) -> ResumeIndex {
-        let n = self
-            .messages
-            .iter()
-            .filter(|m| matches!(m, Message::Resume))
-            .count() as u32;
-        ResumeIndex(n)
+    /// Return the `ResumeId` of the most-recently pushed `Message::Resume`
+    /// in the thread, or `None` if no Resume marker exists. Used by
+    /// `auto_pin_resume` immediately after pushing the marker.
+    fn last_resume_id(&self) -> Option<ResumeId> {
+        self.messages.iter().rev().find_map(|m| match m {
+            Message::Resume(rid) => Some(*rid),
+            _ => None,
+        })
     }
 
     /// Coalesce Resume pins to at most `MAX_RESUME_PINS`. Drops oldest first.
@@ -2398,14 +2448,13 @@ impl Thread {
     }
 
     /// Resume auto-pin trigger: pin the most recently pushed Resume marker
-    /// (its 1-based index in the thread) with `PinReason::Resume`. Honors
+    /// (by its stable `ResumeId`) with `PinReason::Resume`. Honors
     /// `MAX_RESUME_PINS` via `coalesce_resume_pins`.
     fn auto_pin_resume(&mut self) {
-        let idx = self.current_resume_index();
-        if idx.0 == 0 {
+        let Some(rid) = self.last_resume_id() else {
             return;
-        }
-        self.pin(PinnedMessageKey::Resume(idx), PinReason::Resume);
+        };
+        self.pin(PinnedMessageKey::Resume(rid), PinReason::Resume);
     }
 
     /// PlanUpdate hook: called from `agent.rs` (legacy ACP dispatcher) when
@@ -2535,7 +2584,7 @@ impl Thread {
                 Message::Agent(a) => {
                     caduceus_bridge::orchestrator::count_tokens_exact(&a.to_markdown())
                 }
-                Message::Resume => 0,
+                Message::Resume(_) => 0,
             })
             .sum();
         self.cached_token_estimate.set(Some(total));
@@ -2785,7 +2834,7 @@ impl Thread {
                         CompactMessage::new("assistant", text)
                     }
                 }
-                Message::Resume => CompactMessage::new("system", "[session resumed]"),
+                Message::Resume(_) => CompactMessage::new("system", "[session resumed]"),
             })
             .collect();
 
@@ -3218,7 +3267,7 @@ impl Thread {
                 Message::User(message) => {
                     self.request_token_usage.remove(&message.id);
                 }
-                Message::Agent(_) | Message::Resume => {}
+                Message::Agent(_) | Message::Resume(_) => {}
             }
         }
         if evicted_count > 0 {
@@ -3308,7 +3357,7 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
-        self.messages.push(Message::Resume);
+        self.messages.push(Message::Resume(ResumeId::new()));
         // ST2: auto-pin Resume marker (explicit-resume trigger site).
         self.auto_pin_resume();
         self.invalidate_token_cache();
@@ -3706,7 +3755,7 @@ impl Thread {
                     if let Some(Message::Agent(message)) = this.messages.last() {
                         if message.tool_results.is_empty() {
                             intent = CompletionIntent::UserPrompt;
-                            this.messages.push(Message::Resume);
+                            this.messages.push(Message::Resume(ResumeId::new()));
                             // ST2: auto-pin implicit-continuation Resume.
                             this.auto_pin_resume();
                         }
@@ -3826,7 +3875,7 @@ impl Thread {
                 .rev()
                 .find_map(|m| match m {
                     Message::User(u) => Some(u.to_markdown()),
-                    Message::Resume => Some("Continue where you left off.".to_string()),
+                    Message::Resume(_) => Some("Continue where you left off.".to_string()),
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -4984,7 +5033,7 @@ impl Thread {
             .find_map(|message| match message {
                 Message::User(user_message) => Some(user_message),
                 Message::Agent(_) => None,
-                Message::Resume => None,
+                Message::Resume(_) => None,
             })
     }
 
@@ -5684,7 +5733,7 @@ impl Thread {
             match message {
                 Message::User(_) => markdown.push_str("## User\n\n"),
                 Message::Agent(_) => markdown.push_str("## Assistant\n\n"),
-                Message::Resume => {}
+                Message::Resume(_) => {}
             }
             markdown.push_str(&message.to_markdown());
         }
@@ -9351,8 +9400,23 @@ mod st2_pinned_tests {
         PinnedMessageKey::User(UserMessageId::new())
     }
 
-    fn resume_key(idx: u32) -> PinnedMessageKey {
-        PinnedMessageKey::Resume(ResumeIndex(idx))
+    /// Fresh, unique Resume key. Use when the test only cares that keys
+    /// differ (e.g. cap/coalesce tests, orphan-gc tests).
+    fn resume_key_new() -> PinnedMessageKey {
+        PinnedMessageKey::Resume(ResumeId::new())
+    }
+
+    /// Collect the `ResumeId`s from the thread's messages, in push-order.
+    /// Used by tests that need to pin a *specific* Resume marker.
+    #[allow(dead_code)]
+    fn resume_ids(t: &Thread) -> Vec<ResumeId> {
+        t.messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Resume(rid) => Some(*rid),
+                _ => None,
+            })
+            .collect()
     }
 
     async fn setup_thread_for_test(
@@ -9509,20 +9573,28 @@ mod st2_pinned_tests {
     async fn t_resume_pin_cap_3(cx: &mut TestAppContext) {
         let (thread, _ev) = setup_thread_for_test(cx).await;
         thread.update(cx, |t, _| {
-            for i in 1..=5u32 {
-                t.pin_at(resume_key(i), PinReason::Resume, fixed_now());
+            // 5 distinct Resume ids — coalesce drops the oldest 2.
+            let mut ids: Vec<ResumeId> = Vec::new();
+            for _ in 0..5 {
+                let rid = ResumeId::new();
+                ids.push(rid);
+                t.pin_at(
+                    PinnedMessageKey::Resume(rid),
+                    PinReason::Resume,
+                    fixed_now(),
+                );
             }
-            let resume_keys: Vec<u32> = t
+            let kept: Vec<ResumeId> = t
                 .pinned_refs()
                 .iter()
                 .filter_map(|p| match (&p.key, p.reason) {
-                    (PinnedMessageKey::Resume(r), PinReason::Resume) => Some(r.0),
+                    (PinnedMessageKey::Resume(r), PinReason::Resume) => Some(*r),
                     _ => None,
                 })
                 .collect();
-            assert_eq!(resume_keys.len(), MAX_RESUME_PINS);
-            // newest 3 retained
-            assert_eq!(resume_keys, vec![3, 4, 5]);
+            assert_eq!(kept.len(), MAX_RESUME_PINS);
+            // newest 3 retained (insertion order)
+            assert_eq!(kept, ids[2..].to_vec());
         });
     }
 
@@ -9550,8 +9622,8 @@ mod st2_pinned_tests {
                 PinReason::Manual,
                 fixed_now(),
             );
-            // orphan resume pin (idx 5, but no resumes yet)
-            t.pin_at(resume_key(5), PinReason::Resume, fixed_now());
+            // orphan resume pin (random ResumeId, no matching marker in messages)
+            t.pin_at(resume_key_new(), PinReason::Resume, fixed_now());
             assert_eq!(t.pinned_refs().len(), 3);
             t.gc_pinned();
             assert_eq!(t.pinned_refs().len(), 1);
@@ -9566,7 +9638,7 @@ mod st2_pinned_tests {
         let (thread, _ev) = setup_thread_for_test(cx).await;
         thread.update(cx, |t, _| {
             t.pin_at(user_key(), PinReason::Manual, fixed_now());
-            t.pin_at(resume_key(1), PinReason::Resume, fixed_now());
+            t.pin_at(resume_key_new(), PinReason::Resume, fixed_now());
             // messages stays empty -> all pins orphan
             t.gc_pinned();
             assert!(t.pinned_refs().is_empty());
@@ -9581,22 +9653,24 @@ mod st2_pinned_tests {
         thread.update(cx, |t, _| {
             let id_a = UserMessageId::new();
             let id_b = UserMessageId::new();
+            let r1 = ResumeId::new();
+            let r2 = ResumeId::new();
             t.messages.push(Message::User(UserMessage {
                 id: id_a.clone(),
                 content: vec![],
             }));
-            t.messages.push(Message::Resume);
+            t.messages.push(Message::Resume(r1));
             t.messages.push(Message::User(UserMessage {
                 id: id_b.clone(),
                 content: vec![],
             }));
-            t.messages.push(Message::Resume);
+            t.messages.push(Message::Resume(r2));
             t.pin_at(
                 PinnedMessageKey::User(id_a),
                 PinReason::FirstUser,
                 fixed_now(),
             );
-            t.pin_at(resume_key(2), PinReason::Resume, fixed_now());
+            t.pin_at(PinnedMessageKey::Resume(r2), PinReason::Resume, fixed_now());
             t.pin_at(
                 PinnedMessageKey::User(id_b),
                 PinReason::Manual,
@@ -9641,12 +9715,13 @@ mod st2_pinned_tests {
     async fn t_resume_index_stable_across_user_message_edits(cx: &mut TestAppContext) {
         let (thread, _ev) = setup_thread_for_test(cx).await;
         thread.update(cx, |t, _| {
-            t.messages.push(Message::Resume); // resume #1 at idx 0
-            t.pin_at(resume_key(1), PinReason::Resume, fixed_now());
+            let r = ResumeId::new();
+            t.messages.push(Message::Resume(r)); // resume at idx 0
+            t.pin_at(PinnedMessageKey::Resume(r), PinReason::Resume, fixed_now());
             assert_eq!(t.pinned_message_indices(), vec![0]);
 
             // inserting/removing user messages around the resume marker
-            // does not invalidate the resume_index pin.
+            // does not invalidate the resume pin (id-keyed, not position-keyed).
             t.messages.insert(
                 0,
                 Message::User(UserMessage {
@@ -9735,24 +9810,77 @@ mod st2_pinned_tests {
     }
 
     #[gpui::test]
-    async fn t_resume_auto_pin_assigns_correct_index(cx: &mut TestAppContext) {
+    async fn t_resume_auto_pin_pins_marker_id(cx: &mut TestAppContext) {
         let (thread, _ev) = setup_thread_for_test(cx).await;
         thread.update(cx, |t, _| {
-            t.messages.push(Message::Resume);
+            let r1 = ResumeId::new();
+            t.messages.push(Message::Resume(r1));
             t.auto_pin_resume();
-            assert_eq!(t.is_pinned(&resume_key(1)), vec![PinReason::Resume]);
+            assert_eq!(
+                t.is_pinned(&PinnedMessageKey::Resume(r1)),
+                vec![PinReason::Resume]
+            );
 
-            t.messages.push(Message::Resume);
+            let r2 = ResumeId::new();
+            t.messages.push(Message::Resume(r2));
             t.auto_pin_resume();
-            let resume_pins: Vec<u32> = t
+            let pins: Vec<ResumeId> = t
                 .pinned_refs()
                 .iter()
                 .filter_map(|p| match (&p.key, p.reason) {
-                    (PinnedMessageKey::Resume(r), PinReason::Resume) => Some(r.0),
+                    (PinnedMessageKey::Resume(r), PinReason::Resume) => Some(*r),
                     _ => None,
                 })
                 .collect();
-            assert_eq!(resume_pins, vec![1, 2]);
+            assert_eq!(pins, vec![r1, r2]);
+        });
+    }
+
+    #[gpui::test]
+    async fn t_resume_pin_after_resume_removal_does_not_redirect(cx: &mut TestAppContext) {
+        // ST2 fix-loop #2 (reviewer Correctness 3/4): with the legacy
+        // `ResumeIndex` keying, removing Resume #1 silently retargeted
+        // a `Resume(2)` pin to the now-second-position Resume #3 — the
+        // wrong message. After moving to `ResumeId(Uuid)` identity, the
+        // pin tracks the *original* Resume #2 by id; if Resume #1 is
+        // removed, the pin still resolves to the original Resume #2
+        // (now at a different position), NOT to Resume #3.
+        // Plan v3.1 §5 (Fix 2 — `PinnedMessageKey` upfront).
+        let (thread, _ev) = setup_thread_for_test(cx).await;
+        thread.update(cx, |t, _| {
+            let r1 = ResumeId::new();
+            let r2 = ResumeId::new();
+            let r3 = ResumeId::new();
+            t.messages.push(Message::Resume(r1)); // pos 0
+            t.messages.push(Message::Resume(r2)); // pos 1
+            t.messages.push(Message::Resume(r3)); // pos 2
+
+            // Pin Resume #2 (the middle one).
+            t.pin_at(PinnedMessageKey::Resume(r2), PinReason::Resume, fixed_now());
+            assert_eq!(t.pinned_message_indices(), vec![1]);
+
+            // Remove Resume #1.
+            t.messages.remove(0);
+            // r2 now at pos 0, r3 at pos 1.
+
+            // The pin must still resolve to r2 (now at pos 0), NOT r3 at pos 1.
+            assert_eq!(t.pinned_message_indices(), vec![0]);
+            // And by identity:
+            let pinned_pos = t.pinned_message_indices()[0];
+            match &t.messages[pinned_pos] {
+                Message::Resume(id) => assert_eq!(
+                    *id, r2,
+                    "Resume pin must still target original r2, not r3"
+                ),
+                other => panic!("expected Resume marker at pinned pos, got {other:?}"),
+            }
+
+            // gc_pinned must NOT drop the live pin.
+            t.gc_pinned();
+            assert_eq!(t.pinned_refs().len(), 1);
+            assert!(t
+                .is_pinned(&PinnedMessageKey::Resume(r2))
+                .contains(&PinReason::Resume));
         });
     }
 
@@ -9878,6 +10006,27 @@ mod st2_pinned_tests {
         let s = serde_json::to_string(&r).unwrap();
         let back: MessageRef = serde_json::from_str(&s).unwrap();
         assert_eq!(r, back);
+    }
+
+    #[test]
+    fn t_legacy_resume_message_deserializes_with_synthetic_id() {
+        // ST2 fix-loop #2: legacy DbThread JSON encodes Message::Resume
+        // as the bare string "Resume". The custom Deserialize impl on
+        // Message must accept this and synthesize a fresh ResumeId, so
+        // pre-ST2 threads on disk continue to load.
+        let legacy = serde_json::json!("Resume");
+        let m: Message = serde_json::from_value(legacy).expect("legacy Resume must deserialize");
+        match m {
+            Message::Resume(_) => {}
+            other => panic!("expected Message::Resume(_), got {other:?}"),
+        }
+
+        // And new shape round-trips.
+        let r = ResumeId::new();
+        let m2 = Message::Resume(r);
+        let s = serde_json::to_string(&m2).unwrap();
+        let back: Message = serde_json::from_str(&s).unwrap();
+        assert_eq!(m2, back);
     }
 
     #[test]
