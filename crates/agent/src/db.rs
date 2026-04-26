@@ -345,6 +345,7 @@ impl DbThread {
                     }
 
                     crate::Message::Agent(AgentMessage {
+                        id: crate::AgentMessageId::new(),
                         content,
                         tool_results,
                         reasoning_details: None,
