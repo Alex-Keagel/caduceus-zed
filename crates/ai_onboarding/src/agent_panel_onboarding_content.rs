@@ -45,10 +45,16 @@ impl AgentPanelOnboarding {
     }
 
     fn has_configured_providers(cx: &App) -> bool {
+        // ST1a (C13): variant-direct read — `is_configured()` includes `RateLimited`
+        // (provider IS set up, just temporarily throttled). Onboarding upsell would be
+        // wrong for those users.
         LanguageModelRegistry::read_global(cx)
             .visible_providers()
             .iter()
-            .any(|provider| provider.is_authenticated(cx) && provider.id() != ZED_CLOUD_PROVIDER_ID)
+            .any(|provider| {
+                provider.auth_state(cx).is_configured()
+                    && provider.id() != ZED_CLOUD_PROVIDER_ID
+            })
     }
 }
 

@@ -2716,10 +2716,19 @@ impl GitPanel {
                 });
 
                 if let Some(task) = cx.update(|cx| {
-                    if !provider.is_authenticated(cx) {
-                        Some(provider.authenticate(cx))
-                    } else {
-                        None
+                    // ST1a (C12): variant-direct. Calling `authenticate()` only makes sense
+                    // for `NotAuthenticated` — it can't fix a rate-limit and has no effect
+                    // on a policy-disabled provider. For `Authenticated` skip the round-trip;
+                    // for `RateLimited`/`DisabledByPolicy` the subsequent completion call
+                    // will surface the real error.
+                    use language_model::ProviderAuthState;
+                    match provider.auth_state(cx) {
+                        ProviderAuthState::NotAuthenticated { .. } => {
+                            Some(provider.authenticate(cx))
+                        }
+                        ProviderAuthState::Authenticated
+                        | ProviderAuthState::RateLimited { .. }
+                        | ProviderAuthState::DisabledByPolicy { .. } => None,
                     }
                 }) {
                     task.await.log_err();

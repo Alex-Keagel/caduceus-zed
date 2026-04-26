@@ -38,9 +38,10 @@ pub(crate) struct OllamaGenerateResponse {
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("ollama");
 
 pub fn is_available(cx: &App) -> bool {
+    // ST1a: usability-check — direct replacement for the deprecated `is_authenticated`.
     LanguageModelRegistry::read_global(cx)
         .provider(&PROVIDER_ID)
-        .is_some_and(|provider| provider.is_authenticated(cx))
+        .is_some_and(|provider| provider.auth_state(cx).can_provide_models())
 }
 
 pub fn ensure_authenticated(cx: &mut App) {

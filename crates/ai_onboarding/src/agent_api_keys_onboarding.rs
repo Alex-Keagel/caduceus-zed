@@ -28,11 +28,14 @@ impl ApiKeysWithProviders {
     }
 
     fn compute_configured_providers(cx: &App) -> Vec<(IconOrSvg, SharedString)> {
+        // ST1a (C14): variant-direct — rate-limited providers ARE configured; surface
+        // them in the "configured providers" pill list rather than hiding them.
         LanguageModelRegistry::read_global(cx)
             .visible_providers()
             .iter()
             .filter(|provider| {
-                provider.is_authenticated(cx) && provider.id() != ZED_CLOUD_PROVIDER_ID
+                provider.auth_state(cx).is_configured()
+                    && provider.id() != ZED_CLOUD_PROVIDER_ID
             })
             .map(|provider| (provider.icon(), provider.name().0))
             .collect()

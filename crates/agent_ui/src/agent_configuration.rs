@@ -286,8 +286,14 @@ impl AgentConfiguration {
                                                     )
                                                 } else {
                                                     this.when(
-                                                        provider.is_authenticated(cx)
-                                                            && !is_expanded,
+                                                        // ST1a (C5): variant-direct —
+                                                        // green check icon ONLY for
+                                                        // `Authenticated`. Rate-limited
+                                                        // shouldn't show "all good ✓".
+                                                        matches!(
+                                                            provider.auth_state(cx),
+                                                            language_model::ProviderAuthState::Authenticated
+                                                        ) && !is_expanded,
                                                         |parent| {
                                                             parent.child(
                                                                 Icon::new(IconName::Check)
@@ -329,7 +335,10 @@ impl AgentConfiguration {
                             "No configuration view for {provider_name}",
                         ))),
                     })
-                    .when(is_expanded && provider.is_authenticated(cx), |parent| {
+                    .when(is_expanded && provider.auth_state(cx).is_configured(), |parent| {
+                        // ST1a (C6): variant-direct — provider is configured (Authenticated
+                        // or RateLimited). The thread-init path will surface 429 errors
+                        // properly when a rate-limited provider is selected.
                         parent.child(
                             Button::new(
                                 SharedString::from(format!("new-thread-{provider_id}")),

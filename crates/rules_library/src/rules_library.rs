@@ -959,7 +959,10 @@ impl RulesLibrary {
         };
 
         let initial_prompt = action.prompt.clone();
-        if provider.is_authenticated(cx) {
+        // ST1a (C11): usability-check — proceed only if provider can serve a request.
+        // TODO(ST5): variant-direct so rate-limited surfaces a toast instead of opening
+        // the configuration panel.
+        if provider.auth_state(cx).can_provide_models() {
             self.inline_assist_delegate
                 .assist(rule_editor, initial_prompt, window, cx);
         } else {

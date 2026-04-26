@@ -483,7 +483,10 @@ impl PickerDelegate for LanguageModelPickerDelegate {
             .read(cx)
             .visible_providers()
             .into_iter()
-            .filter(|provider| provider.is_authenticated(cx))
+            // ST1a (C8 — deferred to ST1b): kept as a usability filter for now;
+            // ST1b's RowDescriptor redesign removes the filter and renders unauth rows
+            // with a [Sign In] badge.
+            .filter(|provider| provider.auth_state(cx).can_provide_models())
             .collect::<Vec<_>>();
 
         let configured_provider_ids = configured_providers

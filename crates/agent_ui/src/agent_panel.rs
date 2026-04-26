@@ -5334,11 +5334,14 @@ impl AgentPanel {
             return false;
         }
 
+        // ST1a (C4): variant-direct — rate-limited Anthropic IS configured; do not show
+        // onboarding upsell to those users. `is_configured()` returns true for both
+        // `Authenticated` and `RateLimited` variants.
         let has_configured_non_zed_providers = LanguageModelRegistry::read_global(cx)
             .visible_providers()
             .iter()
             .any(|provider| {
-                provider.is_authenticated(cx)
+                provider.auth_state(cx).is_configured()
                     && provider.id() != language_model::ZED_CLOUD_PROVIDER_ID
             });
 
