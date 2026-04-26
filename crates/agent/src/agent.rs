@@ -3075,7 +3075,46 @@ impl SubagentHandle for NativeSubagentHandle {
                                     }
                                 }
                                 Ok(None) => SubagentPromptResult::Error("No response from the agent. You can try messaging again.".into()),
-                                Err(error) => SubagentPromptResult::Error(error.to_string()),
+                                Err(error) => {
+                                    // ST7 fix-loop #1: preserve typed errors on the
+                                    // live path. Reviewer convergence (Sonnet+GPT)
+                                    // flagged this site as where the typed taxonomy
+                                    // dies — `error.to_string()` flattened
+                                    // CaduceusError / SubAgentFailure into an opaque
+                                    // String BEFORE spawn_agent_tool's classifier
+                                    // could downcast.
+                                    //
+                                    // Order matters: SubAgentFailure first (already
+                                    // classified upstream — e.g. RecursionLimit at
+                                    // agent.rs:2832), then CaduceusError (run the
+                                    // classifier so 429/503/timeout map to
+                                    // RetryClass correctly). Genuinely unknown
+                                    // errors fall back to String.
+                                    if let Some(failure) =
+                                        error.downcast_ref::<caduceus_core::SubAgentFailure>()
+                                    {
+                                        SubagentPromptResult::TypedError(failure.clone())
+                                    } else if let Some(cd_err) =
+                                        error.downcast_ref::<caduceus_core::CaduceusError>()
+                                    {
+                                        // Empty context at this boundary: the
+                                        // (provider, model) pair is not in scope
+                                        // here. ST8 will populate this when the
+                                        // dispatcher emits CaduceusError directly
+                                        // through the harness (see plan V3 §A).
+                                        let failure = caduceus_core::classify_caduceus_error(
+                                            cd_err,
+                                            &caduceus_core::ClassifyContext::empty(),
+                                            caduceus_core::SubAgentPhase::Unknown,
+                                            false,
+                                            0,
+                                            0,
+                                        );
+                                        SubagentPromptResult::TypedError(failure)
+                                    } else {
+                                        SubagentPromptResult::Error(error.to_string())
+                                    }
+                                }
                             },
                             _ = token_limit_rx.fuse() => SubagentPromptResult::ContextWindowWarning,
                         }

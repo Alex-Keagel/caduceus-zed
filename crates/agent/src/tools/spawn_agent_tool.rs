@@ -37,11 +37,21 @@ pub fn validate_timeout(t: Option<u64>) -> std::result::Result<Duration, SubAgen
 }
 
 /// ST7: classify an `anyhow::Error` returned by `subagent.send()` into a
-/// structured [`SubAgentFailure`]. Tries to downcast to a typed
-/// `SubAgentFailure` first (when the inner agent loop wrapped one); falls
-/// back to string-pattern probing for the well-known canned messages emitted
-/// by `agent.rs:3060–3068`. Anything else becomes
-/// `InternalError { kind: "subagent_send_failed", ... }`.
+/// structured [`SubAgentFailure`]. Order:
+///
+/// 1. Downcast to a typed `SubAgentFailure` (already classified upstream
+///    — e.g. `RecursionLimitExceeded` at `agent.rs:2832`,
+///    `ModelRefusal` at `agent.rs:3073`, or any failure wrapped by the
+///    new `Err` arm at `agent.rs:3078`).
+/// 2. Downcast to a typed [`caduceus_core::CaduceusError`] (live-path fix
+///    — must-fix #1, plan v3 §A: 429 / 503 / timeout / cancel from the
+///    provider stack reach this site as `anyhow!(CaduceusError::*)`; the
+///    classifier maps them to `RetryClass` correctly).
+/// 3. String-pattern fallback for the small set of canned `anyhow!(...)`
+///    messages emitted directly by `agent.rs` (`MaxTokens` /
+///    `MaxTurnRequests` / `User canceled` / refusal text /
+///    no-response).
+/// 4. Otherwise → `InternalError { kind: "subagent_send_failed" }`.
 pub fn classify_subagent_error(
     err: &anyhow::Error,
     last_phase: SubAgentPhase,
@@ -49,9 +59,23 @@ pub fn classify_subagent_error(
     elapsed_secs: u64,
     timeout_secs: u64,
 ) -> SubAgentFailure {
-    let _ = (last_phase, tools_started, elapsed_secs, timeout_secs);
     if let Some(typed) = err.downcast_ref::<SubAgentFailure>() {
         return typed.clone();
+    }
+    if let Some(cd_err) = err.downcast_ref::<caduceus_core::CaduceusError>() {
+        // Empty context at this boundary: zed's `spawn_agent_tool` does
+        // not yet thread provider/model into the classify call site
+        // (filed as ST7-followup-B; provider/model populate from the
+        // dispatcher boundary in caduceus-orchestrator). The ClassifyContext
+        // typing makes the upgrade non-breaking.
+        return caduceus_core::classify_caduceus_error(
+            cd_err,
+            &caduceus_core::ClassifyContext::empty(),
+            last_phase,
+            tools_started,
+            elapsed_secs,
+            timeout_secs,
+        );
     }
     let msg = err.to_string();
     if msg == "User canceled" {
@@ -647,6 +671,57 @@ mod tests {
             }
             other => panic!("expected ProviderError, got {other:?}"),
         }
+    }
+
+    // ---- Fix-loop #1: live path preserves CaduceusError -> typed ProviderError ----
+    #[test]
+    fn classify_subagent_error_downcasts_caduceus_error_ratelimit() {
+        // Simulates the new agent.rs Err arm: provider returned a typed
+        // CaduceusError::RateLimited which got wrapped in anyhow::Error at
+        // task.fuse(). The classifier MUST run classify_caduceus_error and
+        // surface a ProviderError with RetryClass::Backoff — not collapse
+        // to InternalError("subagent_send_failed") via string fallback.
+        use caduceus_core::{CaduceusError, RetryClass};
+        let err = anyhow::Error::new(CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        });
+        let out =
+            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, 0, 900);
+        match out {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.retry_class, RetryClass::Backoff);
+                assert_eq!(p.retry_after_secs, Some(30));
+                assert_eq!(p.http_status, Some(429));
+            }
+            other => panic!("expected ProviderError(Backoff), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_subagent_error_downcasts_caduceus_provider_timeout_to_backoff() {
+        use caduceus_core::{CaduceusError, RetryClass};
+        let err = anyhow::Error::new(CaduceusError::ProviderTimeout {
+            elapsed_ms: 6000,
+            limit_ms: 5000,
+            context: "chat".into(),
+        });
+        let out =
+            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, 0, 900);
+        match out {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.retry_class, RetryClass::Backoff);
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_subagent_error_downcasts_caduceus_cancelled_to_user_cancel() {
+        use caduceus_core::CaduceusError;
+        let err = anyhow::Error::new(CaduceusError::Cancelled);
+        let out =
+            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, 0, 900);
+        assert!(matches!(out, SubAgentFailure::UserCancel));
     }
 
     // ---- T-PHASE3-revised: ToolResultEnd does NOT exit ToolExecution ----
