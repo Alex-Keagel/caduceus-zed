@@ -187,9 +187,13 @@ impl SafeUrl {
 /// Sanitize a free-form provider error message before storing it in
 /// `DisabledByPolicy::reason` (S3). Three steps:
 ///
-/// 1. Strip ASCII control characters (preserving spaces).
-/// 2. Redact tokens matching `Bearer\s+\S+`, `sk-[A-Za-z0-9_-]+`, `gho_[A-Za-z0-9]+`,
-///    `ya29\.[A-Za-z0-9_\-]+` with `<redacted>`.
+/// 1. Strip ASCII control characters (preserving spaces and tabs).
+/// 2. Redact tokens matching, case-insensitively:
+///      * `(?i)\bbearer\s+\S+`
+///      * `\bsk-\S+`
+///      * `\bgho_\S+`
+///      * `\bya29\.\S+`
+///    with `<redacted>`. The `\s` class catches double-spaces, tabs, etc.
 /// 3. Truncate to [`MAX_REASON_LEN`] bytes (UTF-8 safe).
 pub fn sanitize_provider_reason(input: &str) -> String {
     // Step 1: drop control chars (keep tab & space).
@@ -198,9 +202,9 @@ pub fn sanitize_provider_reason(input: &str) -> String {
         .filter(|c| !c.is_control() || *c == '\t' || *c == ' ')
         .collect();
 
-    // Step 2: redact token-like substrings. We avoid pulling in the `regex` crate by
-    // doing a hand-rolled scan; performance is irrelevant (called rarely on errors).
-    out = redact_tokens(&out);
+    // Step 2: redact token-like substrings with the regex crate (avoid the literal
+    // " " bug that missed `Bearer\tabc` and `Bearer  abc` in the previous scanner).
+    out = TOKEN_REDACT_RE.replace_all(&out, "<redacted>").into_owned();
 
     // Step 3: byte-truncate to MAX_REASON_LEN, snapping to a UTF-8 char boundary.
     if out.len() > MAX_REASON_LEN {
@@ -214,86 +218,14 @@ pub fn sanitize_provider_reason(input: &str) -> String {
     out
 }
 
-/// Hand-rolled token redactor. Replaces matches of:
-///
-/// * `Bearer ` followed by non-whitespace
-/// * `sk-` followed by `[A-Za-z0-9_-]+`
-/// * `gho_` followed by `[A-Za-z0-9]+`
-/// * `ya29.` followed by `[A-Za-z0-9_-]+`
-///
-/// with the literal `<redacted>`.
-fn redact_tokens(s: &str) -> String {
-    const PLACEHOLDER: &str = "<redacted>";
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        // Try each prefix at the current byte position.
-        let rest = &s[i..];
-        let lower_rest_starts_with_bearer = rest
-            .get(..7)
-            .map(|p| p.eq_ignore_ascii_case("Bearer "))
-            .unwrap_or(false);
-        let starts_sk = rest.starts_with("sk-");
-        let starts_gho = rest.starts_with("gho_");
-        let starts_ya29 = rest.starts_with("ya29.");
-
-        if lower_rest_starts_with_bearer {
-            // "Bearer " + non-whitespace
-            let after = i + 7;
-            let token_end = bytes[after..]
-                .iter()
-                .position(|b| b.is_ascii_whitespace())
-                .map(|n| after + n)
-                .unwrap_or(bytes.len());
-            if token_end > after {
-                out.push_str(PLACEHOLDER);
-                i = token_end;
-                continue;
-            }
-        } else if starts_sk || starts_gho || starts_ya29 {
-            let prefix_len = if starts_sk {
-                3
-            } else if starts_gho {
-                4
-            } else {
-                5
-            };
-            let after = i + prefix_len;
-            let token_end = bytes[after..]
-                .iter()
-                .position(|&b| !is_token_char(b))
-                .map(|n| after + n)
-                .unwrap_or(bytes.len());
-            if token_end - after >= 4 {
-                // require at least 4 token chars to qualify
-                out.push_str(PLACEHOLDER);
-                i = token_end;
-                continue;
-            }
-        }
-
-        // No match at this position — copy one char.
-        let ch_len = utf8_char_len(bytes[i]);
-        out.push_str(&s[i..i + ch_len]);
-        i += ch_len;
-    }
-    out
-}
-
-fn is_token_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.'
-}
-
-fn utf8_char_len(first_byte: u8) -> usize {
-    match first_byte {
-        b if b < 0x80 => 1,
-        b if b < 0xC0 => 1, // continuation byte (shouldn't be at boundary, but defensive)
-        b if b < 0xE0 => 2,
-        b if b < 0xF0 => 3,
-        _ => 4,
-    }
-}
+static TOKEN_REDACT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    // Order matters: bearer first because it consumes a "Bearer<sep>" prefix that
+    // could otherwise be partially matched as a sk-/gho_/ya29 token.
+    regex::Regex::new(
+        r"(?i)\bbearer\s+\S+|\bsk-\S+|\bgho_\S+|\bya29\.\S+",
+    )
+    .expect("static token-redact regex compiles")
+});
 
 #[cfg(test)]
 mod tests {
@@ -426,11 +358,23 @@ mod tests {
     }
 
     // T6: AC-SEC3 — sanitizer redacts tokens, strips control chars, caps length.
+    // (fix-loop #4: pre-fix used a hand-rolled scanner that only matched the literal
+    // `Bearer ` prefix, missing double-space, tab, and uppercase variants.)
     #[test]
     fn disabled_reason_sanitizer_redacts_tokens_and_caps_length() {
         // Bearer redaction (case-insensitive prefix).
         let s = sanitize_provider_reason("auth header was Bearer abc.def.ghi end");
         assert!(s.contains("<redacted>"), "got {s}");
+        assert!(!s.contains("abc.def.ghi"));
+
+        // Pre-fix bug: double-space between Bearer and token slipped through.
+        let s = sanitize_provider_reason("Bearer  abc.def.ghi tail");
+        assert!(s.contains("<redacted>"), "double-space leak: got {s}");
+        assert!(!s.contains("abc.def.ghi"));
+
+        // Pre-fix bug: tab + uppercase BEARER slipped through.
+        let s = sanitize_provider_reason("BEARER\tabc.def.ghi tail");
+        assert!(s.contains("<redacted>"), "BEARER\\tabc leak: got {s}");
         assert!(!s.contains("abc.def.ghi"));
 
         let s = sanitize_provider_reason("got key sk-1234567890ABC then fail");
