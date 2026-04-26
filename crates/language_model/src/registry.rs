@@ -1036,6 +1036,56 @@ mod tests {
         ));
     }
 
+    /// Round-3 fix-loop #3: `NotAuthenticated` is sticky vs a subsequent 429.
+    /// Without the guard in `note_completion_error`, a 429 arriving after a 401
+    /// would silently overwrite the cached `NotAuthenticated` with `RateLimited`,
+    /// hiding the real "user must re-auth" signal behind a transient
+    /// rate-limit UI for up to MAX_RETRY_AFTER / HEADERLESS_RATE_LIMIT_TTL.
+    #[gpui::test]
+    fn rate_limit_does_not_overwrite_not_authenticated(cx: &mut App) {
+        let registry = cx.new(|_| LanguageModelRegistry::default());
+        let provider = Arc::new(FakeLanguageModelProvider::default());
+        let id = provider.id();
+        registry.update(cx, |registry, cx| {
+            registry.register_provider(provider.clone(), cx);
+        });
+
+        // Pre-seed the cache with NotAuthenticated (simulates a prior 401 having
+        // dropped the cache, followed by a re-query that returned NotAuthenticated).
+        registry.read(cx).auth_cache.borrow_mut().insert(
+            id.clone(),
+            CachedAuth {
+                state: ProviderAuthState::NotAuthenticated {
+                    action: AuthAction::EnterApiKeyInSettings,
+                },
+                rate_limited_until: None,
+            },
+        );
+
+        // Now a 429 arrives (with and without Retry-After). Neither should
+        // overwrite the NotAuthenticated entry, nor stamp a deadline onto it.
+        for retry_after in [Some(Duration::from_secs(30)), None] {
+            let err = LanguageModelCompletionError::RateLimitExceeded {
+                provider: provider.name(),
+                retry_after,
+            };
+            registry.read(cx).note_completion_error(&id, &err);
+            let cache = registry.read(cx).auth_cache.borrow();
+            let cached = cache.get(&id).expect("cache entry preserved");
+            assert!(
+                matches!(cached.state, ProviderAuthState::NotAuthenticated { .. }),
+                "429 with retry_after={:?} overwrote NotAuthenticated → {:?}",
+                retry_after,
+                cached.state,
+            );
+            assert!(
+                cached.rate_limited_until.is_none(),
+                "429 with retry_after={:?} stamped a deadline onto NotAuthenticated",
+                retry_after,
+            );
+        }
+    }
+
     /// `DisabledByPolicy` to the matching error variants instead of collapsing both
     /// to `ProviderNotAuthenticated`.
     #[gpui::test]
