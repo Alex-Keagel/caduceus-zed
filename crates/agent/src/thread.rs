@@ -2422,6 +2422,11 @@ impl Thread {
                 Message::Resume(rid) => Some(PinnedMessageKey::Resume(*rid)),
                 Message::Agent(a) => Some(PinnedMessageKey::Agent(a.id)),
             })
+            .chain(
+                self.pending_message
+                    .as_ref()
+                    .map(|m| PinnedMessageKey::Agent(m.id)),
+            )
             .collect()
     }
 
