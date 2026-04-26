@@ -122,9 +122,12 @@ pub enum AuthAction {
     None,
 }
 
-/// New-type wrapper around a URL string. `SafeUrl::https` is the only constructor and it
-/// rejects any scheme other than `https`. Closes S2 (`file://`, `javascript:`, `data:`,
-/// `http://` cannot be embedded in an `AuthAction::OpenUrl`).
+/// New-type wrapper around a URL. `SafeUrl::https` is the only constructor and it
+/// rejects any URL whose scheme is not `https` or whose authority/host is empty
+/// (closes S2). String-prefix checks are insufficient because they accept things
+/// like `https:///etc/passwd` (no host) or `https://?q=1` (empty host); we use
+/// `url::Url::parse` so the full RFC-3986 grammar runs and we then enforce
+/// `scheme() == "https"` AND `host_str().is_some_and(|h| !h.is_empty())`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SafeUrl(String);
 
@@ -132,32 +135,48 @@ pub struct SafeUrl(String);
 pub enum UnsafeUrlError {
     #[error("url must use https:// scheme; got {0}")]
     NonHttpsScheme(String),
-    #[error("url is empty")]
+    #[error("url has no host")]
+    NoHost,
+    #[error("url is empty or unparseable")]
     Empty,
 }
 
 impl SafeUrl {
-    /// Returns `Ok(SafeUrl)` iff `url` parses as `https://...`. We do a lightweight
-    /// scheme check rather than pulling in the `url` crate, which is not currently a
-    /// dependency of `language_model`. Validation is intentionally strict: lowercase
-    /// `https://` prefix, non-empty authority.
+    /// Returns `Ok(SafeUrl)` iff `url` parses as a real `https://host[/...]` URL with
+    /// a non-empty host. Closes S2: rejects `http://`, `file://`, `javascript:`,
+    /// `data:`, `https:///etc/passwd` (no host), `https://?q=1` (empty host),
+    /// `https://#frag` (empty host). The scheme check is naturally case-insensitive
+    /// because `url::Url` lower-cases the scheme during parse.
     pub fn https(url: impl Into<String>) -> std::result::Result<Self, UnsafeUrlError> {
-        let url = url.into();
-        if url.is_empty() {
+        let raw = url.into();
+        if raw.is_empty() || raw.trim().len() != raw.len() {
+            // Reject leading/trailing whitespace bypasses ("  https://...") rather than
+            // silently trimming them.
             return Err(UnsafeUrlError::Empty);
         }
-        let lower = url.to_ascii_lowercase();
-        if !lower.starts_with("https://") {
-            // Extract the would-be scheme for the error message. Cap to avoid logging
-            // very long or attacker-controlled prefixes.
-            let scheme: String = url.chars().take_while(|c| *c != ':').take(32).collect();
-            return Err(UnsafeUrlError::NonHttpsScheme(scheme));
+        // url::Url::parse is liberal about extra slashes — `https:///etc/passwd` is
+        // accepted as `host=etc, path=/passwd`. Pre-screen the literal input so the
+        // authority section starts with a non-slash character (the scheme check is
+        // case-insensitive — url::Url lowercases on parse).
+        let lower_prefix: String = raw.chars().take(8).collect::<String>().to_ascii_lowercase();
+        if !lower_prefix.starts_with("https://") {
+            return Err(UnsafeUrlError::NonHttpsScheme(
+                raw.split(':').next().unwrap_or("").to_string(),
+            ));
         }
-        // Reject `https://` with no authority (e.g. `https://`).
-        if url.len() <= "https://".len() {
-            return Err(UnsafeUrlError::Empty);
+        let after_scheme = &raw[8..];
+        if after_scheme.starts_with('/') {
+            // e.g. `https:///etc/passwd` — would be parsed as host=etc, path=/passwd.
+            return Err(UnsafeUrlError::NoHost);
         }
-        Ok(Self(url))
+        let parsed = url::Url::parse(&raw).map_err(|_| UnsafeUrlError::Empty)?;
+        if parsed.scheme() != "https" {
+            return Err(UnsafeUrlError::NonHttpsScheme(parsed.scheme().to_string()));
+        }
+        match parsed.host_str() {
+            Some(host) if !host.is_empty() => Ok(Self(parsed.into())),
+            _ => Err(UnsafeUrlError::NoHost),
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -367,7 +386,11 @@ mod tests {
         }
     }
 
-    // T5: AC-SEC2 — `SafeUrl::https` rejects every non-https scheme.
+    // T5: AC-SEC2 — `SafeUrl::https` rejects every non-https scheme AND every URL
+    // that string-prefix checks would have accepted but is structurally bogus.
+    // (fix-loop #3: pre-fix accepted `https:///etc/passwd`, `https://?q=1`,
+    // `https://#frag`, `HTTPS://example.com` (case), and bypasses via stray
+    // whitespace.)
     #[test]
     fn safe_url_rejects_non_https() {
         for bad in [
@@ -379,6 +402,11 @@ mod tests {
             "",
             "https://", // no authority
             "  https://example.com",
+            // Pre-fix-loop bugs the prefix check accepted:
+            "https:///etc/passwd", // no host
+            "https://?q=1",        // empty host
+            "https://#frag",       // empty host
+            "https:// space.com",  // space in authority
         ] {
             assert!(
                 SafeUrl::https(bad).is_err(),
@@ -387,8 +415,14 @@ mod tests {
         }
         assert!(SafeUrl::https("https://example.com").is_ok());
         assert!(SafeUrl::https("https://example.com/foo?bar=1").is_ok());
-        // Case is preserved on the path; only the scheme check is case-insensitive.
-        assert!(SafeUrl::https("HTTPS://example.com").is_ok());
+        // Case-insensitive scheme via url::Url::parse — both pass and the canonical
+        // form has a lowercase scheme.
+        let normalized = SafeUrl::https("HTTPS://example.com").expect("uppercase scheme ok");
+        assert!(
+            normalized.as_str().starts_with("https://"),
+            "scheme must be normalized to lowercase, got {}",
+            normalized.as_str()
+        );
     }
 
     // T6: AC-SEC3 — sanitizer redacts tokens, strips control chars, caps length.
