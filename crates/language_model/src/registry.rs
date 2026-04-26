@@ -425,10 +425,14 @@ impl LanguageModelRegistry {
     ) {
         match err {
             LanguageModelCompletionError::RateLimitExceeded { retry_after, .. } => {
-                // fix-loop #7: hand the raw `retry_after` to `rate_limited()`; that
-                // constructor is the SINGLE authority for clamping (and emits the
-                // log::warn! when an over-cap value is seen). Pre-clamping here
-                // suppressed those warnings and split the clamp logic across two sites.
+                // fix-loop #7: hand the raw `retry_after` to `rate_limited()`;
+                // that constructor is the sole emitter of the over-cap
+                // `log::warn!`. The clamp on the `deadline` line below derives
+                // the cache-eviction deadline only — it produces an identical
+                // numeric result but does not duplicate the warning. (Round-3
+                // reword: previous comment incorrectly claimed this site was
+                // the SINGLE clamping authority, which was misleading because
+                // the deadline derivation also clamps.)
                 let state = ProviderAuthState::rate_limited(*retry_after, AuthAction::None);
                 // fix-loop #8: headerless 429 (no Retry-After) must NOT poison the cache
                 // forever. Use a bounded fallback TTL so the entry auto-expires.
