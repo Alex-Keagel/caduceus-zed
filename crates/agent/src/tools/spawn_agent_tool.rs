@@ -1270,7 +1270,7 @@ mod tests {
         use anyhow::anyhow;
         use caduceus_core::{AgentEvent, ToolCallId};
         use caduceus_orchestrator::AgentEventEmitter;
-        use gpui::{App, AppContext as _, AsyncApp, BackgroundExecutor, Task, TestAppContext};
+        use gpui::{App, AsyncApp, BackgroundExecutor, Task, TestAppContext};
         use std::path::PathBuf;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1371,6 +1371,7 @@ mod tests {
                     fake_subagent.clone() as Rc<dyn crate::SubagentHandle>
                 )),
             });
+            #[allow(clippy::arc_with_non_send_sync)]
             let tool = Arc::new(SpawnAgentTool::new(env));
 
             let (event_stream, _event_rx) = ToolCallEventStream::test();
