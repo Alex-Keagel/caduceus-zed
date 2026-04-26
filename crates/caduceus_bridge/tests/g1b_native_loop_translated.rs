@@ -21,6 +21,7 @@ use caduceus_core::StopReason;
 use caduceus_providers::ChatResponse;
 use caduceus_providers::mock::MockLlmAdapter;
 use caduceus_tools::ToolRegistry;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 fn mock_response(text: &str) -> ChatResponse {
@@ -63,6 +64,7 @@ async fn native_loop_translated_emits_ui_events_for_simple_turn() {
             reducer_handle,
             event_rx,
             tx,
+            Arc::new(AtomicBool::new(false)),
         )
         .await;
     assert!(result.is_ok(), "native loop failed: {result:?}");
@@ -133,6 +135,7 @@ async fn native_loop_translated_refuses_when_flag_off() {
             reducer_handle,
             event_rx,
             tx,
+            Arc::new(AtomicBool::new(false)),
         )
         .await;
     assert!(result.is_err(), "flag OFF must refuse");
@@ -176,6 +179,7 @@ async fn native_loop_translated_forwards_reducer_in_lockstep() {
             reducer_handle,
             event_rx,
             tx,
+            Arc::new(AtomicBool::new(false)),
         )
         .await;
     assert!(result.is_ok(), "turn failed: {result:?}");
@@ -192,4 +196,85 @@ async fn native_loop_translated_forwards_reducer_in_lockstep() {
     // Silence unused-variable warning; reducer_shared is kept here to
     // document intent for future expansion of the parity guard.
     drop(reducer_shared);
+}
+
+#[tokio::test]
+async fn native_loop_translated_records_channel_closed_when_receiver_dropped() {
+    // ST7-prereq: when the consumer drops `translated_rx` early, the
+    // forwarder must record that fact in `translated_channel_closed`
+    // so the harness can differentiate "consumer cancelled" from
+    // "no progress was made". The translated stream remains
+    // best-effort (the reducer pipeline is authoritative), so the
+    // run itself still succeeds.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bridge = OrchestratorBridge::new(tmp.path()).with_native_loop_enabled(true);
+    let provider = Arc::new(MockLlmAdapter::new(vec![mock_response("dropped")]));
+    let tools = ToolRegistry::new();
+    let (harness, _approval, _replay, event_rx) =
+        bridge.build_harness_with_emitter(provider, tools, "sys");
+
+    let mut state = bridge.new_session("mock", "mock-model");
+    let mut history = OrchestratorBridge::new_history();
+
+    let reducer_handle = bridge.new_reducer_handle();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TranslatedThreadEvent>();
+    // Drop the receiver immediately so any forwarded event fails to send.
+    drop(rx);
+
+    let closed = Arc::new(AtomicBool::new(false));
+    let result = bridge
+        .run_caduceus_loop_translated(
+            &harness,
+            &mut state,
+            &mut history,
+            "hi",
+            reducer_handle,
+            event_rx,
+            tx,
+            closed.clone(),
+        )
+        .await;
+    assert!(result.is_ok(), "run must still succeed: {result:?}");
+    assert!(
+        closed.load(std::sync::atomic::Ordering::Relaxed),
+        "channel-closed flag must be set when receiver was dropped"
+    );
+}
+
+#[tokio::test]
+async fn native_loop_translated_leaves_flag_clear_on_clean_run() {
+    // Companion to the channel-closed test: when the receiver stays
+    // alive for the duration, the flag must remain false. Otherwise
+    // callers can't distinguish the two cases.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bridge = OrchestratorBridge::new(tmp.path()).with_native_loop_enabled(true);
+    let provider = Arc::new(MockLlmAdapter::new(vec![mock_response("clean")]));
+    let tools = ToolRegistry::new();
+    let (harness, _approval, _replay, event_rx) =
+        bridge.build_harness_with_emitter(provider, tools, "sys");
+
+    let mut state = bridge.new_session("mock", "mock-model");
+    let mut history = OrchestratorBridge::new_history();
+
+    let reducer_handle = bridge.new_reducer_handle();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<TranslatedThreadEvent>();
+
+    let closed = Arc::new(AtomicBool::new(false));
+    let result = bridge
+        .run_caduceus_loop_translated(
+            &harness,
+            &mut state,
+            &mut history,
+            "hi",
+            reducer_handle,
+            event_rx,
+            tx,
+            closed.clone(),
+        )
+        .await;
+    assert!(result.is_ok(), "run must succeed: {result:?}");
+    assert!(
+        !closed.load(std::sync::atomic::Ordering::Relaxed),
+        "channel-closed flag must remain false on a clean run"
+    );
 }
