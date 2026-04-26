@@ -677,6 +677,15 @@ pub trait SubagentHandle {
     ) -> Option<tokio::sync::broadcast::Receiver<caduceus_core::AgentEvent>> {
         None
     }
+    /// ST7 r3 followup-B: surface the subagent's currently-selected
+    /// (provider, model) so `classify_subagent_error` at the
+    /// spawn-tool boundary can build a populated `ClassifyContext`
+    /// (used by ST8 vendor rerouting). Default impl returns
+    /// `ClassifyContext::empty()` so adding this method is non-breaking
+    /// for downstream `SubagentHandle` impls (e.g. `FakeSubagent`).
+    fn classify_context(&self, _cx: &App) -> caduceus_core::ClassifyContext {
+        caduceus_core::ClassifyContext::empty()
+    }
 }
 
 /// Options for spawning a sub-agent. Allows the master to override inherited

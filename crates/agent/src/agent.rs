@@ -3199,6 +3199,18 @@ impl SubagentHandle for NativeSubagentHandle {
         self.subagent_thread
             .read_with(cx, |thread, _cx| thread.subagent_event_subscriber())
     }
+
+    fn classify_context(&self, cx: &App) -> caduceus_core::ClassifyContext {
+        // ST7 r3 followup-B: read currently-selected (provider, model) from
+        // the subagent thread so the spawn-tool boundary classifier surfaces
+        // them to ST8 vendor-rerouting (no more `ClassifyContext::empty()`).
+        let t = self.subagent_thread.read(cx);
+        let model = t.model();
+        let provider =
+            model.map(|m| caduceus_core::ProviderId::new(m.provider_id().0.as_ref()));
+        let model_id = model.map(|m| caduceus_core::ModelId::new(m.id().0.as_ref()));
+        caduceus_core::ClassifyContext::new(provider, model_id)
+    }
 }
 
 pub struct AcpTerminalHandle {

@@ -54,6 +54,7 @@ pub fn validate_timeout(t: Option<u64>) -> std::result::Result<Duration, SubAgen
 /// 4. Otherwise → `InternalError { kind: "subagent_send_failed" }`.
 pub fn classify_subagent_error(
     err: &anyhow::Error,
+    classify_ctx: &caduceus_core::ClassifyContext,
     last_phase: SubAgentPhase,
     tools_started: bool,
     elapsed_secs: Option<u64>,
@@ -63,14 +64,13 @@ pub fn classify_subagent_error(
         return typed.clone();
     }
     if let Some(cd_err) = err.downcast_ref::<caduceus_core::CaduceusError>() {
-        // Empty context at this boundary: zed's `spawn_agent_tool` does
-        // not yet thread provider/model into the classify call site
-        // (filed as ST7-followup-B; provider/model populate from the
-        // dispatcher boundary in caduceus-orchestrator). The ClassifyContext
-        // typing makes the upgrade non-breaking.
+        // ST7 r3 followup-B: caller plumbs `classify_ctx` from the subagent
+        // (`SubagentHandle::classify_context`) at the post-send boundary,
+        // or `ClassifyContext::empty()` at the create boundary where no
+        // subagent exists yet.
         return caduceus_core::classify_caduceus_error(
             cd_err,
-            &caduceus_core::ClassifyContext::empty(),
+            classify_ctx,
             last_phase,
             tools_started,
             elapsed_secs,
@@ -397,8 +397,13 @@ impl AgentTool for SpawnAgentTool {
                 };
                 let subagent = subagent.map_err(|err| {
                     // Best-effort classification at the create boundary.
+                    // ClassifyContext::empty() is honest here — the subagent
+                    // doesn't exist yet so we cannot query its (provider,
+                    // model). Post-create, the wrapper receives a populated
+                    // context via `subagent.classify_context(cx)`.
                     let failure = classify_subagent_error(
                         &err,
+                        &caduceus_core::ClassifyContext::empty(),
                         SubAgentPhase::ModelSelection,
                         false,
                         None,
@@ -564,8 +569,14 @@ impl AgentTool for SpawnAgentTool {
                         let g = phase_state.lock().unwrap();
                         (g.0, g.1)
                     };
+                    // ST7 r3 followup-B: pull (provider, model) from the
+                    // subagent so vendor-rerouting (ST8) sees real values
+                    // for raw `CaduceusError` paths that bypass agent.rs's
+                    // typed-error short-circuit.
+                    let classify_ctx = cx.update(|cx| subagent.classify_context(cx));
                     let failure = classify_subagent_error(
                         &e,
+                        &classify_ctx,
                         last_phase,
                         tools_started,
                         Some(elapsed),
@@ -743,18 +754,18 @@ mod tests {
         use anyhow::anyhow;
         let err = anyhow!("User canceled");
         assert!(matches!(
-            classify_subagent_error(&err, SubAgentPhase::ModelSelection, false, Some(0), Some(900)),
+            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ModelSelection, false, Some(0), Some(900)),
             SubAgentFailure::UserCancel
         ));
 
         let err = anyhow!("The agent refused to process that prompt. Try again.");
         assert!(matches!(
-            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, Some(0), Some(900)),
+            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900)),
             SubAgentFailure::ModelRefusal { .. }
         ));
 
         let err = anyhow!("synthetic random failure");
-        let f = classify_subagent_error(&err, SubAgentPhase::Unknown, false, Some(0), Some(900));
+        let f = classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::Unknown, false, Some(0), Some(900));
         match f {
             SubAgentFailure::InternalError { kind, .. } => {
                 assert_eq!(kind, "subagent_send_failed");
@@ -771,7 +782,7 @@ mod tests {
         p.http_status = Some(429);
         let typed = SubAgentFailure::ProviderError(p);
         let err = anyhow::Error::new(typed.clone());
-        let out = classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, Some(0), Some(900));
+        let out = classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900));
         match out {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_after_secs, Some(30));
@@ -854,7 +865,7 @@ mod tests {
         };
         let err = anyhow::Error::new(typed);
         let out =
-            classify_subagent_error(&err, SubAgentPhase::ModelSelection, false, Some(0), Some(900));
+            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ModelSelection, false, Some(0), Some(900));
         match out {
             SubAgentFailure::RecursionLimitExceeded {
                 current_depth,
@@ -879,7 +890,7 @@ mod tests {
         // string) instead of papered over.
         let err = anyhow::anyhow!("Maximum subagent depth (4) reached");
         let out =
-            classify_subagent_error(&err, SubAgentPhase::ModelSelection, false, Some(0), Some(900));
+            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ModelSelection, false, Some(0), Some(900));
         match out {
             SubAgentFailure::InternalError { kind, .. } => {
                 assert_eq!(
@@ -975,7 +986,7 @@ mod tests {
             retry_after_secs: 30,
         });
         let out =
-            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, Some(0), Some(900));
+            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900));
         match out {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
@@ -995,7 +1006,7 @@ mod tests {
             context: "chat".into(),
         });
         let out =
-            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, Some(0), Some(900));
+            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900));
         match out {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
@@ -1009,8 +1020,44 @@ mod tests {
         use caduceus_core::CaduceusError;
         let err = anyhow::Error::new(CaduceusError::Cancelled);
         let out =
-            classify_subagent_error(&err, SubAgentPhase::ProviderCall, false, Some(0), Some(900));
+            classify_subagent_error(&err, &caduceus_core::ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900));
         assert!(matches!(out, SubAgentFailure::UserCancel));
+    }
+
+    // ST7 r3 followup-B: populated `ClassifyContext` flows through to the
+    // resulting `ProviderErrorFailure.provider` / `.model` so ST8's
+    // vendor-rerouting sees real values for raw `CaduceusError` paths.
+    #[test]
+    fn classify_subagent_error_populated_context_surfaces_provider_and_model() {
+        use caduceus_core::{CaduceusError, ClassifyContext, ModelId, ProviderId};
+        let err = anyhow::Error::new(CaduceusError::RateLimited { retry_after_secs: 30 });
+        let ctx = ClassifyContext::new(
+            Some(ProviderId::new("anthropic")),
+            Some(ModelId::new("claude-opus-4.7")),
+        );
+        let out = classify_subagent_error(
+            &err,
+            &ctx,
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        );
+        match out {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(
+                    p.provider.as_ref().map(|x| x.0.as_str()),
+                    Some("anthropic"),
+                    "populated ctx must surface provider id"
+                );
+                assert_eq!(
+                    p.model.as_ref().map(|x| x.0.as_str()),
+                    Some("claude-opus-4.7"),
+                    "populated ctx must surface model id"
+                );
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
     }
 
     // ---- Fix-loop #4: gpui clock advances elapsed_secs (mock-clock test) ----
