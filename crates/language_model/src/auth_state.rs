@@ -221,7 +221,12 @@ impl SafeUrl {
 /// Sanitize a free-form provider error message before storing it in
 /// `DisabledByPolicy::reason` (S3). Three steps:
 ///
-/// 1. Strip ASCII control characters (preserving spaces and tabs).
+/// 1. Replace ASCII/Unicode control characters with a single space. We
+///    REPLACE rather than STRIP so that control-char-separated token
+///    patterns (e.g. `Bearer\nabc.def`, `word\rsk-SECRET`, `leak\x0bya29.X`)
+///    still present a `\s` separator to the redact regex in step 2. (Round-3
+///    fix: the previous strip-then-regex order let `Bearer\nabc` collapse to
+///    `Bearerabc`, which the `\bbearer\s+\S+` pattern could not match.)
 /// 2. Redact tokens matching, case-insensitively:
 ///      * `(?i)\bbearer\s+\S+`
 ///      * `\bsk-\S+`
@@ -230,10 +235,13 @@ impl SafeUrl {
 ///    with `<redacted>`. The `\s` class catches double-spaces, tabs, etc.
 /// 3. Truncate to [`MAX_REASON_LEN`] bytes (UTF-8 safe).
 pub fn sanitize_provider_reason(input: &str) -> String {
-    // Step 1: drop control chars (keep tab & space).
+    // Step 1: replace any control char (including \t, \n, \r, \x0b, ...) with
+    // a single ASCII space. This ensures step-2 regex sees a `\s` boundary
+    // between e.g. `Bearer` and the leaked token even when the original
+    // separator was a non-space control char.
     let mut out: String = input
         .chars()
-        .filter(|c| !c.is_control() || *c == '\t' || *c == ' ')
+        .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
 
     // Step 2: redact token-like substrings with the regex crate (avoid the literal
@@ -423,9 +431,12 @@ mod tests {
         assert!(s.contains("<redacted>"));
         assert!(!s.contains("ya29.A0ARr-foo_bar-baz"));
 
-        // Control chars are stripped; tabs and spaces preserved.
+        // Control chars are replaced with spaces; spaces preserved.
+        // (Round-3 fix: we now replace rather than strip so that control-char
+        // separators between `Bearer`/`sk-`/etc. and the leaked token still
+        // present a `\s` boundary to the redact regex.)
         let s = sanitize_provider_reason("a\x00b\x07c\td e");
-        assert_eq!(s, "abc\td e");
+        assert_eq!(s, "a b c d e");
 
         // Length cap with char-boundary safety.
         let long: String = "x".repeat(MAX_REASON_LEN + 100);
