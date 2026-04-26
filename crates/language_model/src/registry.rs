@@ -318,11 +318,13 @@ impl LanguageModelRegistry {
     }
 
     /// Returns `true` if at least one provider is `Authenticated` (can serve completions
-    /// right now). ST1a (C2 — usability check, NOT configuration check).
+    /// right now). ST1a (C2 — usability check, NOT configuration check). Routed through
+    /// `cached_auth_state` so a fan-out render frame causes ≤1 `provider.auth_state(cx)`
+    /// call per provider (AC-PERF1).
     pub fn has_authenticated_provider(&self, cx: &App) -> bool {
         self.providers
-            .values()
-            .any(|p| p.auth_state(cx).can_provide_models())
+            .keys()
+            .any(|id| self.cached_auth_state(id, cx).can_provide_models())
     }
 
     pub fn available_models<'a>(
@@ -330,11 +332,12 @@ impl LanguageModelRegistry {
         cx: &'a App,
     ) -> impl Iterator<Item = Arc<dyn LanguageModel>> + 'a {
         // ST1a (C3 — usability check; ST1b removes the filter entirely once selector is
-        // redesigned to render unauth providers).
+        // redesigned to render unauth providers). Routed through `cached_auth_state`
+        // (AC-PERF1) so this is amortized across fan-out callers in the same render.
         self.providers
-            .values()
-            .filter(|provider| provider.auth_state(cx).can_provide_models())
-            .flat_map(|provider| provider.provided_models(cx))
+            .iter()
+            .filter(|(id, _)| self.cached_auth_state(id, cx).can_provide_models())
+            .flat_map(|(_, provider)| provider.provided_models(cx))
     }
 
     pub fn provider(&self, id: &LanguageModelProviderId) -> Option<Arc<dyn LanguageModelProvider>> {
@@ -1060,5 +1063,49 @@ mod tests {
             r.cached_auth_state(&id, cx),
             ProviderAuthState::NotAuthenticated { .. }
         ));
+    }
+
+    /// AC-PERF1 (fix-loop #1): `has_authenticated_provider` and `available_models`
+    /// route through `cached_auth_state`, so N consecutive fan-out reads only invoke
+    /// the underlying `provider.auth_state(cx)` once per provider per cache lifetime.
+    #[gpui::test]
+    fn fanout_callers_go_through_cache(cx: &mut App) {
+        let registry = cx.new(|_| LanguageModelRegistry::default());
+        let provider = Arc::new(FakeLanguageModelProvider::default());
+        let id = provider.id();
+        registry.update(cx, |registry, cx| {
+            registry.register_provider(provider.clone(), cx);
+        });
+
+        // Baseline: registering the provider does not call auth_state.
+        assert_eq!(provider.auth_state_call_count(), 0);
+
+        // Drive every fan-out caller multiple times in the same "render frame".
+        let r = registry.read(cx);
+        for _ in 0..5 {
+            assert!(r.has_authenticated_provider(cx));
+            // available_models is lazy; force iteration.
+            let _ = r.available_models(cx).count();
+            // configuration_error and direct cached reads also go through the cache.
+            let _ = r.cached_auth_state(&id, cx);
+        }
+        assert_eq!(
+            provider.auth_state_call_count(),
+            1,
+            "fan-out callers must hit cache; got {} provider calls",
+            provider.auth_state_call_count()
+        );
+
+        // After invalidation, exactly one fresh call services subsequent fan-out.
+        r.invalidate_auth_cache(&id);
+        for _ in 0..5 {
+            assert!(r.has_authenticated_provider(cx));
+            let _ = r.available_models(cx).count();
+        }
+        assert_eq!(
+            provider.auth_state_call_count(),
+            2,
+            "expected exactly one re-query after invalidation"
+        );
     }
 }

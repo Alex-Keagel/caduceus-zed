@@ -23,6 +23,9 @@ pub struct FakeLanguageModelProvider {
     /// `Arc<Mutex<>>` so `&self`-only `auth_state(cx)` can read it and tests can mutate via
     /// `set_auth_state`.
     auth_state_override: Arc<Mutex<Option<ProviderAuthState>>>,
+    /// Counts every call to `auth_state(cx)`. Used by registry cache tests
+    /// (AC-PERF1) to prove a fan-out render frame causes ≤1 underlying call.
+    auth_state_call_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for FakeLanguageModelProvider {
@@ -32,6 +35,7 @@ impl Default for FakeLanguageModelProvider {
             name: LanguageModelProviderName::from("Fake".to_string()),
             models: vec![Arc::new(FakeLanguageModel::default())],
             auth_state_override: Arc::new(Mutex::new(None)),
+            auth_state_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -66,6 +70,8 @@ impl LanguageModelProvider for FakeLanguageModelProvider {
     }
 
     fn auth_state(&self, _: &App) -> ProviderAuthState {
+        self.auth_state_call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.auth_state_override
             .lock()
             .clone()
@@ -97,6 +103,7 @@ impl FakeLanguageModelProvider {
             name,
             models: vec![Arc::new(FakeLanguageModel::default())],
             auth_state_override: Arc::new(Mutex::new(None)),
+            auth_state_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -109,6 +116,13 @@ impl FakeLanguageModelProvider {
     /// `Authenticated` default. Used by tests that exercise the non-authenticated paths.
     pub fn set_auth_state(&self, state: Option<ProviderAuthState>) {
         *self.auth_state_override.lock() = state;
+    }
+
+    /// Number of times `auth_state(cx)` has been called. Used by the registry's
+    /// AC-PERF1 cache test to verify fan-out callers go through `cached_auth_state`.
+    pub fn auth_state_call_count(&self) -> usize {
+        self.auth_state_call_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn test_model(&self) -> FakeLanguageModel {
