@@ -31,8 +31,6 @@ pub enum StorageOperation {
         /// The task ID to delete.
         id: String,
     },
-    /// Snapshot the project file hashes for change detection.
-    SnapshotProject,
     /// Export a session transcript to a file.
     ExportTranscript {
         /// The session ID to export.
@@ -94,7 +92,6 @@ impl AgentTool for CaduceusStorageTool {
                 StorageOperation::ListTasks => "list tasks",
                 StorageOperation::SaveTask { .. } => "save task",
                 StorageOperation::DeleteTask { .. } => "delete task",
-                StorageOperation::SnapshotProject => "snapshot",
                 StorageOperation::ExportTranscript { .. } => "export transcript",
             };
             format!("Storage {op}").into()
@@ -139,10 +136,6 @@ impl AgentTool for CaduceusStorageTool {
                 StorageOperation::DeleteTask { id } => bridge
                     .delete_task(&project_root, &id)
                     .map(|_| format!("Task '{id}' deleted")),
-                StorageOperation::SnapshotProject => {
-                    let snapshot = bridge.snapshot_project(&project_root);
-                    Ok(format!("{} files snapshotted", snapshot.len()))
-                }
                 StorageOperation::ExportTranscript { session_id } => {
                     // Export transcript is not available without caduceus_core::SessionId.
                     // Return info about the session ID for manual export.

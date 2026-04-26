@@ -4,9 +4,8 @@
 use caduceus_core::{AuditEntry, SessionId};
 use caduceus_storage::{
     GitTrackableStore, MemoryRecord, SqliteStorage, StoredCost, StoredToolCall, TraceEvent,
-    TraceEventType, TrajectoryRecorder, WikiEngine, WikiIndex, WikiLinter, WikiPage, WikiWatcher,
+    TraceEventType, TrajectoryRecorder, WikiEngine, WikiIndex, WikiLinter, WikiPage,
 };
-use std::collections::HashMap;
 use std::path::Path;
 
 /// Wrapper around SqliteStorage for the bridge.
@@ -328,14 +327,6 @@ impl StorageBridge {
         store.delete_task(id)
     }
 
-    // ── Project snapshot ─────────────────────────────────────────────────
-
-    /// Snapshot the project file hashes for change detection.
-    pub fn snapshot_project(&self, project_root: &Path) -> HashMap<String, u64> {
-        let watcher = WikiWatcher::new();
-        watcher.snapshot_project(project_root)
-    }
-
     // ── Wiki operations ──────────────────────────────────────────────────
 
     /// List all wiki pages.
@@ -615,15 +606,6 @@ mod tests {
         storage.delete_task(root, "t1").unwrap();
         let tasks = storage.list_tasks(root).unwrap();
         assert!(tasks.is_empty());
-    }
-
-    #[test]
-    fn storage_snapshot_project() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
-        let storage = StorageBridge::open_in_memory().unwrap();
-        let snap = storage.snapshot_project(dir.path());
-        assert!(snap.len() >= 1);
     }
 
     #[test]
