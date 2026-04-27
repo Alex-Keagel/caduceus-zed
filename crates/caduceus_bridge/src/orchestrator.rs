@@ -1001,6 +1001,8 @@ impl OrchestratorBridge {
             injector: InjectorChoice::None,
             max_context_tokens: 200_000,
             tool_timeout: std::time::Duration::from_secs(120),
+            resume_on_grant: false,
+            grant_timeout: None,
         }
     }
 
@@ -1710,6 +1712,12 @@ pub struct HarnessBuilder<'a> {
     injector: InjectorChoice,
     max_context_tokens: u32,
     tool_timeout: std::time::Duration,
+    /// ST8-PR3 — opt-in to the orchestrator pause-before-deny-commit path.
+    /// `false` by default to preserve existing behaviour.
+    resume_on_grant: bool,
+    /// ST8-PR3 — override for the orchestrator's grant-pause timeout.
+    /// `None` falls back to the harness default (5s).
+    grant_timeout: Option<std::time::Duration>,
 }
 
 /// Result of [`HarnessBuilder::build`].
@@ -1795,6 +1803,24 @@ impl<'a> HarnessBuilder<'a> {
         self
     }
 
+    /// ST8-PR3 — enable the orchestrator's resume-on-grant pause path.
+    /// When `true`, the harness will pause a would-be deny for up to
+    /// [`Self::with_grant_timeout`] (5s default) and emit
+    /// `AgentEvent::GrantPending`, waiting for an out-of-band call to
+    /// [`AgentHarness::submit_grant`]. Default `false` — purely
+    /// additive; existing callers see no behavioural change.
+    pub fn with_resume_on_grant(mut self, enabled: bool) -> Self {
+        self.resume_on_grant = enabled;
+        self
+    }
+
+    /// ST8-PR3 — override the grant-pause timeout. Only meaningful when
+    /// [`Self::with_resume_on_grant`] is `true`.
+    pub fn with_grant_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.grant_timeout = Some(timeout);
+        self
+    }
+
     pub fn build(self) -> BuiltHarness {
         let HarnessBuilder {
             bridge,
@@ -1808,11 +1834,20 @@ impl<'a> HarnessBuilder<'a> {
             injector,
             max_context_tokens,
             tool_timeout,
+            resume_on_grant,
+            grant_timeout,
         } = self;
 
         let mut base = AgentHarness::new(provider, tools, max_context_tokens, &system_prompt)
             .with_tool_timeout(tool_timeout)
             .with_instructions(&bridge.project_root);
+
+        if resume_on_grant {
+            base = base.with_resume_on_grant(true);
+        }
+        if let Some(d) = grant_timeout {
+            base = base.with_grant_timeout(d);
+        }
 
         if let Some(env) = envelope {
             base = base.with_permission_envelope(env);

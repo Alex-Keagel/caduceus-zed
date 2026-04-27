@@ -101,6 +101,45 @@ impl std::fmt::Display for NoModelConfiguredError {
 
 impl std::error::Error for NoModelConfiguredError {}
 
+/// ST8-PR3 — error type for [`Thread::submit_caduceus_grant`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaduceusGrantError {
+    /// No live harness is currently provisioned for this thread (no
+    /// active turn, or the harness was invalidated). Caller should
+    /// retry on the next turn or treat the request as already
+    /// resolved.
+    HarnessNotProvisioned,
+    /// The `tool_use_id` does not match any pending grant on the
+    /// harness — either a typo, a stale id, or the wait already
+    /// timed out and the entry was reaped.
+    NoSuchPending,
+    /// The receiver-side deny-task dropped before consuming the
+    /// outcome — the deny was committed before the grant landed.
+    ReceiverDropped,
+}
+
+impl std::fmt::Display for CaduceusGrantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HarnessNotProvisioned => write!(f, "no live harness on this thread"),
+            Self::NoSuchPending => write!(f, "no pending grant for this tool_use_id"),
+            Self::ReceiverDropped => write!(f, "grant arrived after the deny was committed"),
+        }
+    }
+}
+
+impl std::error::Error for CaduceusGrantError {}
+
+impl From<caduceus_orchestrator::SubmitGrantError> for CaduceusGrantError {
+    fn from(e: caduceus_orchestrator::SubmitGrantError) -> Self {
+        use caduceus_orchestrator::SubmitGrantError as S;
+        match e {
+            S::NoSuchPending => Self::NoSuchPending,
+            S::ReceiverDropped => Self::ReceiverDropped,
+        }
+    }
+}
+
 /// Context passed to a subagent thread for lifecycle management
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubagentContext {
@@ -2223,6 +2262,40 @@ impl Thread {
         self.caduceus.harness.is_some()
             && self.caduceus.native_state.is_some()
             && self.caduceus.bridge.is_some()
+    }
+
+    /// ST8-PR3 — deliver an out-of-band grant decision to the live
+    /// orchestrator harness. Used by the inline approve-expansion
+    /// picker to resume a tool call that was paused on
+    /// `AgentEvent::GrantPending`.
+    ///
+    /// Returns `Ok(())` when the harness was found and the outcome was
+    /// routed to the waiting deny-task. Returns `Err` when:
+    /// - the harness is not currently provisioned (no live turn);
+    /// - the `tool_use_id` has no pending grant (typo / stale id /
+    ///   already timed out and reaped);
+    /// - the receiver-side task dropped before consuming the outcome
+    ///   (the deny will already have been committed).
+    ///
+    /// Caller MUST construct the `GrantOutcome::Granted { updated }`
+    /// envelope so it monotonically widens the active envelope and
+    /// covers the originally-denied capability/resource. The
+    /// orchestrator re-validates both invariants before dispatching
+    /// and rejects mismatches with a synth deny.
+    pub async fn submit_caduceus_grant(
+        &self,
+        tool_use_id: &str,
+        outcome: caduceus_permissions::GrantOutcome,
+    ) -> std::result::Result<(), CaduceusGrantError> {
+        let harness = self
+            .caduceus
+            .harness
+            .clone()
+            .ok_or(CaduceusGrantError::HarnessNotProvisioned)?;
+        harness
+            .submit_grant(tool_use_id, outcome)
+            .await
+            .map_err(CaduceusGrantError::from)
     }
 
     /// Drops the harness, state, cancel token, emitter, and bridge
