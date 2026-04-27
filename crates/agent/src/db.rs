@@ -132,6 +132,12 @@ impl PinReasonProxy {
 #[serde(untagged)]
 enum PinnedMessageKeyProxy {
     Known(PinnedMessageKeyKnown),
+    /// Forward-compat fallback. The held value is never inspected — its
+    /// only job is to absorb unknown variants from a future schema so the
+    /// outer thread still deserializes. `into_known` maps this arm to
+    /// `None`; we keep the `serde_json::Value` payload because the
+    /// `untagged` representation needs *something* to bind to.
+    #[allow(dead_code)]
     Unknown(serde_json::Value),
 }
 
@@ -145,9 +151,7 @@ enum PinnedMessageKeyKnown {
 impl PinnedMessageKeyProxy {
     fn into_known(self) -> Option<crate::PinnedMessageKey> {
         match self {
-            Self::Known(PinnedMessageKeyKnown::User(id)) => {
-                Some(crate::PinnedMessageKey::User(id))
-            }
+            Self::Known(PinnedMessageKeyKnown::User(id)) => Some(crate::PinnedMessageKey::User(id)),
             Self::Known(PinnedMessageKeyKnown::Resume(rid)) => {
                 Some(crate::PinnedMessageKey::Resume(rid))
             }
