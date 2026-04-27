@@ -2180,19 +2180,32 @@ impl NativeAgentConnection {
                                 log::debug!("Assistant message complete: {:?}", stop_reason);
                                 return Ok(acp::PromptResponse::new(stop_reason));
                             }
-                            // G1b: native-loop-only variants. In legacy
-                            // (non-caduceus) sessions these are never
-                            // produced; in native sessions a richer
-                            // consumer surfaces them. Here we log-and-
-                            // drop to stay compatible with existing
-                            // ACP behavior.
+                            // ST8 PR-3C: surface caduceus context notices as
+                            // header-banner toasts. Special-case `grant.resolved`
+                            // to also clear the inline grant picker. Other kinds
+                            // become Info-severity banners.
                             ThreadEvent::ContextNotice(notice) => {
-                                log::debug!(
-                                    "ContextNotice (not surfaced in ACP path): {} {}",
-                                    notice.kind,
-                                    notice.message
-                                );
+                                log::debug!("ContextNotice: {} {}", notice.kind, notice.message);
+                                let kind = notice.kind.clone();
+                                let message = notice.message.clone();
+                                acp_thread
+                                    .update(cx, |thread, cx| {
+                                        if kind == "grant.resolved" {
+                                            thread.clear_pending_grant(cx);
+                                        }
+                                        thread.push_notice(
+                                            kind,
+                                            message,
+                                            acp_thread::NoticeSeverity::Info,
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
                             }
+                            // ST8 PR-3C: surface engine diagnostics as header-
+                            // banner toasts. Suppress the duplicate `grant.pending`
+                            // diagnostic (the typed `GrantApprovalRequest` arm
+                            // below renders the interactive picker for that case).
                             ThreadEvent::EngineDiagnostic(diag) => {
                                 log::warn!(
                                     "EngineDiagnostic [{:?}] {}: {}",
@@ -2200,6 +2213,60 @@ impl NativeAgentConnection {
                                     diag.kind,
                                     diag.detail
                                 );
+                                if diag.kind == "grant.pending" {
+                                    // Picker is the surface; skip the warning text.
+                                    continue;
+                                }
+                                let severity = match diag.severity {
+                                    crate::thread::EngineDiagnosticSeverity::Error => {
+                                        acp_thread::NoticeSeverity::Error
+                                    }
+                                    crate::thread::EngineDiagnosticSeverity::Warning => {
+                                        acp_thread::NoticeSeverity::Warning
+                                    }
+                                    crate::thread::EngineDiagnosticSeverity::Info => {
+                                        acp_thread::NoticeSeverity::Info
+                                    }
+                                };
+                                let kind = diag.kind.clone();
+                                let detail = diag.detail.clone();
+                                acp_thread
+                                    .update(cx, |thread, cx| {
+                                        thread.push_notice(kind, detail, severity, cx);
+                                    })
+                                    .ok();
+                            }
+                            // ST8 PR-3C: typed grant.pending picker. Routes the
+                            // user's Allow/Deny choice back to the consumer task
+                            // which calls `submit_caduceus_grant_detached`.
+                            ThreadEvent::GrantApprovalRequest {
+                                tool_use_id,
+                                deadline_ms,
+                                response,
+                            } => {
+                                let outcome_rx = acp_thread
+                                    .update(cx, |thread, cx| {
+                                        thread.request_grant(tool_use_id, deadline_ms, cx)
+                                    })
+                                    .ok();
+                                if let Some(outcome_rx) = outcome_rx {
+                                    cx.background_spawn(async move {
+                                        match outcome_rx.await {
+                                            Ok(allow) => {
+                                                // `send` errors only if the consumer
+                                                // sub-task already dropped its rx,
+                                                // which can't happen until we send.
+                                                let _ = response.send(allow);
+                                            }
+                                            Err(_) => {
+                                                // AcpThread dropped or grant cleared
+                                                // without resolution — drop response,
+                                                // consumer task observes Canceled.
+                                            }
+                                        }
+                                    })
+                                    .detach();
+                                }
                             }
                             ThreadEvent::UsageUpdated(usage) => {
                                 // Native-loop-only: per-turn token

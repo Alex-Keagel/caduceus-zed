@@ -285,7 +285,11 @@ impl Conversation {
                     | AcpThreadEvent::AvailableCommandsUpdated(_)
                     | AcpThreadEvent::ModeUpdated(_)
                     | AcpThreadEvent::ConfigOptionsUpdated(_)
-                    | AcpThreadEvent::WorkingDirectoriesUpdated => {}
+                    | AcpThreadEvent::WorkingDirectoriesUpdated
+                    | AcpThreadEvent::GrantApprovalRequested
+                    | AcpThreadEvent::GrantApprovalResolved
+                    | AcpThreadEvent::NoticeAdded(_)
+                    | AcpThreadEvent::NoticeRemoved(_) => {}
                 }
             }
         });
@@ -408,7 +412,11 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::AvailableCommandsUpdated(_)
         | AcpThreadEvent::ModeUpdated(_)
         | AcpThreadEvent::ConfigOptionsUpdated(_)
-        | AcpThreadEvent::SubagentSpawned(_) => false,
+        | AcpThreadEvent::SubagentSpawned(_)
+        | AcpThreadEvent::GrantApprovalRequested
+        | AcpThreadEvent::GrantApprovalResolved
+        | AcpThreadEvent::NoticeAdded(_)
+        | AcpThreadEvent::NoticeRemoved(_) => false,
     }
 }
 
@@ -1634,6 +1642,16 @@ impl ConversationView {
                 cx.notify();
             }
             AcpThreadEvent::WorkingDirectoriesUpdated => {
+                cx.notify();
+            }
+            // ST8 PR-3C: grant picker + notice surface. The picker is rendered
+            // by `render_grant_picker` reading `thread.pending_grant()` from
+            // the AcpThread, so we just trigger a redraw — no explicit field
+            // mirroring needed.
+            AcpThreadEvent::GrantApprovalRequested
+            | AcpThreadEvent::GrantApprovalResolved
+            | AcpThreadEvent::NoticeAdded(_)
+            | AcpThreadEvent::NoticeRemoved(_) => {
                 cx.notify();
             }
         }

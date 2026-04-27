@@ -3292,6 +3292,8 @@ impl ThreadView {
                             .flex_wrap()
                             .justify_between()
                             .children(self.render_guardrail_alert(cx))
+                            .children(self.render_grant_picker(cx))
+                            .child(self.render_notice_banners(cx))
                             .child(
                                 h_flex()
                                     .gap_0p5()
@@ -3613,6 +3615,135 @@ impl ThreadView {
                         .color(label_color),
                 ),
         )
+    }
+
+    /// ST8 PR-3C: render the inline grant approval picker as a header banner.
+    /// Surfaces `acp_thread.pending_grant()` with a Deny button (Allow is
+    /// deferred — see PR-3C MVP scope note in `Thread::submit_caduceus_grant_detached`).
+    fn render_grant_picker(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let acp_thread = self.thread.read(cx);
+        let pending = acp_thread.pending_grant()?;
+        let tool_use_id = pending.tool_use_id.clone();
+        let elapsed = pending.created_at.elapsed();
+        let deadline_ms = pending.deadline_ms;
+        let tool_use_hash: u64 = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            tool_use_id.hash(&mut hasher);
+            hasher.finish()
+        };
+        let countdown_label = deadline_ms.map(|ms| {
+            let total = std::time::Duration::from_millis(ms);
+            let remaining = total.saturating_sub(elapsed);
+            format!("{}s", remaining.as_secs().max(0))
+        });
+
+        let thread_for_deny = self.thread.clone();
+        let deny_button = Button::new(("grant-deny", 0u32), "Deny")
+            .label_size(LabelSize::Small)
+            .start_icon(
+                Icon::new(IconName::Close)
+                    .size(IconSize::XSmall)
+                    .color(Color::Error),
+            )
+            .on_click(move |_, _window, cx| {
+                thread_for_deny.update(cx, |thread, cx| {
+                    thread.resolve_grant_user_choice(false, cx);
+                });
+            });
+
+        let bg_color = cx.theme().status().warning.opacity(0.1);
+        let border_color = cx.theme().status().warning.opacity(0.4);
+
+        Some(
+            h_flex()
+                .id(("grant-picker", tool_use_hash))
+                .w_full()
+                .px_2()
+                .py_1()
+                .mb_1()
+                .gap_2()
+                .rounded_md()
+                .bg(bg_color)
+                .border_1()
+                .border_color(border_color)
+                .child(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::XSmall)
+                        .color(Color::Warning),
+                )
+                .child(
+                    Label::new(format!(
+                        "Grant required: tool_use_id={}{}",
+                        &tool_use_id,
+                        countdown_label
+                            .as_ref()
+                            .map(|s| format!(" (timeout in {s})"))
+                            .unwrap_or_default(),
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Warning),
+                )
+                .child(div().flex_1())
+                .child(deny_button),
+        )
+    }
+
+    /// ST8 PR-3C: render notice banners (transient header toasts) sourced
+    /// from `ContextNotice` / `EngineDiagnostic` thread events.
+    fn render_notice_banners(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let acp_thread = self.thread.read(cx);
+        let notices: Vec<acp_thread::NoticeBanner> = acp_thread.notices().to_vec();
+        v_flex()
+            .w_full()
+            .gap_0p5()
+            .children(notices.into_iter().map(|notice| {
+                let (bg, border, label_color) = match notice.severity {
+                    acp_thread::NoticeSeverity::Error => (
+                        cx.theme().status().error.opacity(0.1),
+                        cx.theme().status().error.opacity(0.4),
+                        Color::Error,
+                    ),
+                    acp_thread::NoticeSeverity::Warning => (
+                        cx.theme().status().warning.opacity(0.1),
+                        cx.theme().status().warning.opacity(0.4),
+                        Color::Warning,
+                    ),
+                    acp_thread::NoticeSeverity::Info => (
+                        cx.theme().status().info.opacity(0.1),
+                        cx.theme().status().info.opacity(0.4),
+                        Color::Muted,
+                    ),
+                };
+                let id = notice.id;
+                let thread_for_dismiss = self.thread.clone();
+                h_flex()
+                    .id(("notice-banner", id as usize))
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .rounded_md()
+                    .bg(bg)
+                    .border_1()
+                    .border_color(border)
+                    .child(
+                        Label::new(format!("{}: {}", notice.kind, notice.message))
+                            .size(LabelSize::Small)
+                            .color(label_color),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new(("notice-dismiss", id as usize), "✕")
+                            .label_size(LabelSize::Small)
+                            .on_click(move |_, _window, cx| {
+                                thread_for_dismiss.update(cx, |thread, cx| {
+                                    thread.dismiss_notice(id, cx);
+                                });
+                            }),
+                    )
+            }))
     }
 
     /// Caduceus: render context zone indicator next to token usage

@@ -981,6 +981,25 @@ pub enum ThreadEvent {
     /// ACP consumers (`agent.rs:1961+`) log-and-drop; native consumers
     /// can render a token-usage badge.
     UsageUpdated(NativeTokenUsage),
+    /// Caduceus ST8 PR-3C: structured grant approval request. Consumed by
+    /// the `agent.rs` ThreadEvent → AcpThread bridge to drive the inline
+    /// header-banner picker. Emitted by the native consumer task on
+    /// `TranslatedThreadEvent::GrantPending`, ALONGSIDE the existing
+    /// `EngineDiagnostic("grant.pending", Warning)` from the dispatcher
+    /// (kept for legacy consumers that only saw the warning text). The
+    /// dispatcher is intentionally NOT forked — see PR-3C design notes.
+    ///
+    /// `response`: the user's Allow (true) / Deny (false) choice routed
+    /// back from the picker. The bridge spawns a sub-task that awaits this
+    /// and calls `Thread::submit_caduceus_grant`. If the receiver-side is
+    /// dropped (UI cleared without resolution), the bridge silently skips
+    /// `submit_caduceus_grant` — the orchestrator's `grant_timeout` reaps
+    /// the original pending entry.
+    GrantApprovalRequest {
+        tool_use_id: String,
+        deadline_ms: Option<u64>,
+        response: futures::channel::oneshot::Sender<bool>,
+    },
 }
 
 /// Payload for [`ThreadEvent::UsageUpdated`]. Mirrors
@@ -2296,6 +2315,40 @@ impl Thread {
             .submit_grant(tool_use_id, outcome)
             .await
             .map_err(CaduceusGrantError::from)
+    }
+
+    /// PR-3C: fire-and-forget variant of `submit_caduceus_grant` for the
+    /// native consumer task. Spawns the harness submit on a background task
+    /// and silently drops `NoSuchPending` errors (race with orchestrator
+    /// timeout). Used by the inline grant picker bridge.
+    pub fn submit_caduceus_grant_detached(
+        &self,
+        tool_use_id: String,
+        outcome: caduceus_permissions::GrantOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(harness) = self.caduceus.harness.clone() else {
+            log::debug!(
+                "submit_caduceus_grant_detached: harness not provisioned; \
+                 dropping outcome for tool_use_id={tool_use_id}"
+            );
+            return;
+        };
+        cx.background_spawn(async move {
+            match harness.submit_grant(&tool_use_id, outcome).await {
+                Ok(()) => {}
+                Err(e) => {
+                    // SubmitGrantError::NoSuchPending == orchestrator already
+                    // resolved (timeout / replaced). Not an error from the
+                    // user's perspective — the picker resolved.
+                    log::debug!(
+                        "submit_caduceus_grant_detached: \
+                         tool_use_id={tool_use_id} swallowed: {e:?}"
+                    );
+                }
+            }
+        })
+        .detach();
     }
 
     /// Drops the harness, state, cancel token, emitter, and bridge
@@ -4607,6 +4660,68 @@ impl Thread {
                     let _ = thread_for_pins.update(cx_cons, |t, cx| {
                         t.on_plan_event_emitted(cx);
                     });
+                }
+                // ST8 PR-3C: surface the grant.pending picker as a typed
+                // ThreadEvent BEFORE running the dispatcher. The dispatcher
+                // still emits its EngineDiagnostic + ContextNotice text-stream
+                // events for legacy paths; the bridge in agent.rs ignores
+                // the duplicate diagnostic when it sees this typed variant.
+                if let T::GrantPending {
+                    tool_use_id,
+                    deadline_ms,
+                } = &ev
+                {
+                    let (tx, rx) = futures::channel::oneshot::channel::<bool>();
+                    let _ = stream_for_consumer.0.unbounded_send(Ok(
+                        ThreadEvent::GrantApprovalRequest {
+                            tool_use_id: tool_use_id.clone(),
+                            deadline_ms: Some(*deadline_ms),
+                            response: tx,
+                        },
+                    ));
+                    let id_for_task = tool_use_id.clone();
+                    let weak_thread = thread_for_pins.clone();
+                    cx_cons
+                        .spawn(async move |cx| {
+                            // The bridge resolves `rx` with the user's
+                            // Allow/Deny choice. If the AcpThread is dropped
+                            // (pane closed, thread torn down) the rx errors
+                            // with `Canceled` — we silently skip submission
+                            // and let the orchestrator's grant_timeout reap.
+                            //
+                            // PR-3C MVP scope: only Deny is wired through
+                            // `submit_caduceus_grant_detached`. Allow requires
+                            // constructing a widened `PermissionEnvelope`
+                            // covering the originally-denied capability/
+                            // resource, which the harness doesn't yet expose
+                            // a helper for. UI surfaces "Deny" as the only
+                            // resolving button; `Allow` is deferred to a
+                            // follow-up that lands the harness-side helper.
+                            // If a future caller resolves with `true`, we
+                            // currently log and skip — orchestrator times out.
+                            let outcome = match rx.await {
+                                Ok(true) => {
+                                    log::warn!(
+                                        "GrantApprovalRequest resolved Allow but \
+                                         envelope construction is not yet wired; \
+                                         skipping submit_caduceus_grant for \
+                                         tool_use_id={id_for_task}"
+                                    );
+                                    return;
+                                }
+                                Ok(false) => caduceus_permissions::GrantOutcome::Denied {
+                                    reason: "user-denied".into(),
+                                },
+                                Err(_) => return,
+                            };
+                            // Race: orchestrator may have already timed out
+                            // the original pending entry. submit_caduceus_grant
+                            // returns `NoSuchPending` in that case — swallow.
+                            let _ = weak_thread.update(cx, |t, cx| {
+                                t.submit_caduceus_grant_detached(id_for_task.clone(), outcome, cx);
+                            });
+                        })
+                        .detach();
                 }
                 let handled_fully = handle_native_tool_lifecycle(
                     &ev,

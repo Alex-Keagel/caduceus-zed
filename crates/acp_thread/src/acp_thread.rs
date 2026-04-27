@@ -53,6 +53,14 @@ impl std::error::Error for MaxOutputTokensError {}
 /// This is a workaround since ACP's ToolCall doesn't have a dedicated name field.
 pub const TOOL_NAME_META_KEY: &str = "tool_name";
 
+/// Monotonic generator for notice banner ids. Process-wide is fine — the id
+/// is only meaningful within a single AcpThread's lifetime.
+fn next_notice_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Helper to extract tool name from ACP meta
 pub fn tool_name_from_meta(meta: &Option<acp::Meta>) -> Option<SharedString> {
     meta.as_ref()
@@ -1067,6 +1075,50 @@ pub struct AcpThread {
     /// gradually to create a fluid typing effect instead of choppy chunk-at-a-time
     /// updates.
     streaming_text_buffer: Option<StreamingTextBuffer>,
+    /// Caduceus ST8: in-flight grant approval request, surfaced as a header
+    /// banner with Allow/Deny buttons. At most one pending grant per thread —
+    /// the orchestrator's `pending_scope_expansion` is single-slotted.
+    pending_grant: Option<PendingGrant>,
+    /// Caduceus ST8 (Layer 1): transient header notices surfaced from
+    /// `ContextNotice` / `EngineDiagnostic` ThreadEvents. Header banners,
+    /// not in-list rows — explicit-dismiss only (no auto-expire).
+    notices: Vec<NoticeBanner>,
+}
+
+/// A pending caduceus grant approval. Carries the oneshot sender used to
+/// deliver the user's Allow/Deny choice back to the bridge task that called
+/// `request_grant`.
+pub struct PendingGrant {
+    pub tool_use_id: String,
+    pub deadline_ms: Option<u64>,
+    pub created_at: Instant,
+    pub respond_tx: oneshot::Sender<bool>,
+}
+
+impl std::fmt::Debug for PendingGrant {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingGrant")
+            .field("tool_use_id", &self.tool_use_id)
+            .field("deadline_ms", &self.deadline_ms)
+            .field("created_at", &self.created_at)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct NoticeBanner {
+    pub id: u64,
+    pub kind: SharedString,
+    pub message: SharedString,
+    pub severity: NoticeSeverity,
+    pub created_at: Instant,
 }
 
 struct StreamingTextBuffer {
@@ -1106,6 +1158,16 @@ pub enum AcpThreadEvent {
     EntriesRemoved(Range<usize>),
     ToolAuthorizationRequested(acp::ToolCallId),
     ToolAuthorizationReceived(acp::ToolCallId),
+    /// Caduceus ST8: a `grant.pending` event arrived; the UI should render
+    /// the header-banner picker reading `pending_grant()`.
+    GrantApprovalRequested,
+    /// Caduceus ST8: pending grant cleared (resolved by user click, by
+    /// `clear_pending_grant`, or by drop).
+    GrantApprovalResolved,
+    /// Caduceus ST8 (Layer 1): a notice banner was added; rerender header.
+    NoticeAdded(u64),
+    /// Caduceus ST8 (Layer 1): a notice banner was dismissed.
+    NoticeRemoved(u64),
     Retry(RetryStatus),
     SubagentSpawned(acp::SessionId),
     Stopped(acp::StopReason),
@@ -1251,6 +1313,8 @@ impl AcpThread {
             draft_prompt: None,
             ui_scroll_position: None,
             streaming_text_buffer: None,
+            pending_grant: None,
+            notices: Vec::new(),
         }
     }
 
@@ -2121,6 +2185,102 @@ impl AcpThread {
         }
 
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
+    }
+
+    // ── Caduceus ST8 grant approval surface ──────────────────────────────
+
+    /// Returns the current pending grant, if any.
+    pub fn pending_grant(&self) -> Option<&PendingGrant> {
+        self.pending_grant.as_ref()
+    }
+
+    /// Records a new grant approval request. Returns the receiver-side of
+    /// the user-choice channel; the caller (typically the agent.rs bridge)
+    /// awaits this to forward the user's Allow/Deny back to the orchestrator.
+    ///
+    /// If a grant is already pending (single-slot invariant violated by a
+    /// stale duplicate), the prior request is silently dropped — its
+    /// receiver-side observes `Canceled` and the orchestrator's grant_timeout
+    /// reaps the original.
+    pub fn request_grant(
+        &mut self,
+        tool_use_id: String,
+        deadline_ms: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_grant = Some(PendingGrant {
+            tool_use_id,
+            deadline_ms,
+            created_at: Instant::now(),
+            respond_tx: tx,
+        });
+        cx.emit(AcpThreadEvent::GrantApprovalRequested);
+        rx
+    }
+
+    /// Resolves the pending grant with the user's choice. Idempotent:
+    /// returns silently if no grant is pending (e.g. a late button click
+    /// after the orchestrator already timed out).
+    pub fn resolve_grant_user_choice(&mut self, allow: bool, cx: &mut Context<Self>) {
+        if let Some(g) = self.pending_grant.take() {
+            // `send` returns Err if the rx half was already dropped — that's
+            // fine; the bridge task simply observes the dropped sender.
+            let _ = g.respond_tx.send(allow);
+            cx.emit(AcpThreadEvent::GrantApprovalResolved);
+        }
+    }
+
+    /// Clears the pending grant without resolving it (the orchestrator
+    /// timed out, or the thread is being torn down). Drops the respond_tx
+    /// so the bridge task observes `Canceled` and skips submit_caduceus_grant.
+    pub fn clear_pending_grant(&mut self, cx: &mut Context<Self>) {
+        if self.pending_grant.take().is_some() {
+            cx.emit(AcpThreadEvent::GrantApprovalResolved);
+        }
+    }
+
+    // ── Caduceus ST8 (Layer 1) notice surface ────────────────────────────
+
+    /// Returns the current notice banners.
+    pub fn notices(&self) -> &[NoticeBanner] {
+        &self.notices
+    }
+
+    /// Pushes a notice banner. Capped at `MAX_NOTICES` — oldest is evicted
+    /// when full so the header doesn't unbounded-grow.
+    pub fn push_notice(
+        &mut self,
+        kind: impl Into<SharedString>,
+        message: impl Into<SharedString>,
+        severity: NoticeSeverity,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        const MAX_NOTICES: usize = 5;
+        let id = next_notice_id();
+        let banner = NoticeBanner {
+            id,
+            kind: kind.into(),
+            message: message.into(),
+            severity,
+            created_at: Instant::now(),
+        };
+        if self.notices.len() >= MAX_NOTICES {
+            let evicted = self.notices.remove(0);
+            cx.emit(AcpThreadEvent::NoticeRemoved(evicted.id));
+        }
+        self.notices.push(banner);
+        cx.emit(AcpThreadEvent::NoticeAdded(id));
+        id
+    }
+
+    /// Dismisses a notice banner by id. Idempotent: silently no-ops if the
+    /// id isn't present (e.g. already evicted).
+    pub fn dismiss_notice(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(pos) = self.notices.iter().position(|n| n.id == id) {
+            self.notices.remove(pos);
+            cx.emit(AcpThreadEvent::NoticeRemoved(id));
+        }
     }
 
     pub fn plan(&self) -> &Plan {
@@ -5501,6 +5661,200 @@ mod tests {
                 thread.cost().is_none(),
                 "cost should be cleared when token usage is cleared"
             );
+        });
+    }
+
+    // ── ST8 PR-3C: grant approval surface tests ─────────────────────────
+
+    #[gpui::test]
+    async fn test_grant_request_resolve_allow(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let rx = thread.update(cx, |thread, cx| {
+            thread.request_grant("toolcall-1".into(), Some(5_000), cx)
+        });
+
+        thread.update(cx, |thread, _cx| {
+            let pending = thread.pending_grant().expect("should have pending grant");
+            assert_eq!(pending.tool_use_id, "toolcall-1");
+            assert_eq!(pending.deadline_ms, Some(5_000));
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.resolve_grant_user_choice(true, cx);
+        });
+
+        let outcome = rx.await.expect("rx should resolve");
+        assert!(outcome, "user chose Allow");
+
+        thread.update(cx, |thread, _cx| {
+            assert!(
+                thread.pending_grant().is_none(),
+                "pending_grant cleared after resolve"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grant_clear_drops_response(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let rx = thread.update(cx, |thread, cx| {
+            thread.request_grant("toolcall-2".into(), None, cx)
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.clear_pending_grant(cx);
+        });
+
+        let res = rx.await;
+        assert!(
+            res.is_err(),
+            "clear_pending_grant must drop tx so rx errors with Canceled"
+        );
+
+        thread.update(cx, |thread, _cx| {
+            assert!(thread.pending_grant().is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grant_resolve_idempotent_when_no_pending(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        // Late click after orchestrator timed out — must not panic.
+        thread.update(cx, |thread, cx| {
+            thread.resolve_grant_user_choice(false, cx);
+            thread.clear_pending_grant(cx);
+            assert!(thread.pending_grant().is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grant_request_replaces_prior(cx: &mut gpui::TestAppContext) {
+        // Single in-flight invariant: a second request_grant supersedes the first.
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let rx1 = thread.update(cx, |thread, cx| {
+            thread.request_grant("first".into(), Some(1_000), cx)
+        });
+        let rx2 = thread.update(cx, |thread, cx| {
+            thread.request_grant("second".into(), Some(2_000), cx)
+        });
+
+        // First receiver must be cancelled (its tx was overwritten).
+        assert!(rx1.await.is_err(), "first request superseded");
+
+        thread.update(cx, |thread, cx| {
+            assert_eq!(thread.pending_grant().unwrap().tool_use_id, "second");
+            thread.resolve_grant_user_choice(false, cx);
+        });
+
+        let outcome2 = rx2.await.expect("second rx resolves");
+        assert!(!outcome2);
+    }
+
+    // ── ST8 PR-3C: notice surface tests ─────────────────────────────────
+
+    #[gpui::test]
+    async fn test_notice_push_dismiss(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let id = thread.update(cx, |thread, cx| {
+            thread.push_notice(
+                "context.compacted",
+                "Compacted 3 turns",
+                NoticeSeverity::Info,
+                cx,
+            )
+        });
+
+        thread.update(cx, |thread, _cx| {
+            assert_eq!(thread.notices().len(), 1);
+            assert_eq!(thread.notices()[0].id, id);
+            assert_eq!(thread.notices()[0].kind.as_ref(), "context.compacted");
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.dismiss_notice(id, cx);
+            assert!(thread.notices().is_empty());
+            // Idempotent: dismissing again is a no-op.
+            thread.dismiss_notice(id, cx);
+            assert!(thread.notices().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_notice_eviction_when_full(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            for i in 0..7 {
+                thread.push_notice(
+                    format!("kind.{i}"),
+                    format!("notice {i}"),
+                    NoticeSeverity::Info,
+                    cx,
+                );
+            }
+            assert_eq!(thread.notices().len(), 5, "capped at MAX_NOTICES");
+            // FIFO: oldest two were evicted.
+            assert_eq!(thread.notices()[0].kind.as_ref(), "kind.2");
+            assert_eq!(thread.notices()[4].kind.as_ref(), "kind.6");
         });
     }
 }
