@@ -7258,6 +7258,36 @@ fn dispatch_translated_event(
             );
         }
 
+        // ── ST8-PR3B — resume-on-grant lifecycle (text-stream surface) ──
+        // Until the inline grant picker widget lands (PR-3C), we surface
+        // these as warning + notice text-stream events, mirroring
+        // `permission.request` / `scope.expansion`. The reducer
+        // (`SessionSnapshotV1::pending_scope_expansion`) carries the
+        // structured state the eventual widget will read; this arm only
+        // needs to make the user *aware* that input is required and
+        // resolution is informational.
+        T::GrantPending {
+            tool_use_id,
+            deadline_ms,
+        } => {
+            stream.send_engine_diagnostic(
+                "grant.pending",
+                format!(
+                    "resume-on-grant pending: tool_use_id={tool_use_id} deadline={deadline_ms}ms"
+                ),
+                EngineDiagnosticSeverity::Warning,
+            );
+        }
+        T::GrantResolved {
+            tool_use_id,
+            outcome,
+        } => {
+            stream.send_context_notice(
+                "grant.resolved",
+                format!("tool_use_id={tool_use_id} outcome={outcome}"),
+            );
+        }
+
         // Retry — map to the existing acp_thread::RetryStatus shape
         // with best-effort fields. The legacy path carries more
         // detail (attempt counts, backoff), which the provider
@@ -8767,6 +8797,46 @@ mod native_dispatch_tests {
                 assert_eq!(d.severity, EngineDiagnosticSeverity::Warning);
             }
             other => panic!("expected EngineDiagnostic, got {other:?}"),
+        });
+    }
+
+    // ── ST8-PR3B — GrantPending / GrantResolved dispatcher arms ────────
+    #[test]
+    fn grant_pending_is_warning_diagnostic() {
+        let evs = dispatch_one(T::GrantPending {
+            tool_use_id: "tu-7".into(),
+            deadline_ms: 30_000,
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::EngineDiagnostic(d) => {
+                assert_eq!(d.kind, "grant.pending");
+                assert_eq!(d.severity, EngineDiagnosticSeverity::Warning);
+                assert!(
+                    d.detail.contains("tu-7") && d.detail.contains("30000"),
+                    "expected tool_use_id and deadline_ms in detail, got: {}",
+                    d.detail
+                );
+            }
+            other => panic!("expected EngineDiagnostic, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn grant_resolved_is_context_notice() {
+        let evs = dispatch_one(T::GrantResolved {
+            tool_use_id: "tu-7".into(),
+            outcome: "granted:simulated".into(),
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::ContextNotice(n) => {
+                assert_eq!(n.kind, "grant.resolved");
+                assert!(
+                    n.message.contains("tu-7") && n.message.contains("granted:simulated"),
+                    "expected tool_use_id and outcome in message, got: {}",
+                    n.message
+                );
+            }
+            other => panic!("expected ContextNotice, got {other:?}"),
         });
     }
 

@@ -116,6 +116,23 @@ pub enum TranslatedThreadEvent {
         tool: String,
         reason: String,
     },
+    /// ST8-PR3B — resume-on-grant pending: a Deny was caught and parked
+    /// awaiting `submit_grant`. UI should surface an inline picker
+    /// (Allow / Deny / countdown). Capability/resource/reason are NOT on
+    /// this event — they were carried by the preceding `ScopeExpansion`
+    /// (and remain available via `SessionSnapshotV1::pending_scope_expansion`
+    /// for late subscribers / replay).
+    GrantPending {
+        tool_use_id: String,
+        deadline_ms: u64,
+    },
+    /// ST8-PR3B — resume-on-grant resolved. `outcome` is the stable
+    /// short string from the orchestrator: `"granted"`, `"granted:simulated"`,
+    /// `"denied"`, `"timeout"`, `"cancelled"`, or `"rejected:<reason>"`.
+    GrantResolved {
+        tool_use_id: String,
+        outcome: String,
+    },
     /// Mode or lens changed mid-session. UI updates mode badge.
     /// H2 — `from_*` preserved so the UI can render transition
     /// animations / diff badges.
@@ -259,6 +276,20 @@ pub fn translate(ev: &AgentEvent) -> TranslatedEvents {
                 reason: "permission resolution — UI already updated on user action",
             }]
         }
+        AgentEvent::GrantPending {
+            tool_use_id,
+            deadline_ms,
+        } => smallvec![T::GrantPending {
+            tool_use_id: tool_use_id.clone(),
+            deadline_ms: *deadline_ms,
+        }],
+        AgentEvent::GrantResolved {
+            tool_use_id,
+            outcome,
+        } => smallvec![T::GrantResolved {
+            tool_use_id: tool_use_id.clone(),
+            outcome: outcome.clone(),
+        }],
         AgentEvent::ScopeExpansionRequested {
             capability,
             resource,
@@ -987,6 +1018,47 @@ mod tests {
                 assert_eq!(tool, "edit_file");
             }
             other => panic!("expected ScopeExpansion, got {other:?}"),
+        }
+    }
+
+    // ── ST8-PR3B — GrantPending / GrantResolved translator arms ─────────
+    #[test]
+    fn grant_pending_translates() {
+        let got = one(&AgentEvent::GrantPending {
+            tool_use_id: "tu-42".into(),
+            deadline_ms: 5_000,
+        });
+        assert_eq!(
+            got,
+            TranslatedThreadEvent::GrantPending {
+                tool_use_id: "tu-42".into(),
+                deadline_ms: 5_000,
+            }
+        );
+    }
+
+    #[test]
+    fn grant_resolved_translates_each_outcome_string() {
+        for outcome in [
+            "granted",
+            "granted:simulated",
+            "denied",
+            "timeout",
+            "cancelled",
+            "rejected:over-grant-no-coverage",
+        ] {
+            let got = one(&AgentEvent::GrantResolved {
+                tool_use_id: "tu-x".into(),
+                outcome: outcome.into(),
+            });
+            assert_eq!(
+                got,
+                TranslatedThreadEvent::GrantResolved {
+                    tool_use_id: "tu-x".into(),
+                    outcome: outcome.into(),
+                },
+                "outcome=\"{outcome}\" must round-trip verbatim"
+            );
         }
     }
 
