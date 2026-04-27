@@ -2486,10 +2486,10 @@ impl Thread {
     fn live_pin_keys(&self) -> HashSet<PinnedMessageKey> {
         self.messages
             .iter()
-            .filter_map(|m| match m {
-                Message::User(u) => Some(PinnedMessageKey::User(u.id.clone())),
-                Message::Resume(rid) => Some(PinnedMessageKey::Resume(*rid)),
-                Message::Agent(a) => Some(PinnedMessageKey::Agent(a.id)),
+            .map(|m| match m {
+                Message::User(u) => PinnedMessageKey::User(u.id.clone()),
+                Message::Resume(rid) => PinnedMessageKey::Resume(*rid),
+                Message::Agent(a) => PinnedMessageKey::Agent(a.id),
             })
             .chain(
                 self.pending_message
