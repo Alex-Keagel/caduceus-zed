@@ -2351,6 +2351,42 @@ impl Thread {
         .detach();
     }
 
+    /// PR-3D: fire-and-forget Allow path for the inline grant picker.
+    /// Calls `AgentHarness::submit_grant_widening`, which internally
+    /// looks up the `(capability, resource)` of the originally-denied
+    /// preflight, widens the harness's active envelope, and dispatches
+    /// `GrantOutcome::Granted { updated }` to the deny-task. The UI
+    /// only needs the `tool_use_id` — no envelope plumbing across the
+    /// wire.
+    ///
+    /// All error variants (`NoSuchPending` / `NoActiveEnvelope` /
+    /// `Proposal` / `ReceiverDropped`) are races between the user's
+    /// click and the orchestrator's grant_timeout / turn teardown —
+    /// they're logged at debug and swallowed. The orchestrator's
+    /// timeout will reap any straggler pending entries.
+    pub fn submit_caduceus_grant_widening_detached(
+        &self,
+        tool_use_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(harness) = self.caduceus.harness.clone() else {
+            log::debug!(
+                "submit_caduceus_grant_widening_detached: harness not provisioned; \
+                 dropping Allow for tool_use_id={tool_use_id}"
+            );
+            return;
+        };
+        cx.background_spawn(async move {
+            if let Err(e) = harness.submit_grant_widening(&tool_use_id).await {
+                log::debug!(
+                    "submit_caduceus_grant_widening_detached: \
+                     tool_use_id={tool_use_id} swallowed: {e:?}"
+                );
+            }
+        })
+        .detach();
+    }
+
     /// Drops the harness, state, cancel token, emitter, and bridge
     /// handle so the next `ensure_caduceus_harness` rebuilds them.
     /// Cheap: dropping an Arc is O(1); the async mutex's inner drop is
@@ -4689,30 +4725,27 @@ impl Thread {
                             // with `Canceled` — we silently skip submission
                             // and let the orchestrator's grant_timeout reap.
                             //
-                            // PR-3C MVP scope: only Deny is wired through
-                            // `submit_caduceus_grant_detached`. Allow requires
-                            // constructing a widened `PermissionEnvelope`
-                            // covering the originally-denied capability/
-                            // resource, which the harness doesn't yet expose
-                            // a helper for. UI surfaces "Deny" as the only
-                            // resolving button; `Allow` is deferred to a
-                            // follow-up that lands the harness-side helper.
-                            // If a future caller resolves with `true`, we
-                            // currently log and skip — orchestrator times out.
-                            let outcome = match rx.await {
+                            // PR-3D: Allow now wires through
+                            // `submit_caduceus_grant_widening_detached`,
+                            // which delegates envelope construction to the
+                            // harness (it owns the active envelope and the
+                            // pending `(capability, resource)`). UI only
+                            // needs the `tool_use_id`.
+                            match rx.await {
                                 Ok(true) => {
-                                    log::warn!(
-                                        "GrantApprovalRequest resolved Allow but \
-                                         envelope construction is not yet wired; \
-                                         skipping submit_caduceus_grant for \
-                                         tool_use_id={id_for_task}"
-                                    );
+                                    let _ = weak_thread.update(cx, |t, cx| {
+                                        t.submit_caduceus_grant_widening_detached(
+                                            id_for_task.clone(),
+                                            cx,
+                                        );
+                                    });
                                     return;
                                 }
-                                Ok(false) => caduceus_permissions::GrantOutcome::Denied {
-                                    reason: "user-denied".into(),
-                                },
+                                Ok(false) => {}
                                 Err(_) => return,
+                            }
+                            let outcome = caduceus_permissions::GrantOutcome::Denied {
+                                reason: "user-denied".into(),
                             };
                             // Race: orchestrator may have already timed out
                             // the original pending entry. submit_caduceus_grant

@@ -3653,6 +3653,20 @@ impl ThreadView {
                 });
             });
 
+        let thread_for_allow = self.thread.clone();
+        let allow_button = Button::new(("grant-allow", 0u32), "Allow")
+            .label_size(LabelSize::Small)
+            .start_icon(
+                Icon::new(IconName::Check)
+                    .size(IconSize::XSmall)
+                    .color(Color::Success),
+            )
+            .on_click(move |_, _window, cx| {
+                thread_for_allow.update(cx, |thread, cx| {
+                    thread.resolve_grant_user_choice(true, cx);
+                });
+            });
+
         let bg_color = cx.theme().status().warning.opacity(0.1);
         let border_color = cx.theme().status().warning.opacity(0.4);
 
@@ -3686,6 +3700,7 @@ impl ThreadView {
                     .color(Color::Warning),
                 )
                 .child(div().flex_1())
+                .child(allow_button)
                 .child(deny_button),
         )
     }
