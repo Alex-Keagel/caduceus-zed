@@ -154,6 +154,19 @@ pub struct PendingScopeExpansionV1 {
     pub resource: String,
     pub reason: String,
     pub tool: String,
+    /// ST8-PR3 — populated when the orchestrator is paused on this
+    /// expansion request (i.e. resume-on-grant is enabled and a
+    /// `GrantPending` event has been observed). When `None`, the UI
+    /// should show the expansion as advisory ("denied — adjust scope
+    /// and retry") rather than as a live grant prompt. Cleared on
+    /// `GrantResolved`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    /// ST8-PR3 — Unix-epoch millisecond deadline for the pending grant.
+    /// Drives the inline picker's countdown UI. `None` when no grant
+    /// is in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -306,7 +319,54 @@ impl SessionStateReducer {
                     resource: resource.clone(),
                     reason: reason.clone(),
                     tool: tool.clone(),
+                    tool_use_id: None,
+                    deadline_ms: None,
                 });
+            }
+
+            AgentEvent::GrantPending {
+                tool_use_id,
+                deadline_ms,
+            } => {
+                // ST8-PR3 — enrich the pending request with the
+                // orchestrator's grant-channel handle and countdown
+                // deadline. Producer always emits
+                // `ScopeExpansionRequested` immediately before
+                // `GrantPending`, so under normal flow the slot is
+                // already populated. If we get a `GrantPending`
+                // without a preceding request (replay / event drop),
+                // synthesize a placeholder so the UI still has
+                // enough to surface a picker.
+                if let Some(p) = self.pending_scope_expansion.as_mut() {
+                    p.tool_use_id = Some(tool_use_id.clone());
+                    p.deadline_ms = Some(*deadline_ms);
+                } else {
+                    self.pending_scope_expansion = Some(PendingScopeExpansionV1 {
+                        capability: String::new(),
+                        resource: String::new(),
+                        reason: String::new(),
+                        tool: String::new(),
+                        tool_use_id: Some(tool_use_id.clone()),
+                        deadline_ms: Some(*deadline_ms),
+                    });
+                }
+            }
+
+            AgentEvent::GrantResolved { tool_use_id, .. } => {
+                // ST8-PR3 — clear the pending slot only if the
+                // resolution corresponds to the same `tool_use_id` we
+                // were tracking. This protects against a stale
+                // `GrantResolved` (e.g. from a reaped sibling tool
+                // call) prematurely clearing a still-live request.
+                let matches_pending = self
+                    .pending_scope_expansion
+                    .as_ref()
+                    .and_then(|p| p.tool_use_id.as_deref())
+                    .map(|id| id == tool_use_id.as_str())
+                    .unwrap_or(false);
+                if matches_pending {
+                    self.pending_scope_expansion = None;
+                }
             }
 
             AgentEvent::Introspection(ev) => self.ingest_introspection(ev),
@@ -882,6 +942,109 @@ mod tests {
         let p = s.pending_scope_expansion.unwrap();
         assert_eq!(p.capability, "write");
         assert_eq!(p.resource, "/etc/passwd");
+        assert!(p.tool_use_id.is_none());
+        assert!(p.deadline_ms.is_none());
+    }
+
+    // ── ST8-PR3: GrantPending / GrantResolved reducer arms ────────────
+
+    #[test]
+    fn st8_pr3_grant_pending_enriches_existing_request() {
+        let mut r = SessionStateReducer::new();
+        r.ingest(&AgentEvent::ScopeExpansionRequested {
+            capability: "write".into(),
+            resource: "/tmp/foo".into(),
+            reason: "OutsideRoot".into(),
+            tool: "edit_file".into(),
+        });
+        r.ingest(&AgentEvent::GrantPending {
+            tool_use_id: "tu-42".into(),
+            deadline_ms: 1_700_000_000_000,
+        });
+        let p = r
+            .active_session_snapshot(true)
+            .pending_scope_expansion
+            .unwrap();
+        assert_eq!(p.capability, "write");
+        assert_eq!(p.tool_use_id.as_deref(), Some("tu-42"));
+        assert_eq!(p.deadline_ms, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn st8_pr3_grant_pending_without_request_synthesizes_placeholder() {
+        let mut r = SessionStateReducer::new();
+        r.ingest(&AgentEvent::GrantPending {
+            tool_use_id: "tu-orphan".into(),
+            deadline_ms: 99,
+        });
+        let p = r
+            .active_session_snapshot(true)
+            .pending_scope_expansion
+            .unwrap();
+        assert_eq!(p.tool_use_id.as_deref(), Some("tu-orphan"));
+        assert_eq!(p.deadline_ms, Some(99));
+        assert!(p.capability.is_empty());
+    }
+
+    #[test]
+    fn st8_pr3_grant_resolved_clears_matching_pending() {
+        let mut r = SessionStateReducer::new();
+        r.ingest(&AgentEvent::ScopeExpansionRequested {
+            capability: "exec".into(),
+            resource: "rm".into(),
+            reason: "NotAllowed".into(),
+            tool: "bash".into(),
+        });
+        r.ingest(&AgentEvent::GrantPending {
+            tool_use_id: "tu-1".into(),
+            deadline_ms: 1,
+        });
+        r.ingest(&AgentEvent::GrantResolved {
+            tool_use_id: "tu-1".into(),
+            outcome: "granted".into(),
+        });
+        assert!(
+            r.active_session_snapshot(true)
+                .pending_scope_expansion
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn st8_pr3_grant_resolved_ignores_mismatched_tool_use_id() {
+        let mut r = SessionStateReducer::new();
+        r.ingest(&AgentEvent::ScopeExpansionRequested {
+            capability: "write".into(),
+            resource: "/tmp/x".into(),
+            reason: "Denied".into(),
+            tool: "edit_file".into(),
+        });
+        r.ingest(&AgentEvent::GrantPending {
+            tool_use_id: "tu-live".into(),
+            deadline_ms: 0,
+        });
+        r.ingest(&AgentEvent::GrantResolved {
+            tool_use_id: "tu-stale".into(),
+            outcome: "timeout".into(),
+        });
+        let p = r.active_session_snapshot(true).pending_scope_expansion;
+        assert!(p.is_some(), "stale resolution must not clear live pending");
+        assert_eq!(p.unwrap().tool_use_id.as_deref(), Some("tu-live"));
+    }
+
+    #[test]
+    fn st8_pr3_grant_resolved_without_pending_is_noop() {
+        let mut r = SessionStateReducer::new();
+        // No prior request. Should not panic, should not synthesize.
+        r.ingest(&AgentEvent::GrantResolved {
+            tool_use_id: "tu-ghost".into(),
+            outcome: "denied".into(),
+        });
+        assert!(
+            r.active_session_snapshot(true)
+                .pending_scope_expansion
+                .is_none()
+        );
     }
 
     #[test]
