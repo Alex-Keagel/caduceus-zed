@@ -2192,6 +2192,12 @@ impl NativeAgentConnection {
                                     .update(cx, |thread, cx| {
                                         if kind == "grant.resolved" {
                                             thread.clear_pending_grant(cx);
+                                        } else if kind == "profile_switch.resolved" {
+                                            // ST8 PR-B3: late-resolve path —
+                                            // engine timeout / cancellation
+                                            // closes the picker even if the
+                                            // user never clicked.
+                                            thread.clear_pending_profile_switch(cx);
                                         }
                                         thread.push_notice(
                                             kind,
@@ -2215,6 +2221,12 @@ impl NativeAgentConnection {
                                 );
                                 if diag.kind == "grant.pending" {
                                     // Picker is the surface; skip the warning text.
+                                    continue;
+                                }
+                                if diag.kind == "profile_switch.pending" {
+                                    // ST8 PR-B3: same logic — interactive picker
+                                    // (ProfileSwitchRequest typed arm) is the
+                                    // surface, suppress the duplicate text.
                                     continue;
                                 }
                                 let severity = match diag.severity {
@@ -2262,6 +2274,53 @@ impl NativeAgentConnection {
                                                 // AcpThread dropped or grant cleared
                                                 // without resolution — drop response,
                                                 // consumer task observes Canceled.
+                                            }
+                                        }
+                                    })
+                                    .detach();
+                                }
+                            }
+                            // ST8 PR-B3: typed profile_switch.pending picker.
+                            // Mirrors the GrantApprovalRequest arm exactly:
+                            // forward the user choice (Switch=true /
+                            // StayAndDeny=false) back to the dispatcher's
+                            // sub-task which calls
+                            // `submit_caduceus_profile_switch_detached`.
+                            ThreadEvent::ProfileSwitchRequest {
+                                tool_use_id,
+                                target_mode,
+                                capability,
+                                resource,
+                                deadline_ms,
+                                response,
+                            } => {
+                                let outcome_rx = acp_thread
+                                    .update(cx, |thread, cx| {
+                                        thread.request_profile_switch(
+                                            tool_use_id,
+                                            target_mode,
+                                            capability,
+                                            resource,
+                                            Some(deadline_ms),
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                                if let Some(outcome_rx) = outcome_rx {
+                                    cx.background_spawn(async move {
+                                        match outcome_rx.await {
+                                            Ok(choice) => {
+                                                let allow = matches!(
+                                                    choice,
+                                                    acp_thread::SwitchUserChoice::Switch
+                                                );
+                                                let _ = response.send(allow);
+                                            }
+                                            Err(_) => {
+                                                // AcpThread dropped or pending
+                                                // cleared without resolution —
+                                                // dispatcher's spawn observes
+                                                // Canceled and skips submit.
                                             }
                                         }
                                     })

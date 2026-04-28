@@ -140,6 +140,39 @@ impl From<caduceus_orchestrator::SubmitGrantError> for CaduceusGrantError {
     }
 }
 
+/// ST8 PR-B3 — error type for [`Thread::submit_caduceus_profile_switch`].
+/// Mirrors [`CaduceusGrantError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaduceusProfileSwitchError {
+    HarnessNotProvisioned,
+    NoSuchPending,
+    ReceiverDropped,
+}
+
+impl std::fmt::Display for CaduceusProfileSwitchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HarnessNotProvisioned => write!(f, "no live harness on this thread"),
+            Self::NoSuchPending => write!(f, "no pending profile-switch for this tool_use_id"),
+            Self::ReceiverDropped => {
+                write!(f, "switch choice arrived after the deny was committed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CaduceusProfileSwitchError {}
+
+impl From<caduceus_orchestrator::SubmitSwitchError> for CaduceusProfileSwitchError {
+    fn from(e: caduceus_orchestrator::SubmitSwitchError) -> Self {
+        use caduceus_orchestrator::SubmitSwitchError as S;
+        match e {
+            S::NoSuchPending => Self::NoSuchPending,
+            S::ReceiverDropped => Self::ReceiverDropped,
+        }
+    }
+}
+
 /// Context passed to a subagent thread for lifecycle management
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubagentContext {
@@ -998,6 +1031,23 @@ pub enum ThreadEvent {
     GrantApprovalRequest {
         tool_use_id: String,
         deadline_ms: Option<u64>,
+        response: futures::channel::oneshot::Sender<bool>,
+    },
+    /// ST8 PR-B3 — typed surface for `T::ProfileSwitchPending`. Mirrors
+    /// `GrantApprovalRequest` but carries the target mode + capability
+    /// + resource so the picker can render copy like
+    /// "Switch to Act for `bash echo`?". The bridge in agent.rs spawns
+    /// a sub-task that awaits `response`; on Switch we call
+    /// `Thread::submit_caduceus_profile_switch_detached` with
+    /// `SwitchOutcome::Switched`, on StayAndDeny we submit `Denied`.
+    /// Receiver-drop semantics mirror grant: silent skip,
+    /// orchestrator's grant_timeout reaps.
+    ProfileSwitchRequest {
+        tool_use_id: String,
+        target_mode: String,
+        capability: String,
+        resource: String,
+        deadline_ms: u64,
         response: futures::channel::oneshot::Sender<bool>,
     },
 }
@@ -2380,6 +2430,51 @@ impl Thread {
             if let Err(e) = harness.submit_grant_widening(&tool_use_id).await {
                 log::debug!(
                     "submit_caduceus_grant_widening_detached: \
+                     tool_use_id={tool_use_id} swallowed: {e:?}"
+                );
+            }
+        })
+        .detach();
+    }
+
+    /// ST8 PR-B3: submit a profile-switch outcome to the harness.
+    /// Mirrors [`Thread::submit_caduceus_grant`].
+    pub async fn submit_caduceus_profile_switch(
+        &self,
+        tool_use_id: &str,
+        outcome: caduceus_orchestrator::SwitchOutcome,
+    ) -> std::result::Result<(), CaduceusProfileSwitchError> {
+        let harness = self
+            .caduceus
+            .harness
+            .clone()
+            .ok_or(CaduceusProfileSwitchError::HarnessNotProvisioned)?;
+        harness
+            .submit_profile_switch(tool_use_id, outcome)
+            .await
+            .map_err(CaduceusProfileSwitchError::from)
+    }
+
+    /// ST8 PR-B3: fire-and-forget variant for the inline picker bridge.
+    /// Mirrors [`Thread::submit_caduceus_grant_detached`] — silently
+    /// drops `NoSuchPending` (race with engine timeout / cancellation).
+    pub fn submit_caduceus_profile_switch_detached(
+        &self,
+        tool_use_id: String,
+        outcome: caduceus_orchestrator::SwitchOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(harness) = self.caduceus.harness.clone() else {
+            log::debug!(
+                "submit_caduceus_profile_switch_detached: harness not provisioned; \
+                 dropping outcome for tool_use_id={tool_use_id}"
+            );
+            return;
+        };
+        cx.background_spawn(async move {
+            if let Err(e) = harness.submit_profile_switch(&tool_use_id, outcome).await {
+                log::debug!(
+                    "submit_caduceus_profile_switch_detached: \
                      tool_use_id={tool_use_id} swallowed: {e:?}"
                 );
             }
@@ -4548,7 +4643,16 @@ impl Thread {
                     .as_deref()
                     .and_then(ActLens::from_str_loose)
                     .unwrap_or(ActLens::Normal);
-                built.harness.with_mode(mode).with_mode_lens(lens)
+                // ST8 PR-B3 — plumb permission_mode into the engine so the
+                // PR-B2 denial classifier can route to ProfileSwitchPending
+                // when the active mode has a classical_fit row. Without
+                // this, the entire profile-switch picker surface is dead
+                // code: every denial routes through GrantPending instead.
+                built
+                    .harness
+                    .with_mode(mode)
+                    .with_mode_lens(lens)
+                    .with_permission_mode(&setup.caduceus_mode)
             };
             let harness_arc = std::sync::Arc::new(harness_with_mode);
             let emitter = built
@@ -4752,6 +4856,50 @@ impl Thread {
                             // returns `NoSuchPending` in that case — swallow.
                             let _ = weak_thread.update(cx, |t, cx| {
                                 t.submit_caduceus_grant_detached(id_for_task.clone(), outcome, cx);
+                            });
+                        })
+                        .detach();
+                }
+                // ST8 PR-B3 — surface profile-switch picker the same way.
+                // Routes user's Switch (true) / Stay-and-Deny (false)
+                // back to the consumer task which calls the typed
+                // `submit_caduceus_profile_switch_detached`.
+                if let T::ProfileSwitchPending {
+                    tool_use_id,
+                    target_mode,
+                    capability,
+                    resource,
+                    deadline_ms,
+                } = &ev
+                {
+                    let (tx, rx) = futures::channel::oneshot::channel::<bool>();
+                    let _ = stream_for_consumer.0.unbounded_send(Ok(
+                        ThreadEvent::ProfileSwitchRequest {
+                            tool_use_id: tool_use_id.clone(),
+                            target_mode: target_mode.clone(),
+                            capability: capability.clone(),
+                            resource: resource.clone(),
+                            deadline_ms: *deadline_ms,
+                            response: tx,
+                        },
+                    ));
+                    let id_for_task = tool_use_id.clone();
+                    let weak_thread = thread_for_pins.clone();
+                    cx_cons
+                        .spawn(async move |cx| {
+                            let outcome = match rx.await {
+                                Ok(true) => caduceus_orchestrator::SwitchOutcome::Switched,
+                                Ok(false) => caduceus_orchestrator::SwitchOutcome::Denied,
+                                // Receiver dropped (thread torn down) →
+                                // skip submit; orchestrator times out.
+                                Err(_) => return,
+                            };
+                            let _ = weak_thread.update(cx, |t, cx| {
+                                t.submit_caduceus_profile_switch_detached(
+                                    id_for_task.clone(),
+                                    outcome,
+                                    cx,
+                                );
                             });
                         })
                         .detach();
@@ -7436,6 +7584,37 @@ fn dispatch_translated_event(
             );
         }
 
+        // ── ST8 PR-B3 — profile-switch lifecycle (text-stream surface) ──
+        // The typed `ThreadEvent::ProfileSwitchRequest` arm above carries
+        // the interactive picker; this mirror keeps the legacy text-stream
+        // consumer informed (notices feed agent.rs's clear-pending logic).
+        T::ProfileSwitchPending {
+            tool_use_id,
+            target_mode,
+            capability,
+            resource,
+            deadline_ms,
+        } => {
+            stream.send_engine_diagnostic(
+                "profile_switch.pending",
+                format!(
+                    "profile-switch pending: tool_use_id={tool_use_id} \
+                     target={target_mode} cap={capability} resource={resource} \
+                     deadline={deadline_ms}ms"
+                ),
+                EngineDiagnosticSeverity::Warning,
+            );
+        }
+        T::ProfileSwitchResolved {
+            tool_use_id,
+            outcome,
+        } => {
+            stream.send_context_notice(
+                "profile_switch.resolved",
+                format!("tool_use_id={tool_use_id} outcome={outcome}"),
+            );
+        }
+
         // Retry — map to the existing acp_thread::RetryStatus shape
         // with best-effort fields. The legacy path carries more
         // detail (attempt counts, backoff), which the provider
@@ -8980,6 +9159,57 @@ mod native_dispatch_tests {
                 assert_eq!(n.kind, "grant.resolved");
                 assert!(
                     n.message.contains("tu-7") && n.message.contains("granted:simulated"),
+                    "expected tool_use_id and outcome in message, got: {}",
+                    n.message
+                );
+            }
+            other => panic!("expected ContextNotice, got {other:?}"),
+        });
+    }
+
+    // ── ST8 PR-B3: profile-switch dispatcher arms ───────────────────────
+    //
+    // The typed `ThreadEvent::ProfileSwitchRequest` arm above carries the
+    // interactive picker. These tests verify the legacy text-stream
+    // mirror (mirroring the grant-side tests above) — `EngineDiagnostic`
+    // for pending, `ContextNotice` for resolved. The notice emission is
+    // load-bearing: agent.rs's ContextNotice consumer arm watches for
+    // `profile_switch.resolved` to clear the pending picker.
+
+    #[test]
+    fn profile_switch_pending_is_warning_diagnostic() {
+        let evs = dispatch_one(T::ProfileSwitchPending {
+            tool_use_id: "tu-ps-9".into(),
+            target_mode: "developer".into(),
+            capability: "fs.write".into(),
+            resource: "/repo".into(),
+            deadline_ms: 4_000,
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::EngineDiagnostic(d) => {
+                assert_eq!(d.kind, "profile_switch.pending");
+                assert_eq!(d.severity, EngineDiagnosticSeverity::Warning);
+                let msg = &d.detail;
+                assert!(msg.contains("tu-ps-9"), "msg: {msg}");
+                assert!(msg.contains("developer"), "msg: {msg}");
+                assert!(msg.contains("fs.write"), "msg: {msg}");
+                assert!(msg.contains("/repo"), "msg: {msg}");
+            }
+            other => panic!("expected EngineDiagnostic, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn profile_switch_resolved_is_context_notice() {
+        let evs = dispatch_one(T::ProfileSwitchResolved {
+            tool_use_id: "tu-ps-12".into(),
+            outcome: "switched".into(),
+        });
+        assert_one(&evs, |e| match e {
+            ThreadEvent::ContextNotice(n) => {
+                assert_eq!(n.kind, "profile_switch.resolved");
+                assert!(
+                    n.message.contains("tu-ps-12") && n.message.contains("switched"),
                     "expected tool_use_id and outcome in message, got: {}",
                     n.message
                 );

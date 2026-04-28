@@ -1079,6 +1079,11 @@ pub struct AcpThread {
     /// banner with Allow/Deny buttons. At most one pending grant per thread —
     /// the orchestrator's `pending_scope_expansion` is single-slotted.
     pending_grant: Option<PendingGrant>,
+    /// ST8 PR-B3: in-flight profile-switch request, surfaced as a header
+    /// banner with Switch/Stay buttons. Distinct slot from `pending_grant`:
+    /// the engine routes a denial to one or the other classifier branch
+    /// (mode has classical_fit → switch picker; otherwise grant picker).
+    pending_profile_switch: Option<PendingProfileSwitch>,
     /// Caduceus ST8 (Layer 1): transient header notices surfaced from
     /// `ContextNotice` / `EngineDiagnostic` ThreadEvents. Header banners,
     /// not in-list rows — explicit-dismiss only (no auto-expire).
@@ -1103,6 +1108,43 @@ impl std::fmt::Debug for PendingGrant {
             .field("created_at", &self.created_at)
             .finish_non_exhaustive()
     }
+}
+
+/// ST8 PR-B3: a pending profile-switch request. Carries the oneshot
+/// sender used to deliver the user's Switch/StayAndDeny choice back to
+/// the bridge task. Independent of [`PendingGrant`] because the routing
+/// classifier produces one or the other but not both per denial, and
+/// the UI surface differs (mode-switch picker vs scope-expansion picker).
+pub struct PendingProfileSwitch {
+    pub tool_use_id: String,
+    pub target_mode: String,
+    pub capability: String,
+    pub resource: String,
+    pub deadline_ms: Option<u64>,
+    pub created_at: Instant,
+    pub respond_tx: oneshot::Sender<SwitchUserChoice>,
+}
+
+impl std::fmt::Debug for PendingProfileSwitch {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingProfileSwitch")
+            .field("tool_use_id", &self.tool_use_id)
+            .field("target_mode", &self.target_mode)
+            .field("capability", &self.capability)
+            .field("resource", &self.resource)
+            .field("deadline_ms", &self.deadline_ms)
+            .field("created_at", &self.created_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// ST8 PR-B3 — UI-intent type carried back from the picker. Mapped to
+/// `caduceus_orchestrator::SwitchOutcome` at the agent.rs boundary
+/// (`acp_thread` does NOT depend on the engine crate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchUserChoice {
+    Switch,
+    StayAndDeny,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1164,6 +1206,12 @@ pub enum AcpThreadEvent {
     /// Caduceus ST8: pending grant cleared (resolved by user click, by
     /// `clear_pending_grant`, or by drop).
     GrantApprovalResolved,
+    /// ST8 PR-B3: a `profile_switch.pending` event arrived; UI should
+    /// render the mode-switch picker reading `pending_profile_switch()`.
+    ProfileSwitchRequested,
+    /// ST8 PR-B3: pending profile-switch cleared (resolved by user
+    /// click, by `clear_pending_profile_switch`, or by drop).
+    ProfileSwitchResolved,
     /// Caduceus ST8 (Layer 1): a notice banner was added; rerender header.
     NoticeAdded(u64),
     /// Caduceus ST8 (Layer 1): a notice banner was dismissed.
@@ -1314,6 +1362,7 @@ impl AcpThread {
             ui_scroll_position: None,
             streaming_text_buffer: None,
             pending_grant: None,
+            pending_profile_switch: None,
             notices: Vec::new(),
         }
     }
@@ -2237,6 +2286,67 @@ impl AcpThread {
     pub fn clear_pending_grant(&mut self, cx: &mut Context<Self>) {
         if self.pending_grant.take().is_some() {
             cx.emit(AcpThreadEvent::GrantApprovalResolved);
+        }
+    }
+
+    // ── ST8 PR-B3 — profile-switch picker surface ────────────────────────
+
+    /// Returns the current pending profile-switch, if any.
+    pub fn pending_profile_switch(&self) -> Option<&PendingProfileSwitch> {
+        self.pending_profile_switch.as_ref()
+    }
+
+    /// Records a new profile-switch request. Returns the rx-side of the
+    /// user-choice channel; the agent.rs bridge awaits this to forward
+    /// the user's Switch / StayAndDeny back to the orchestrator.
+    ///
+    /// If a switch is already pending (single-slot invariant violated by
+    /// a stale duplicate), the prior request is silently dropped — its
+    /// receiver-side observes `Canceled` and the orchestrator's
+    /// grant_timeout reaps the original.
+    pub fn request_profile_switch(
+        &mut self,
+        tool_use_id: String,
+        target_mode: String,
+        capability: String,
+        resource: String,
+        deadline_ms: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<SwitchUserChoice> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_profile_switch = Some(PendingProfileSwitch {
+            tool_use_id,
+            target_mode,
+            capability,
+            resource,
+            deadline_ms,
+            created_at: Instant::now(),
+            respond_tx: tx,
+        });
+        cx.emit(AcpThreadEvent::ProfileSwitchRequested);
+        rx
+    }
+
+    /// Resolves the pending switch with the user's choice. Idempotent:
+    /// returns silently if no switch is pending (e.g. a late button click
+    /// after the orchestrator already timed out).
+    pub fn resolve_profile_switch_choice(
+        &mut self,
+        choice: SwitchUserChoice,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(p) = self.pending_profile_switch.take() {
+            let _ = p.respond_tx.send(choice);
+            cx.emit(AcpThreadEvent::ProfileSwitchResolved);
+        }
+    }
+
+    /// Clears the pending switch without resolving it (engine timed out
+    /// or thread is being torn down). Drops the respond_tx so the bridge
+    /// task observes `Canceled` and skips submit.
+    pub fn clear_pending_profile_switch(&mut self, cx: &mut Context<Self>) {
+        if self.pending_profile_switch.take().is_some() {
+            cx.emit(AcpThreadEvent::ProfileSwitchResolved);
         }
     }
 
@@ -5856,5 +5966,209 @@ mod tests {
             assert_eq!(thread.notices()[0].kind.as_ref(), "kind.2");
             assert_eq!(thread.notices()[4].kind.as_ref(), "kind.6");
         });
+    }
+
+    // ── ST8 PR-B3: profile-switch picker surface tests ──────────────────
+    //
+    // Mirrors the grant-picker tests above. Asserts the 2-action
+    // asymmetric vocabulary of `SwitchUserChoice` (per
+    // zed/docs/specs/spec-m-ui-approval-card.md §6.2) and the same
+    // single-slot / clear-drops-tx / late-click-idempotent invariants
+    // documented for `pending_grant`.
+
+    #[gpui::test]
+    async fn test_profile_switch_request_resolve_switch(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let rx = thread.update(cx, |thread, cx| {
+            thread.request_profile_switch(
+                "toolcall-ps-1".into(),
+                "developer".into(),
+                "fs.write".into(),
+                "/repo".into(),
+                Some(5_000),
+                cx,
+            )
+        });
+
+        thread.update(cx, |thread, _cx| {
+            let pending = thread
+                .pending_profile_switch()
+                .expect("should have pending profile-switch");
+            assert_eq!(pending.tool_use_id, "toolcall-ps-1");
+            assert_eq!(pending.target_mode, "developer");
+            assert_eq!(pending.capability, "fs.write");
+            assert_eq!(pending.resource, "/repo");
+            assert_eq!(pending.deadline_ms, Some(5_000));
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.resolve_profile_switch_choice(SwitchUserChoice::Switch, cx);
+        });
+
+        let choice = rx.await.expect("rx should resolve");
+        assert_eq!(choice, SwitchUserChoice::Switch);
+
+        thread.update(cx, |thread, _cx| {
+            assert!(
+                thread.pending_profile_switch().is_none(),
+                "pending_profile_switch cleared after resolve"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_profile_switch_request_resolve_stay(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let rx = thread.update(cx, |thread, cx| {
+            thread.request_profile_switch(
+                "toolcall-ps-2".into(),
+                "developer".into(),
+                "shell.exec".into(),
+                "*".into(),
+                None,
+                cx,
+            )
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.resolve_profile_switch_choice(SwitchUserChoice::StayAndDeny, cx);
+        });
+
+        let choice = rx.await.expect("rx should resolve");
+        assert_eq!(choice, SwitchUserChoice::StayAndDeny);
+
+        thread.update(cx, |thread, _cx| {
+            assert!(thread.pending_profile_switch().is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_profile_switch_clear_drops_response(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let rx = thread.update(cx, |thread, cx| {
+            thread.request_profile_switch(
+                "toolcall-ps-3".into(),
+                "developer".into(),
+                "fs.write".into(),
+                "/repo".into(),
+                None,
+                cx,
+            )
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.clear_pending_profile_switch(cx);
+        });
+
+        let res = rx.await;
+        assert!(
+            res.is_err(),
+            "clear_pending_profile_switch must drop tx so rx errors with Canceled"
+        );
+
+        thread.update(cx, |thread, _cx| {
+            assert!(thread.pending_profile_switch().is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_profile_switch_resolve_idempotent_when_no_pending(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        // Late click after orchestrator timed out — must not panic.
+        thread.update(cx, |thread, cx| {
+            thread.resolve_profile_switch_choice(SwitchUserChoice::Switch, cx);
+            thread.clear_pending_profile_switch(cx);
+            assert!(thread.pending_profile_switch().is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_profile_switch_request_replaces_prior(cx: &mut gpui::TestAppContext) {
+        // Single in-flight invariant per `request_profile_switch` doc: a
+        // second request supersedes the first; the prior rx observes Canceled.
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let rx1 = thread.update(cx, |thread, cx| {
+            thread.request_profile_switch(
+                "first".into(),
+                "developer".into(),
+                "fs.write".into(),
+                "/repo".into(),
+                Some(1_000),
+                cx,
+            )
+        });
+        let rx2 = thread.update(cx, |thread, cx| {
+            thread.request_profile_switch(
+                "second".into(),
+                "developer".into(),
+                "shell.exec".into(),
+                "*".into(),
+                Some(2_000),
+                cx,
+            )
+        });
+
+        assert!(rx1.await.is_err(), "first request superseded");
+
+        thread.update(cx, |thread, cx| {
+            assert_eq!(
+                thread.pending_profile_switch().unwrap().tool_use_id,
+                "second"
+            );
+            thread.resolve_profile_switch_choice(SwitchUserChoice::StayAndDeny, cx);
+        });
+
+        let choice2 = rx2.await.expect("second rx resolves");
+        assert_eq!(choice2, SwitchUserChoice::StayAndDeny);
     }
 }
