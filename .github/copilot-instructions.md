@@ -56,6 +56,21 @@ When adding a new AgentTool:
 - Checkpoints MUST be created before destructive operations
 - Auto-compact MUST trigger before context explosion (threshold: 40 messages)
 
+## Project-local `private/` files — read open, write requires grant + path
+
+The repo's top-level `private/` directory holds audits, reviews, scratch notes, and reviewer/critique artifacts. The convention is **profile-agnostic** (plan, research, act, autopilot, custom modes alike) and is enforced engine-side as an envelope invariant — every preset in `caduceus-permissions` allows reading `private/**`.
+
+**Read access — always permitted.** Any agent may read freely from `private/**`. No prompt, no grant flow.
+
+**Write access — never silent.** Before writing, creating, or modifying any file under `private/`, the agent MUST do BOTH in a single `ask_user`:
+
+1. **Ask permission to write** — state intent (artifact kind, producing workflow, why `private/` vs. session workspace).
+2. **Ask where to write** — propose a target subpath (e.g. `private/audits/<slug>-<date>.md`) AND let the user override slug, subdirectory, or filename.
+
+Applies to every write path — `create`, `edit`, `bash` redirects, `git add` of newly authored `private/**` files. **Exception:** when the user explicitly hands the agent a specific `private/` file to edit, no re-prompt for that file in that turn.
+
+See `~/Dev/.github/copilot-instructions.md` for the cross-repo source of truth.
+
 ## Architecture
 
 - **Engine**: `~/Dev/caduceus` — 14 Rust crates, source of truth for capabilities
