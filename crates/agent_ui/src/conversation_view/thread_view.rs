@@ -3634,11 +3634,11 @@ impl ThreadView {
             tool_use_id.hash(&mut hasher);
             hasher.finish()
         };
-        let countdown_label = deadline_ms.map(|ms| {
-            let total = std::time::Duration::from_millis(ms);
+        let countdown_label = {
+            let total = std::time::Duration::from_millis(deadline_ms);
             let remaining = total.saturating_sub(elapsed);
             format!("{}s", remaining.as_secs())
-        });
+        };
 
         let thread_for_deny = self.thread.clone();
         let deny_button = Button::new(("grant-deny", 0u32), "Deny")
@@ -3690,12 +3690,8 @@ impl ThreadView {
                 )
                 .child(
                     Label::new(format!(
-                        "Grant required: tool_use_id={}{}",
-                        &tool_use_id,
-                        countdown_label
-                            .as_ref()
-                            .map(|s| format!(" (timeout in {s})"))
-                            .unwrap_or_default(),
+                        "Grant required: tool_use_id={} (timeout in {})",
+                        &tool_use_id, countdown_label,
                     ))
                     .size(LabelSize::Small)
                     .color(Color::Warning),
