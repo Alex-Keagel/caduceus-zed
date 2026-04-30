@@ -23,6 +23,7 @@ mod mode_selector;
 mod model_selector;
 mod model_selector_popover;
 mod profile_selector;
+mod runs_panel;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 #[cfg(any(test, feature = "test-support"))]
@@ -203,6 +204,8 @@ actions!(
         CaduceusCheckpoint,
         /// Caduceus: Emergency stop all agents.
         CaduceusKillSwitch,
+        /// Caduceus: Open the runs panel.
+        CaduceusOpenRunsPanel,
     ]
 );
 
@@ -502,6 +505,27 @@ pub fn init(
                         window,
                         cx,
                     );
+                }
+            },
+        );
+    })
+    .detach();
+    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+        workspace.register_action(
+            move |workspace: &mut Workspace,
+                  _: &CaduceusOpenRunsPanel,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let existing = workspace
+                    .active_pane()
+                    .read(cx)
+                    .items()
+                    .find_map(|item| item.downcast::<runs_panel::RunsPanel>());
+                if let Some(existing) = existing {
+                    workspace.activate_item(&existing, true, true, window, cx);
+                } else {
+                    let panel = runs_panel::RunsPanel::new(workspace, window, cx);
+                    workspace.add_item_to_active_pane(Box::new(panel), None, true, window, cx);
                 }
             },
         );
