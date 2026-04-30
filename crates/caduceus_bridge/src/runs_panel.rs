@@ -136,12 +136,16 @@ impl PanelStatus {
 }
 
 /// Sort rows within a bucket: newest attempts first, then by run_id
-/// (lexicographic) for stability.
+/// (lexicographic), then by repo slug — fully deterministic order even
+/// when two rows share the same `(attempt, run_id)` across distinct
+/// repos.  Without the slug tiebreaker, refresh re-renders could shuffle
+/// tied rows depending on snapshot input order.
 pub fn sort_rows_by_recency(rows: &mut [RunsPanelRow]) {
     rows.sort_by(|a, b| {
         b.attempt
             .cmp(&a.attempt)
             .then_with(|| a.run_ref.0.run_id.cmp(&b.run_ref.0.run_id))
+            .then_with(|| a.run_ref.0.slug.cmp(&b.run_ref.0.slug))
     });
 }
 
@@ -217,6 +221,36 @@ mod tests {
         // Attempt 3 (run_id "02" < "04") -> 3/04 -> 2 -> 1.
         let order: Vec<&str> = rows.iter().map(|r| r.run_ref.0.run_id.as_str()).collect();
         assert_eq!(order, ["02", "04", "03", "01"]);
+    }
+
+    #[test]
+    fn sort_rows_breaks_ties_on_repo_slug() {
+        // Two rows with identical (attempt, run_id) across different
+        // repos must sort deterministically by slug — input order MUST
+        // NOT influence the result.
+        let mut a = vec![
+            row("g_a", "01", PanelStatus::Running, 1),
+            row("g_b", "01", PanelStatus::Running, 1),
+        ];
+        let mut b = vec![
+            row("g_b", "01", PanelStatus::Running, 1),
+            row("g_a", "01", PanelStatus::Running, 1),
+        ];
+        sort_rows_by_recency(&mut a);
+        sort_rows_by_recency(&mut b);
+        let order_a: Vec<&str> = a.iter().map(|r| r.run_ref.0.slug.as_str()).collect();
+        let order_b: Vec<&str> = b.iter().map(|r| r.run_ref.0.slug.as_str()).collect();
+        assert_eq!(order_a, order_b);
+        assert_eq!(order_a, ["g_a", "g_b"]);
+    }
+
+    #[test]
+    fn finished_only_view_is_not_active() {
+        // `has_active` MUST require at least one row in
+        // running/retrying/disconnected; a recent-only view is inert.
+        let v = group_by_status(vec![row("g_x", "01", PanelStatus::Finished, 1)]);
+        assert_eq!(v.total(), 1);
+        assert!(!v.has_active());
     }
 
     #[test]

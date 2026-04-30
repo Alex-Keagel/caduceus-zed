@@ -114,7 +114,10 @@ fn unauth_rows(cx: &App) -> Vec<UnauthRow> {
 fn partition_providers(cx: &App) -> (Vec<LanguageModelProviderId>, Vec<UnauthRow>) {
     let mut configured = Vec::new();
     let mut unauth = Vec::new();
-    for provider in LanguageModelRegistry::global(cx).read(cx).visible_providers() {
+    for provider in LanguageModelRegistry::global(cx)
+        .read(cx)
+        .visible_providers()
+    {
         let auth_state = provider.auth_state(cx);
         if auth_state.can_provide_models() {
             configured.push(provider.id());
@@ -395,9 +398,7 @@ impl GroupedModels {
         // ST1b: unauthenticated / rate-limited / policy-disabled providers
         // always appear at the bottom so configured stuff comes first.
         if !self.unauth.is_empty() {
-            entries.push(LanguageModelPickerEntry::Separator(
-                "More providers".into(),
-            ));
+            entries.push(LanguageModelPickerEntry::Separator("More providers".into()));
             for row in &self.unauth {
                 entries.push(LanguageModelPickerEntry::UnauthProvider(row.clone()));
             }
@@ -543,13 +544,7 @@ impl PickerDelegate for LanguageModelPickerDelegate {
         // surfaces the unauth row.
         if !query.is_empty() {
             let q = query.to_lowercase();
-            unauth_rows.retain(|row| {
-                row.provider
-                    .name()
-                    .0
-                    .to_lowercase()
-                    .contains(&q)
-            });
+            unauth_rows.retain(|row| row.provider.name().0.to_lowercase().contains(&q));
         }
 
         let recommended_models = all_models
@@ -788,11 +783,7 @@ fn render_unauth_row(ix: usize, row: &UnauthRow, focused: bool) -> impl IntoElem
 /// and is not yet plumbed end-to-end from the picker. The toggle-on-second-
 /// click behavior of `OpenSettings` is documented as a known limitation
 /// (see ST1b-followup).
-fn dispatch_unauth_action(
-    action: AuthAction,
-    window: &mut Window,
-    cx: &mut App,
-) {
+fn dispatch_unauth_action(action: AuthAction, window: &mut Window, cx: &mut App) {
     match action {
         AuthAction::SignInImperative | AuthAction::EnterApiKeyInSettings => {
             window.dispatch_action(OpenSettings.boxed_clone(), cx);
@@ -1146,9 +1137,7 @@ mod tests {
 
     // ─── ST1b: unauth-provider helpers + data-flow ──────────────────────
 
-    use language_model::{
-        SafeUrl, SanitizedReason, fake_provider::FakeLanguageModelProvider,
-    };
+    use language_model::{SafeUrl, SanitizedReason, fake_provider::FakeLanguageModelProvider};
 
     fn fake_unauth_row(id: &str, name: &str, state: ProviderAuthState) -> UnauthRow {
         let provider = FakeLanguageModelProvider::new(
@@ -1348,7 +1337,10 @@ mod tests {
             LanguageModelPickerEntry::Separator(s) => {
                 assert_eq!(s.as_ref(), "More providers")
             }
-            other => panic!("expected separator, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected separator, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
         match &entries[entries.len() - 1] {
             LanguageModelPickerEntry::UnauthProvider(r) => {

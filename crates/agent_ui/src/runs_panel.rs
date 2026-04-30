@@ -179,7 +179,7 @@ impl Item for RunsPanel {
 mod tests {
     use super::*;
     use caduceus_bridge::run_ref::RunRef;
-    use caduceus_bridge::runs_panel::{RunsPanelRow, SerRunRef};
+    use caduceus_bridge::runs_panel::{PanelStatus, RunsPanelRow, SerRunRef};
 
     fn row(id: &str, status: PanelStatus, attempt: u32) -> RunsPanelRow {
         RunsPanelRow {
@@ -196,9 +196,10 @@ mod tests {
 
     #[test]
     fn bucketing_helpers_call_through_to_bridge() {
-        // Sanity: ensure the bridge helpers we re-use here actually
-        // produce non-empty output.  The render path is exercised in
-        // gpui tests at the workspace integration level.
+        // Sanity: ensure the bridge helpers we re-use here produce
+        // expected buckets.  NOTE: render/open-path gpui tests for
+        // RunsPanel are still TODO — they belong with the daemon-IPC
+        // streaming hookup landing in the follow-up PR.
         let rows = vec![
             row("01", PanelStatus::Running, 1),
             row("02", PanelStatus::Finished, 1),

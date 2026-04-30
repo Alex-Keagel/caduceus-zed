@@ -133,11 +133,23 @@ pub fn parse_remote_url(url: &str) -> Option<ParsedRemote> {
     }
     let path = path.strip_suffix(".git").unwrap_or(&path);
     let path = path.trim_start_matches('/');
+    // Defence-in-depth: reject any URL whose path carries query/fragment
+    // markers.  parse_remote_url is display-only but downstream callers
+    // (RepoCard::picker_line) treat segments as identifiers; we never want
+    // a `?foo=bar` substring to surface in a UI label.
+    if path.contains(['?', '#']) {
+        return None;
+    }
     let segments: Vec<String> = path
         .split('/')
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
+    // A remote with no owner+repo segments is not a useful repo identity.
+    // `https://github.com` and `git@github.com:` both land here.
+    if segments.is_empty() {
+        return None;
+    }
     Some(ParsedRemote {
         host,
         path_segments: segments,
@@ -219,6 +231,22 @@ mod tests {
         assert!(parse_remote_url("").is_none());
         assert!(parse_remote_url("not a url").is_none());
         assert!(parse_remote_url("https://").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_host_only_remote() {
+        // A remote with no owner+repo path segments is not a useful repo
+        // identity.  Both https-host-only and scp-host-only should fail.
+        assert!(parse_remote_url("https://github.com").is_none());
+        assert!(parse_remote_url("https://github.com/").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_url_with_query_or_fragment() {
+        // Defence-in-depth: query strings and fragments would otherwise
+        // be smuggled into the repo name segment in the picker line.
+        assert!(parse_remote_url("https://github.com/openai/symphony?ref=main").is_none());
+        assert!(parse_remote_url("https://github.com/openai/symphony#L1").is_none());
     }
 
     #[test]
