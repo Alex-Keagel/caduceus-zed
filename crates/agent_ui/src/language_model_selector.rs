@@ -188,6 +188,7 @@ impl LanguageModelPickerDelegate {
 
         Self {
             on_model_changed,
+            #[allow(clippy::arc_with_non_send_sync)]
             all_models: Arc::new(models),
             selected_index: Self::get_active_model_index(&entries, get_active_model(cx)),
             filtered_entries: entries,
@@ -203,7 +204,10 @@ impl LanguageModelPickerDelegate {
                         | language_model::Event::AddedProvider(_)
                         | language_model::Event::RemovedProvider(_) => {
                             let query = picker.query(cx);
-                            picker.delegate.all_models = Arc::new(all_models(cx));
+                            #[allow(clippy::arc_with_non_send_sync)]
+                            {
+                                picker.delegate.all_models = Arc::new(all_models(cx));
+                            }
                             // Update matches will automatically drop the previous task
                             // if we get a provider event again
                             picker.update_matches(query, window, cx)
@@ -750,7 +754,7 @@ fn render_unauth_row(ix: usize, row: &UnauthRow, focused: bool) -> impl IntoElem
 
     div()
         .id(("unauth-row-wrapper", ix))
-        .debug_selector(move || selector_key.clone())
+        .debug_selector(move || selector_key)
         .child(
             ListItem::new(("unauth-row", ix))
                 .inset(true)
