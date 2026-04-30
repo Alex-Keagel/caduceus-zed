@@ -2889,7 +2889,7 @@ mod tests {
         let h = bridge.build_harness_no_approval(provider, ToolRegistry::new(), "sys");
         assert!(h.reflexion().is_some(), "harness must carry reflexion");
 
-        let reflector = HeuristicReflector::default();
+        let reflector = HeuristicReflector;
         let outcome = AttemptOutcome::Failure {
             error: "compile error: missing semicolon".into(),
             attempted_action: None,
@@ -2908,7 +2908,7 @@ mod tests {
         use caduceus_providers::mock::MockLlmAdapter;
         let dir = tempfile::tempdir().unwrap();
         let cfg = PlannerConfig::default();
-        let bridge = OrchestratorBridge::new(dir.path()).with_tot_config(cfg.clone());
+        let bridge = OrchestratorBridge::new(dir.path()).with_tot_config(cfg);
         let provider: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
         let h = bridge.build_harness_no_approval(provider, ToolRegistry::new(), "sys");
         assert!(h.tot_config().is_some(), "harness must carry tot config");

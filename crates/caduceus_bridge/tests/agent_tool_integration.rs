@@ -515,9 +515,8 @@ fn storage_list_tasks_empty() {
     let dir = tempfile::tempdir().unwrap();
     let tasks = storage.list_tasks(dir.path());
     // Empty dir has no tasks (may be Ok(empty) or Err, both acceptable)
-    match tasks {
-        Ok(list) => assert!(list.is_empty()),
-        Err(_) => {} // no .caduceus/tasks dir yet
+    if let Ok(list) = tasks {
+        assert!(list.is_empty());
     }
 }
 

@@ -1863,10 +1863,13 @@ mod tests {
             }
         });
 
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             tokio::join!(churner, searcher)
         })
         .await
         .expect("churn + zero-top-k searches must finish");
+        // Both halves of the join return Result; surface failures explicitly.
+        a.expect("churner half panicked");
+        b.expect("searcher half panicked");
     }
 }

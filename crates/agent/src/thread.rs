@@ -8832,7 +8832,6 @@ mod native_dispatch_tests {
         RetryKind as TRetryKind, StopReasonKind as TStop, TokenUsageMirror,
         TranslatedThreadEvent as T,
     };
-    use futures::StreamExt;
     use futures::channel::mpsc;
 
     fn dispatch_one(ev: T) -> Vec<ThreadEvent> {
@@ -8841,7 +8840,7 @@ mod native_dispatch_tests {
         dispatch_translated_event(&ev, &stream);
         drop(stream);
         let mut out = Vec::new();
-        while let Ok(Some(item)) = rx.try_next() {
+        while let Ok(item) = rx.try_recv() {
             out.push(item.expect("dispatcher only produces Ok"));
         }
         out
@@ -9446,7 +9445,7 @@ mod native_turn_e2e_tests {
         }
         drop(stream);
         let mut out = Vec::new();
-        while let Ok(Some(item)) = rx.try_next() {
+        while let Ok(item) = rx.try_recv() {
             out.push(item.expect("dispatcher only produces Ok"));
         }
         out
@@ -9714,7 +9713,6 @@ mod route_native_permission_tests {
     //! was only found by a rubber-duck review.
     use super::*;
     use agent_settings::AgentSettings;
-    use futures::StreamExt;
     use futures::channel::mpsc as fmpsc;
     use gpui::{TestAppContext, UpdateGlobal};
     use settings::SettingsStore;
@@ -9746,7 +9744,7 @@ mod route_native_permission_tests {
 
     fn drain(rx: &mut fmpsc::UnboundedReceiver<Result<ThreadEvent>>) -> Vec<ThreadEvent> {
         let mut out = Vec::new();
-        while let Ok(Some(item)) = rx.try_next() {
+        while let Ok(item) = rx.try_recv() {
             out.push(item.expect("stream only carries Ok"));
         }
         out
@@ -9993,10 +9991,9 @@ mod native_tool_lifecycle_tests {
 
     use super::*;
     use caduceus_bridge::event_translator::TranslatedThreadEvent as T;
-    use futures::StreamExt;
     use futures::channel::mpsc as fmpsc;
     use gpui::TestAppContext;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
 
     fn make_stream() -> (
         ThreadEventStream,
@@ -10008,7 +10005,7 @@ mod native_tool_lifecycle_tests {
 
     fn drain(rx: &mut fmpsc::UnboundedReceiver<Result<ThreadEvent>>) -> Vec<ThreadEvent> {
         let mut out = Vec::new();
-        while let Ok(Some(item)) = rx.try_next() {
+        while let Ok(item) = rx.try_recv() {
             out.push(item.expect("stream only carries Ok"));
         }
         out
@@ -10321,7 +10318,7 @@ mod st2_pinned_tests {
         thread.update(cx, |t, _| {
             let k = user_key();
             assert!(t.pin_at(k.clone(), PinReason::Manual, fixed_now()));
-            assert!(!t.pin_at(k.clone(), PinReason::Manual, fixed_now()));
+            assert!(!t.pin_at(k, PinReason::Manual, fixed_now()));
             assert_eq!(t.pinned_refs().len(), 1);
         });
     }
@@ -10598,7 +10595,7 @@ mod st2_pinned_tests {
                 fixed_now(),
             );
             t.pin_at(
-                PinnedMessageKey::User(id.clone()),
+                PinnedMessageKey::User(id),
                 PinReason::FirstUser,
                 fixed_now(),
             );

@@ -1145,7 +1145,7 @@ mod tests {
         assert!(
             registry
                 .read(cx)
-                .configuration_error(Some(model.clone()), cx)
+                .configuration_error(Some(model), cx)
                 .is_none()
         );
     }

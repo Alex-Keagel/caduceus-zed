@@ -465,7 +465,7 @@ mod tests {
         assert!(s.len() <= MAX_REASON_LEN + "…".len());
 
         // Multibyte chars at the boundary do not panic.
-        let s: String = std::iter::repeat("é").take(MAX_REASON_LEN).collect();
+        let s: String = "é".repeat(MAX_REASON_LEN);
         let _ = sanitize_provider_reason(&s);
     }
 
@@ -491,6 +491,7 @@ mod tests {
         assert!(r.as_str().contains("<redacted>"));
         assert!(!r.as_str().contains("abcdefghijk"));
         // Round-trip via Display + into_string preserves sanitized content.
-        assert_eq!(r.to_string(), r.clone().into_string());
+        let display = r.to_string();
+        assert_eq!(display, r.into_string());
     }
 }
