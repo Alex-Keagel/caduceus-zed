@@ -124,7 +124,7 @@ impl RenderSnapshot {
 
     #[track_caller]
     fn ensure_queried(&self, selector: &str, op: &str) {
-        if !self.queried.iter().any(|s| *s == selector) {
+        if !self.queried.contains(&selector) {
             panic!(
                 "{op}: selector `{selector}` was not included in RenderSnapshot::capture selectors.\n  queried: {:?}\n  hint: add `{selector}` to the selectors list at capture time.",
                 self.queried

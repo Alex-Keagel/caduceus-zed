@@ -228,12 +228,20 @@ fn p13e_catalogs_are_populated_and_aligned() {
         );
     }
 
-    // Modes catalog has the 4 canonical modes.
+    // Modes catalog has the 3 canonical modes (Plan now subsumes the
+    // former Research mode — see `AgentMode::all_modes()` and the
+    // ModeDescriptor::label override in `list_modes` that surfaces
+    // "Plan & Research" in the picker).
     let modes = list_modes();
     let names: Vec<&str> = modes.iter().map(|m| m.name.as_str()).collect();
-    for want in ["plan", "research", "act", "autopilot"] {
+    for want in ["plan", "act", "autopilot"] {
         assert!(names.contains(&want), "mode catalog missing {want}");
     }
+    assert_eq!(
+        modes.len(),
+        3,
+        "expected exactly 3 canonical modes, got {names:?}"
+    );
 
     // Persona.default_mode MUST reference a mode that exists in the catalog.
     // Cross-catalog integrity check — catches drift between `modes.rs` and

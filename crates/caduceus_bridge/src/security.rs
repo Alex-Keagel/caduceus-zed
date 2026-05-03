@@ -215,7 +215,7 @@ mod tests {
         let report = bridge.generate_security_report();
         assert!(report.contains("OWASP"));
         let score = bridge.compliance_score();
-        assert!(score >= 0.0 && score <= 1.0);
+        assert!((0.0..=1.0).contains(&score));
     }
 
     #[test]

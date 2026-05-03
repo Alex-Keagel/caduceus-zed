@@ -805,7 +805,7 @@ mod tests {
         p.retry_after_secs = Some(30);
         p.http_status = Some(429);
         let typed = SubAgentFailure::ProviderError(p);
-        let err = anyhow::Error::new(typed.clone());
+        let err = anyhow::Error::new(typed);
         let out = classify_subagent_error(
             &err,
             &caduceus_core::ClassifyContext::empty(),
