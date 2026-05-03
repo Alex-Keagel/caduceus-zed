@@ -1095,7 +1095,11 @@ pub struct AcpThread {
 /// `request_grant`.
 pub struct PendingGrant {
     pub tool_use_id: String,
-    pub deadline_ms: Option<u64>,
+    /// Always set: the orchestrator's grant_timeout in milliseconds.
+    /// Tightened from `Option<u64>` per ST8 PR-3D wiring audit
+    /// (the bridge always supplied `Some(_)`; the optionality was
+    /// vestigial and risked silently losing the countdown).
+    pub deadline_ms: u64,
     pub created_at: Instant,
     pub respond_tx: oneshot::Sender<bool>,
 }
@@ -2254,7 +2258,7 @@ impl AcpThread {
     pub fn request_grant(
         &mut self,
         tool_use_id: String,
-        deadline_ms: Option<u64>,
+        deadline_ms: u64,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
@@ -5790,13 +5794,13 @@ mod tests {
             .unwrap();
 
         let rx = thread.update(cx, |thread, cx| {
-            thread.request_grant("toolcall-1".into(), Some(5_000), cx)
+            thread.request_grant("toolcall-1".into(), 5_000, cx)
         });
 
         thread.update(cx, |thread, _cx| {
             let pending = thread.pending_grant().expect("should have pending grant");
             assert_eq!(pending.tool_use_id, "toolcall-1");
-            assert_eq!(pending.deadline_ms, Some(5_000));
+            assert_eq!(pending.deadline_ms, 5_000);
         });
 
         thread.update(cx, |thread, cx| {
@@ -5828,7 +5832,7 @@ mod tests {
             .unwrap();
 
         let rx = thread.update(cx, |thread, cx| {
-            thread.request_grant("toolcall-2".into(), None, cx)
+            thread.request_grant("toolcall-2".into(), 5_000, cx)
         });
 
         thread.update(cx, |thread, cx| {
@@ -5882,10 +5886,10 @@ mod tests {
             .unwrap();
 
         let rx1 = thread.update(cx, |thread, cx| {
-            thread.request_grant("first".into(), Some(1_000), cx)
+            thread.request_grant("first".into(), 1_000, cx)
         });
         let rx2 = thread.update(cx, |thread, cx| {
-            thread.request_grant("second".into(), Some(2_000), cx)
+            thread.request_grant("second".into(), 2_000, cx)
         });
 
         // First receiver must be cancelled (its tx was overwritten).

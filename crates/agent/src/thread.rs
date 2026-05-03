@@ -1030,7 +1030,9 @@ pub enum ThreadEvent {
     /// the original pending entry.
     GrantApprovalRequest {
         tool_use_id: String,
-        deadline_ms: Option<u64>,
+        /// Always set — orchestrator's grant_timeout in ms. Tightened
+        /// from `Option<u64>` per ST8 PR-3D wiring audit.
+        deadline_ms: u64,
         response: futures::channel::oneshot::Sender<bool>,
     },
     /// ST8 PR-B3 — typed surface for `T::ProfileSwitchPending`. Mirrors
@@ -4815,7 +4817,7 @@ impl Thread {
                     let _ = stream_for_consumer.0.unbounded_send(Ok(
                         ThreadEvent::GrantApprovalRequest {
                             tool_use_id: tool_use_id.clone(),
-                            deadline_ms: Some(*deadline_ms),
+                            deadline_ms: *deadline_ms,
                             response: tx,
                         },
                     ));
