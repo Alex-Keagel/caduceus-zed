@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit — fast local gate that runs on every commit.
+#
+# Runs:
+#   1. cargo fmt --all --check   (formatting)
+#   2. cargo check               (scope-limited: agent + agent_ui + caduceus_bridge)
+#
+# Skips automatically when the staged diff is docs-only
+# (`*.md`, `docs/`, `private/`, `.github/`, `.githooks/`, `scripts/`).
+#
+# Bypass for one commit:  git commit --no-verify
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# ── Smart skip: docs-only commits don't need rust gates.
+staged_nonrust=$(
+  git diff --cached --name-only --diff-filter=ACMR \
+    | grep -Ev '\.md$|^docs/|^private/|^\.github/|^\.githooks/|^scripts/' \
+    || true
+)
+if [ -z "$staged_nonrust" ]; then
+  exit 0
+fi
+
+# ── Sibling-repo invariant. caduceus-zed has 14 path deps on
+# ../caduceus/crates/* and won't compile without it.
+if [ ! -d "../caduceus" ]; then
+  echo "✗ pre-commit: expected sibling repo at $(cd .. && pwd)/caduceus" >&2
+  echo "  Clone it:  git -C $(cd .. && pwd) clone https://github.com/Alex-Keagel/caduceus.git" >&2
+  echo "  Or bypass once: git commit --no-verify" >&2
+  exit 1
+fi
+
+step() { echo "▶ pre-commit: $1"; }
+
+step "cargo fmt --all --check"
+cargo fmt --all --check
+
+# Scope-limited check — full workspace is too slow on every commit
+# (cold target = ~10 min). These three crates cover the actively-edited
+# surface; full workspace clippy/test still runs at pre-push time.
+step "cargo check -p agent -p agent_ui -p caduceus_bridge"
+cargo check -p agent -p agent_ui -p caduceus_bridge
+
+echo "✓ pre-commit: fmt + check green"

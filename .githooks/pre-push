@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# .githooks/pre-push — version-controlled pre-push hook.
+#
+# Activate once per clone:
+#     git config core.hooksPath .githooks
+# (or run: scripts/install-git-hooks.sh)
+#
+# Bypass for one push:  git push --no-verify
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Skip on tag-only or branch-deletion pushes (no SHA on stdin).
+read -r local_ref local_sha remote_ref remote_sha || true
+[ -z "${local_sha:-}" ] && exit 0
+[ "${local_sha:-}" = "0000000000000000000000000000000000000000" ] && exit 0
+
+exec "$REPO_ROOT/scripts/ci-preflight.sh" --skip-rust-when-docs-only

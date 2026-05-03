@@ -3735,7 +3735,7 @@ impl ThreadView {
         let countdown_label = deadline_ms.map(|ms| {
             let total = std::time::Duration::from_millis(ms);
             let remaining = total.saturating_sub(elapsed);
-            format!("{}s", remaining.as_secs().max(0))
+            format!("{}s", remaining.as_secs())
         });
 
         let thread_for_deny = self.thread.clone();

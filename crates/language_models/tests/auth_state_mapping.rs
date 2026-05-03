@@ -33,29 +33,95 @@ struct Expected {
 }
 
 const EXPECTED: &[Expected] = &[
-    Expected { file: "anthropic.rs",          expected_action: "EnterApiKeyInSettings", can_be_disabled_by_policy: false },
-    Expected { file: "open_ai.rs",            expected_action: "EnterApiKeyInSettings", can_be_disabled_by_policy: false },
-    Expected { file: "google.rs",             expected_action: "EnterApiKeyInSettings", can_be_disabled_by_policy: false },
-    Expected { file: "ollama.rs",             expected_action: "None",                  can_be_disabled_by_policy: false },
-    Expected { file: "lmstudio.rs",           expected_action: "None",                  can_be_disabled_by_policy: false },
+    Expected {
+        file: "anthropic.rs",
+        expected_action: "EnterApiKeyInSettings",
+        can_be_disabled_by_policy: false,
+    },
+    Expected {
+        file: "open_ai.rs",
+        expected_action: "EnterApiKeyInSettings",
+        can_be_disabled_by_policy: false,
+    },
+    Expected {
+        file: "google.rs",
+        expected_action: "EnterApiKeyInSettings",
+        can_be_disabled_by_policy: false,
+    },
+    Expected {
+        file: "ollama.rs",
+        expected_action: "None",
+        can_be_disabled_by_policy: false,
+    },
+    Expected {
+        file: "lmstudio.rs",
+        expected_action: "None",
+        can_be_disabled_by_policy: false,
+    },
     // fix-loop #5: AWS IAM/STS — no in-app remediation.
-    Expected { file: "bedrock.rs",            expected_action: "None",                  can_be_disabled_by_policy: false },
-    Expected { file: "mistral.rs",            expected_action: "EnterApiKeyInSettings", can_be_disabled_by_policy: false },
-    Expected { file: "deepseek.rs",           expected_action: "EnterApiKeyInSettings", can_be_disabled_by_policy: false },
-    Expected { file: "vercel.rs",             expected_action: "EnterApiKeyInSettings", can_be_disabled_by_policy: false },
-    Expected { file: "vercel_ai_gateway.rs",  expected_action: "EnterApiKeyInSettings", can_be_disabled_by_policy: false },
-    Expected { file: "open_router.rs",        expected_action: "EnterApiKeyInSettings", can_be_disabled_by_policy: false },
-    Expected { file: "opencode.rs",           expected_action: "EnterApiKeyInSettings", can_be_disabled_by_policy: false },
-    Expected { file: "x_ai.rs",               expected_action: "EnterApiKeyInSettings", can_be_disabled_by_policy: false },
-    Expected { file: "open_ai_compatible.rs", expected_action: "EnterApiKeyInSettings", can_be_disabled_by_policy: false },
+    Expected {
+        file: "bedrock.rs",
+        expected_action: "None",
+        can_be_disabled_by_policy: false,
+    },
+    Expected {
+        file: "mistral.rs",
+        expected_action: "EnterApiKeyInSettings",
+        can_be_disabled_by_policy: false,
+    },
+    Expected {
+        file: "deepseek.rs",
+        expected_action: "EnterApiKeyInSettings",
+        can_be_disabled_by_policy: false,
+    },
+    Expected {
+        file: "vercel.rs",
+        expected_action: "EnterApiKeyInSettings",
+        can_be_disabled_by_policy: false,
+    },
+    Expected {
+        file: "vercel_ai_gateway.rs",
+        expected_action: "EnterApiKeyInSettings",
+        can_be_disabled_by_policy: false,
+    },
+    Expected {
+        file: "open_router.rs",
+        expected_action: "EnterApiKeyInSettings",
+        can_be_disabled_by_policy: false,
+    },
+    Expected {
+        file: "opencode.rs",
+        expected_action: "EnterApiKeyInSettings",
+        can_be_disabled_by_policy: false,
+    },
+    Expected {
+        file: "x_ai.rs",
+        expected_action: "EnterApiKeyInSettings",
+        can_be_disabled_by_policy: false,
+    },
+    Expected {
+        file: "open_ai_compatible.rs",
+        expected_action: "EnterApiKeyInSettings",
+        can_be_disabled_by_policy: false,
+    },
     // Copilot has TWO unauth branches: Status::Disabled → DisabledByPolicy,
     // otherwise SignInImperative.
-    Expected { file: "copilot_chat.rs",       expected_action: "SignInImperative",      can_be_disabled_by_policy: true  },
-    Expected { file: "cloud.rs",              expected_action: "SignInImperative",      can_be_disabled_by_policy: false },
+    Expected {
+        file: "copilot_chat.rs",
+        expected_action: "SignInImperative",
+        can_be_disabled_by_policy: true,
+    },
+    Expected {
+        file: "cloud.rs",
+        expected_action: "SignInImperative",
+        can_be_disabled_by_policy: false,
+    },
 ];
 
 fn provider_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join("provider")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("provider")
 }
 
 fn extract_auth_state_body(path: &std::path::Path) -> String {
@@ -100,7 +166,11 @@ fn t8_every_provider_maps_unauth_to_expected_action() {
     for ent in EXPECTED {
         let path = dir.join(ent.file);
         if !path.exists() {
-            failures.push(format!("{}: file not found at {}", ent.file, path.display()));
+            failures.push(format!(
+                "{}: file not found at {}",
+                ent.file,
+                path.display()
+            ));
             continue;
         }
         let body = extract_auth_state_body(&path);

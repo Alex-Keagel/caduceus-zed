@@ -71,6 +71,50 @@ Applies to every write path — `create`, `edit`, `bash` redirects, `git add` of
 
 See `~/Dev/.github/copilot-instructions.md` for the cross-repo source of truth.
 
+## Local CI gate — pre-commit + pre-push
+
+Every commit and every push runs the same gates GitHub Actions runs, **before** the change goes out. The CI workflow at `.github/workflows/ci.yml` (`Caduceus CI`) takes ~42 minutes per run; catching a `clippy -D warnings`, `cargo fmt`, or test failure locally avoids that round-trip.
+
+**Once per fresh clone:**
+
+```bash
+scripts/install-git-hooks.sh          # sets core.hooksPath = .githooks
+```
+
+After that, every `git commit` and `git push` runs the version-controlled hooks under `.githooks/`.
+
+### `pre-commit` — fast gate, fires every commit
+
+Runs (skipped automatically on docs-only diffs):
+
+1. `cargo fmt --all --check`
+2. `cargo check -p agent -p agent_ui -p caduceus_bridge`
+   *(scope-limited; full-workspace check still runs at pre-push time.)*
+
+### `pre-push` — full CI mirror, fires every push
+
+Runs (skipped automatically on docs-only diffs vs `origin/main`):
+
+1. Verify the sibling `../caduceus` checkout exists (path deps require it).
+2. `cargo check -p agent -p agent_ui`
+3. `cargo test -p caduceus_bridge --lib --tests`
+4. `cargo test -p agent_ui --lib`
+5. `cargo clippy --workspace --all-targets -- -D warnings`
+6. `cargo check --release -p zed --features gpui_platform/runtime_shaders`
+
+**On-demand invocation** (no commit/push needed):
+
+```bash
+scripts/ci-preflight.sh               # full gate
+scripts/ci-preflight.sh --fast        # skip the slow release-build check
+```
+
+**Skip rules:** both hooks auto-skip the rust gate when the staged/pushed diff is **only** `*.md` / `docs/` / `private/` / `.github/` / `.githooks/` / `scripts/` files.
+
+**Bypass for one commit/push:** `git commit --no-verify` / `git push --no-verify` — true emergencies only. CI will still catch a regression after the fact, but the round-trip cost is high.
+
+**Why this rule exists:** the `.max(0)` clippy regression that broke run `25276602408` got merged because the previous local hook didn't run clippy and the user `--no-verify`'d a narrow-scope push. The new hooks prevent that exact failure mode by running fmt+check on every commit and the full clippy gate on every push.
+
 ## Architecture
 
 - **Engine**: `~/Dev/caduceus` — 14 Rust crates, source of truth for capabilities

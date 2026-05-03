@@ -263,10 +263,8 @@ pub fn sanitize_provider_reason(input: &str) -> String {
 static TOKEN_REDACT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     // Order matters: bearer first because it consumes a "Bearer<sep>" prefix that
     // could otherwise be partially matched as a sk-/gho_/ya29 token.
-    regex::Regex::new(
-        r"(?i)\bbearer\s+\S+|\bsk-\S+|\bgho_\S+|\bya29\.\S+",
-    )
-    .expect("static token-redact regex compiles")
+    regex::Regex::new(r"(?i)\bbearer\s+\S+|\bsk-\S+|\bgho_\S+|\bya29\.\S+")
+        .expect("static token-redact regex compiles")
 });
 
 #[cfg(test)]
@@ -277,30 +275,30 @@ mod tests {
     #[test]
     fn auth_state_can_provide_models_truth_table() {
         assert!(ProviderAuthState::Authenticated.can_provide_models());
-        assert!(!ProviderAuthState::NotAuthenticated {
-            action: AuthAction::None
-        }
-        .can_provide_models());
+        assert!(
+            !ProviderAuthState::NotAuthenticated {
+                action: AuthAction::None
+            }
+            .can_provide_models()
+        );
         assert!(
             !ProviderAuthState::rate_limited(Some(Duration::from_secs(10)), AuthAction::None)
                 .can_provide_models()
         );
-        assert!(
-            !ProviderAuthState::disabled_by_policy("policy").can_provide_models()
-        );
+        assert!(!ProviderAuthState::disabled_by_policy("policy").can_provide_models());
     }
 
     // T1b: is_configured — Authenticated and RateLimited are configured; others not.
     #[test]
     fn auth_state_is_configured_truth_table() {
         assert!(ProviderAuthState::Authenticated.is_configured());
+        assert!(ProviderAuthState::rate_limited(None, AuthAction::None).is_configured());
         assert!(
-            ProviderAuthState::rate_limited(None, AuthAction::None).is_configured()
+            !ProviderAuthState::NotAuthenticated {
+                action: AuthAction::EnterApiKeyInSettings
+            }
+            .is_configured()
         );
-        assert!(!ProviderAuthState::NotAuthenticated {
-            action: AuthAction::EnterApiKeyInSettings
-        }
-        .is_configured());
         assert!(!ProviderAuthState::disabled_by_policy("p").is_configured());
     }
 

@@ -51,7 +51,12 @@ impl std::fmt::Debug for ConfigurationError {
                 write!(f, "ProviderNotAuthenticated({})", provider.id())
             }
             Self::ProviderRateLimited(provider, retry_after) => {
-                write!(f, "ProviderRateLimited({}, {:?})", provider.id(), retry_after)
+                write!(
+                    f,
+                    "ProviderRateLimited({}, {:?})",
+                    provider.id(),
+                    retry_after
+                )
             }
             Self::ProviderDisabledByPolicy(provider, reason) => {
                 write!(
@@ -305,9 +310,9 @@ impl LanguageModelRegistry {
         // from "rate-limited" and "disabled by policy". `Authenticated` returns None.
         match self.cached_auth_state(&model.provider.id(), cx) {
             ProviderAuthState::Authenticated => None,
-            ProviderAuthState::NotAuthenticated { .. } => Some(
-                ConfigurationError::ProviderNotAuthenticated(model.provider),
-            ),
+            ProviderAuthState::NotAuthenticated { .. } => {
+                Some(ConfigurationError::ProviderNotAuthenticated(model.provider))
+            }
             ProviderAuthState::RateLimited { retry_after, .. } => Some(
                 ConfigurationError::ProviderRateLimited(model.provider, retry_after),
             ),
@@ -358,11 +363,7 @@ impl LanguageModelRegistry {
     /// Per AC-PERF1, callers that fan out (panel render, selector list) should go
     /// through this method so the underlying `provider.auth_state(cx)` is invoked at
     /// most once per provider per render frame.
-    pub fn cached_auth_state(
-        &self,
-        id: &LanguageModelProviderId,
-        cx: &App,
-    ) -> ProviderAuthState {
+    pub fn cached_auth_state(&self, id: &LanguageModelProviderId, cx: &App) -> ProviderAuthState {
         // Fast-path read: clone the cached entry if present and not expired. Two-phase
         // borrow (read, then mutate on miss) avoids holding the `RefMut` across the
         // provider call, which can re-enter the registry on some code paths.
@@ -1028,7 +1029,12 @@ mod tests {
 
         // But the cache entry's deadline is bounded: rewind it to a moment past the
         // fallback TTL and the next read must evict.
-        registry.read(cx).auth_cache.borrow_mut().get_mut(&id).unwrap()
+        registry
+            .read(cx)
+            .auth_cache
+            .borrow_mut()
+            .get_mut(&id)
+            .unwrap()
             .rate_limited_until = Some(Instant::now() - Duration::from_secs(1));
         assert!(matches!(
             registry.read(cx).cached_auth_state(&id, cx),
@@ -1112,7 +1118,10 @@ mod tests {
             AuthAction::None,
         )));
         registry.read(cx).invalidate_auth_cache(&id);
-        match registry.read(cx).configuration_error(Some(model.clone()), cx) {
+        match registry
+            .read(cx)
+            .configuration_error(Some(model.clone()), cx)
+        {
             Some(ConfigurationError::ProviderRateLimited(_, retry)) => {
                 assert_eq!(retry, Some(Duration::from_secs(7)));
             }
@@ -1122,7 +1131,10 @@ mod tests {
         // DisabledByPolicy.
         provider.set_auth_state(Some(ProviderAuthState::disabled_by_policy("nope")));
         registry.read(cx).invalidate_auth_cache(&id);
-        match registry.read(cx).configuration_error(Some(model.clone()), cx) {
+        match registry
+            .read(cx)
+            .configuration_error(Some(model.clone()), cx)
+        {
             Some(ConfigurationError::ProviderDisabledByPolicy(_, reason)) => {
                 assert_eq!(reason, "nope");
             }
@@ -1134,7 +1146,10 @@ mod tests {
             action: AuthAction::EnterApiKeyInSettings,
         }));
         registry.read(cx).invalidate_auth_cache(&id);
-        match registry.read(cx).configuration_error(Some(model.clone()), cx) {
+        match registry
+            .read(cx)
+            .configuration_error(Some(model.clone()), cx)
+        {
             Some(ConfigurationError::ProviderNotAuthenticated(_)) => {}
             other => panic!("expected ProviderNotAuthenticated, got {:?}", other),
         }

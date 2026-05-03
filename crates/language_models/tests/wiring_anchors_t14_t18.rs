@@ -74,11 +74,7 @@ fn t14_agent_panel_onboarding_treats_rate_limited_as_configured() {
     let path = root.join("crates/agent_ui/src/agent_panel.rs");
     // The wiring site (plan v3.1 §6 T14, was line 5341 pre-fix-loop, now ~5344):
     // `provider.auth_state(cx).is_configured()`.
-    assert_contains(
-        "T14",
-        &path,
-        "provider.auth_state(cx).is_configured()",
-    );
+    assert_contains("T14", &path, "provider.auth_state(cx).is_configured()");
     assert_not_contains(
         "T14",
         &path,
@@ -96,16 +92,8 @@ fn t15_agent_configuration_check_icon_only_for_authenticated() {
     let path = root.join("crates/agent_ui/src/agent_configuration.rs");
     // Two anchor sites — both call `provider.auth_state(cx)`.
     assert_contains("T15", &path, "provider.auth_state(cx)");
-    assert_contains(
-        "T15",
-        &path,
-        "provider.auth_state(cx).is_configured()",
-    );
-    assert_not_contains(
-        "T15",
-        &path,
-        &["provider.is_authenticated(cx)"],
-    );
+    assert_contains("T15", &path, "provider.auth_state(cx).is_configured()");
+    assert_not_contains("T15", &path, &["provider.is_authenticated(cx)"]);
 }
 
 /// T16: ai_onboarding hides when a configured (incl. RateLimited) provider exists.
@@ -117,16 +105,8 @@ fn t16_ai_onboarding_hides_when_rate_limited_provider_present() {
         "crates/ai_onboarding/src/agent_api_keys_onboarding.rs",
     ] {
         let path = root.join(rel);
-        assert_contains(
-            "T16",
-            &path,
-            "provider.auth_state(cx).is_configured()",
-        );
-        assert_not_contains(
-            "T16",
-            &path,
-            &["provider.is_authenticated(cx)"],
-        );
+        assert_contains("T16", &path, "provider.auth_state(cx).is_configured()");
+        assert_not_contains("T16", &path, &["provider.is_authenticated(cx)"]);
     }
 }
 
@@ -138,11 +118,7 @@ fn t17_git_panel_does_not_call_authenticate_for_rate_limited() {
     let root = workspace_root();
     let path = root.join("crates/git_ui/src/git_panel.rs");
     assert_contains("T17", &path, "match provider.auth_state(cx)");
-    assert_not_contains(
-        "T17",
-        &path,
-        &["provider.is_authenticated(cx)"],
-    );
+    assert_not_contains("T17", &path, &["provider.is_authenticated(cx)"]);
     // Belt-and-braces: file must use the dispatcher's enum to pick a
     // remediation path; RateLimited is explicitly handled (or maps to None).
     let body = read(&path);
@@ -202,7 +178,11 @@ fn t18_no_unannotated_is_authenticated_calls() {
 
     let mut failures = Vec::new();
     'file: for path in &files {
-        let rel = path.strip_prefix(&root).unwrap().to_string_lossy().to_string();
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         for ex in exempt {
             if rel == *ex {
                 continue 'file;
@@ -228,8 +208,8 @@ fn t18_no_unannotated_is_authenticated_calls() {
             }
             // Inner-state idiom: `.read(cx).is_authenticated()` or `.is_authenticated()`
             // with no cx — these are NOT the trait shim.
-            let has_cx_arg = line.contains(".is_authenticated(cx)")
-                || line.contains(".is_authenticated(&cx)");
+            let has_cx_arg =
+                line.contains(".is_authenticated(cx)") || line.contains(".is_authenticated(&cx)");
             if !has_cx_arg {
                 continue;
             }

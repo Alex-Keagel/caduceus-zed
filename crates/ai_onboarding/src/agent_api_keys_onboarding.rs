@@ -34,8 +34,7 @@ impl ApiKeysWithProviders {
             .visible_providers()
             .iter()
             .filter(|provider| {
-                provider.auth_state(cx).is_configured()
-                    && provider.id() != ZED_CLOUD_PROVIDER_ID
+                provider.auth_state(cx).is_configured() && provider.id() != ZED_CLOUD_PROVIDER_ID
             })
             .map(|provider| (provider.icon(), provider.name().0))
             .collect()

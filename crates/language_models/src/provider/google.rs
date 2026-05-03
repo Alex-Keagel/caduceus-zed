@@ -7,9 +7,9 @@ use google_ai::{GenerateContentResponse, GoogleModelMode};
 use gpui::{AnyView, App, AsyncApp, Context, Entity, SharedString, Task, Window};
 use http_client::HttpClient;
 use language_model::{
-    AuthAction, ProviderAuthState,
-    AuthenticateError, ConfigurationViewTargetAgent, EnvVar, LanguageModelCompletionError,
-    LanguageModelCompletionEvent, LanguageModelToolChoice, LanguageModelToolSchemaFormat,
+    AuthAction, AuthenticateError, ConfigurationViewTargetAgent, EnvVar,
+    LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelToolChoice,
+    LanguageModelToolSchemaFormat, ProviderAuthState,
 };
 use language_model::{
     GOOGLE_PROVIDER_ID, GOOGLE_PROVIDER_NAME, IconOrSvg, LanguageModel, LanguageModelId,

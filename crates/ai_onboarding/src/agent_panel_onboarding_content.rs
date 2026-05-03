@@ -52,8 +52,7 @@ impl AgentPanelOnboarding {
             .visible_providers()
             .iter()
             .any(|provider| {
-                provider.auth_state(cx).is_configured()
-                    && provider.id() != ZED_CLOUD_PROVIDER_ID
+                provider.auth_state(cx).is_configured() && provider.id() != ZED_CLOUD_PROVIDER_ID
             })
     }
 }

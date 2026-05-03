@@ -300,9 +300,7 @@ pub trait LanguageModelProvider: 'static {
     /// Back-compat shim. Returns `auth_state(cx).can_provide_models()`. Deprecated; use
     /// `auth_state(cx)` and match on the variant. Removed in ST1b once selector + every
     /// caller has been migrated.
-    #[deprecated(
-        note = "ST1a: use auth_state(cx) and inspect the variant. Shim removed in ST1b."
-    )]
+    #[deprecated(note = "ST1a: use auth_state(cx) and inspect the variant. Shim removed in ST1b.")]
     fn is_authenticated(&self, cx: &App) -> bool {
         self.auth_state(cx).can_provide_models()
     }
