@@ -29,8 +29,7 @@ use language_model::{
     LanguageModelId, LanguageModelProviderId, LanguageModelProviderName, LanguageModelRegistry,
     LanguageModelRequest, LanguageModelRequestMessage, LanguageModelToolResult,
     LanguageModelToolSchemaFormat, LanguageModelToolUse, MessageContent, ProviderAuthState, Role,
-    StopReason, TokenUsage,
-    fake_provider::FakeLanguageModel,
+    StopReason, TokenUsage, fake_provider::FakeLanguageModel,
 };
 use pretty_assertions::assert_eq;
 use project::{
@@ -3721,10 +3720,12 @@ async fn test_completion_auth_error_invalidates_registry_cache(cx: &mut TestAppC
     // Advance past retry, then drive a 401 → cache should be invalidated.
     cx.executor().advance_clock(Duration::from_secs(7));
     cx.run_until_parked();
-    fake_model.send_last_completion_stream_error(LanguageModelCompletionError::AuthenticationError {
-        provider: LanguageModelProviderName::new("Fake"),
-        message: "401 unauthorized".into(),
-    });
+    fake_model.send_last_completion_stream_error(
+        LanguageModelCompletionError::AuthenticationError {
+            provider: LanguageModelProviderName::new("Fake"),
+            message: "401 unauthorized".into(),
+        },
+    );
     fake_model.end_last_completion_stream();
     cx.run_until_parked();
 

@@ -3293,6 +3293,7 @@ impl ThreadView {
                             .justify_between()
                             .children(self.render_guardrail_alert(cx))
                             .children(self.render_grant_picker(cx))
+                            .children(self.render_profile_switch_picker(cx))
                             .child(self.render_notice_banners(cx))
                             .child(
                                 h_flex()
@@ -3702,6 +3703,107 @@ impl ThreadView {
                 .child(div().flex_1())
                 .child(allow_button)
                 .child(deny_button),
+        )
+    }
+
+    /// ST8 PR-B3: render the inline profile-switch picker as a header banner.
+    ///
+    /// Surfaces `acp_thread.pending_profile_switch()` with the 2-action
+    /// asymmetric vocabulary documented in `zed/docs/specs/spec-m-ui-approval-card.md`
+    /// §6.2 — profile-switch supports only `Switch` (allow-once-equivalent) and
+    /// `StayAndDeny` (deny-equivalent); the 4-action grant vocabulary does not
+    /// apply because the engine surface (`SwitchUserChoice`) only exposes 2 outcomes.
+    ///
+    /// Lifecycle parallels `render_grant_picker`: shown while `pending_profile_switch`
+    /// is `Some`, dismissed by `resolve_profile_switch_choice` (user click) or
+    /// `clear_pending_profile_switch` (engine timeout / `profile_switch.resolved`
+    /// ContextNotice clear-hook per `caduceus/docs/specs/spec-m-permissions.md` §5.9).
+    fn render_profile_switch_picker(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        use acp_thread::SwitchUserChoice;
+
+        let acp_thread = self.thread.read(cx);
+        let pending = acp_thread.pending_profile_switch()?;
+        let tool_use_id = pending.tool_use_id.clone();
+        let target_mode = pending.target_mode.clone();
+        let capability = pending.capability.clone();
+        let resource = pending.resource.clone();
+        let elapsed = pending.created_at.elapsed();
+        let deadline_ms = pending.deadline_ms;
+        let tool_use_hash: u64 = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            tool_use_id.hash(&mut hasher);
+            hasher.finish()
+        };
+        let countdown_label = deadline_ms.map(|ms| {
+            let total = std::time::Duration::from_millis(ms);
+            let remaining = total.saturating_sub(elapsed);
+            format!("{}s", remaining.as_secs().max(0))
+        });
+
+        let thread_for_deny = self.thread.clone();
+        let stay_button = Button::new(("profile-switch-stay", 0u32), "Stay & deny")
+            .label_size(LabelSize::Small)
+            .start_icon(
+                Icon::new(IconName::Close)
+                    .size(IconSize::XSmall)
+                    .color(Color::Error),
+            )
+            .on_click(move |_, _window, cx| {
+                thread_for_deny.update(cx, |thread, cx| {
+                    thread.resolve_profile_switch_choice(SwitchUserChoice::StayAndDeny, cx);
+                });
+            });
+
+        let thread_for_switch = self.thread.clone();
+        let switch_button = Button::new(("profile-switch-allow", 0u32), "Switch")
+            .label_size(LabelSize::Small)
+            .start_icon(
+                Icon::new(IconName::Check)
+                    .size(IconSize::XSmall)
+                    .color(Color::Success),
+            )
+            .on_click(move |_, _window, cx| {
+                thread_for_switch.update(cx, |thread, cx| {
+                    thread.resolve_profile_switch_choice(SwitchUserChoice::Switch, cx);
+                });
+            });
+
+        let bg_color = cx.theme().status().warning.opacity(0.1);
+        let border_color = cx.theme().status().warning.opacity(0.4);
+
+        Some(
+            h_flex()
+                .id(("profile-switch-picker", tool_use_hash))
+                .w_full()
+                .px_2()
+                .py_1()
+                .mb_1()
+                .gap_2()
+                .rounded_md()
+                .bg(bg_color)
+                .border_1()
+                .border_color(border_color)
+                .child(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::XSmall)
+                        .color(Color::Warning),
+                )
+                .child(
+                    Label::new(format!(
+                        "Profile switch required: {capability} on {resource} (target: {target_mode}){}",
+                        countdown_label
+                            .as_ref()
+                            .map(|s| format!(" — timeout in {s}"))
+                            .unwrap_or_default(),
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Warning),
+                )
+                .child(div().flex_1())
+                .child(switch_button)
+                .child(stay_button),
         )
     }
 

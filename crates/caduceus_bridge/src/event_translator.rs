@@ -133,6 +133,27 @@ pub enum TranslatedThreadEvent {
         tool_use_id: String,
         outcome: String,
     },
+    /// ST8 PR-B3 — engine routed a denial through the profile-switch
+    /// classifier (mode has classical_fit for the originally-denied
+    /// capability). UI should surface a "Switch to {target_mode} for
+    /// this command?" picker. Distinct surface from `GrantPending`:
+    /// switch is one-shot per tool call; the conversation otherwise
+    /// stays in the current mode.
+    ProfileSwitchPending {
+        tool_use_id: String,
+        target_mode: String,
+        capability: String,
+        resource: String,
+        deadline_ms: u64,
+    },
+    /// ST8 PR-B3 — terminal outcome of a pending profile switch.
+    /// `outcome` is the stable short string from the orchestrator:
+    /// `"switched"`, `"switched:simulated"`, `"denied"`, `"timeout"`,
+    /// `"cancelled"`, or `"rejected:<reason>"`.
+    ProfileSwitchResolved {
+        tool_use_id: String,
+        outcome: String,
+    },
     /// Mode or lens changed mid-session. UI updates mode badge.
     /// H2 — `from_*` preserved so the UI can render transition
     /// animations / diff badges.
@@ -287,6 +308,26 @@ pub fn translate(ev: &AgentEvent) -> TranslatedEvents {
             tool_use_id,
             outcome,
         } => smallvec![T::GrantResolved {
+            tool_use_id: tool_use_id.clone(),
+            outcome: outcome.clone(),
+        }],
+        AgentEvent::ProfileSwitchPending {
+            tool_use_id,
+            target_mode,
+            capability,
+            resource,
+            deadline_ms,
+        } => smallvec![T::ProfileSwitchPending {
+            tool_use_id: tool_use_id.clone(),
+            target_mode: target_mode.clone(),
+            capability: capability.clone(),
+            resource: resource.clone(),
+            deadline_ms: *deadline_ms,
+        }],
+        AgentEvent::ProfileSwitchResolved {
+            tool_use_id,
+            outcome,
+        } => smallvec![T::ProfileSwitchResolved {
             tool_use_id: tool_use_id.clone(),
             outcome: outcome.clone(),
         }],
@@ -1060,6 +1101,74 @@ mod tests {
                 "outcome=\"{outcome}\" must round-trip verbatim"
             );
         }
+    }
+
+    // ── ST8 PR-B3 — ProfileSwitch translator arms ─────────────────────────
+    #[test]
+    fn profile_switch_pending_translates() {
+        let got = one(&AgentEvent::ProfileSwitchPending {
+            tool_use_id: "tu-ps-7".into(),
+            target_mode: "developer".into(),
+            capability: "fs.write".into(),
+            resource: "/repo/src".into(),
+            deadline_ms: 4_000,
+        });
+        assert_eq!(
+            got,
+            TranslatedThreadEvent::ProfileSwitchPending {
+                tool_use_id: "tu-ps-7".into(),
+                target_mode: "developer".into(),
+                capability: "fs.write".into(),
+                resource: "/repo/src".into(),
+                deadline_ms: 4_000,
+            }
+        );
+    }
+
+    #[test]
+    fn profile_switch_resolved_translates_each_outcome_string() {
+        for outcome in [
+            "switched",
+            "stayed",
+            "timeout",
+            "cancelled",
+            "rejected:no-such-mode",
+        ] {
+            let got = one(&AgentEvent::ProfileSwitchResolved {
+                tool_use_id: "tu-ps-y".into(),
+                outcome: outcome.into(),
+            });
+            assert_eq!(
+                got,
+                TranslatedThreadEvent::ProfileSwitchResolved {
+                    tool_use_id: "tu-ps-y".into(),
+                    outcome: outcome.into(),
+                },
+                "outcome=\"{outcome}\" must round-trip verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_switch_pending_preserves_empty_resource() {
+        // Engine emits "*" for global-scope capabilities; UI must not coerce it.
+        let got = one(&AgentEvent::ProfileSwitchPending {
+            tool_use_id: "tu-ps-glob".into(),
+            target_mode: "developer".into(),
+            capability: "shell.exec".into(),
+            resource: "*".into(),
+            deadline_ms: 0,
+        });
+        assert_eq!(
+            got,
+            TranslatedThreadEvent::ProfileSwitchPending {
+                tool_use_id: "tu-ps-glob".into(),
+                target_mode: "developer".into(),
+                capability: "shell.exec".into(),
+                resource: "*".into(),
+                deadline_ms: 0,
+            }
+        );
     }
 
     #[test]

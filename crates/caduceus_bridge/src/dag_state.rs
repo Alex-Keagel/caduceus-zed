@@ -132,6 +132,13 @@ pub struct SessionSnapshotV1 {
     /// Pending scope-expansion request (see
     /// [`AgentEvent::ScopeExpansionRequested`]). None once resolved.
     pub pending_scope_expansion: Option<PendingScopeExpansionV1>,
+    /// ST8 PR-B3 — pending profile-switch request (see
+    /// [`AgentEvent::ProfileSwitchPending`]). None once resolved.
+    /// Distinct slot from `pending_scope_expansion`: the classifier
+    /// routes to one or the other, never both, but they have
+    /// independent lifetimes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_profile_switch: Option<PendingProfileSwitchV1>,
     /// Cross-graph edges: which execution caused which plan mutation.
     pub provenance: Vec<ProvenanceEdgeV1>,
     pub last_event_id: u64,
@@ -167,6 +174,27 @@ pub struct PendingScopeExpansionV1 {
     /// is in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_ms: Option<u64>,
+}
+
+/// ST8 PR-B3 — pending profile-switch request snapshot. Populated when
+/// `AgentEvent::ProfileSwitchPending` arrives (the classifier routed a
+/// denial to a known target mode); cleared when
+/// `AgentEvent::ProfileSwitchResolved` matches by `tool_use_id`.
+///
+/// Mirrors the shape of [`PendingScopeExpansionV1`] but is
+/// intentionally a separate slot — the classifier routes either
+/// SuggestSwitch (this slot) or GrantRequired (scope-expansion slot)
+/// per denial, never both, and the UI surfaces are different
+/// (mode-switch picker vs scope-expansion picker).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct PendingProfileSwitchV1 {
+    pub tool_use_id: String,
+    pub target_mode: String,
+    pub capability: String,
+    pub resource: String,
+    /// Unix-epoch millisecond deadline for the pending switch; drives
+    /// the picker's countdown UI.
+    pub deadline_ms: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -217,6 +245,7 @@ pub struct SessionStateReducer {
     envelope: Option<EnvelopeSummaryV1>,
     awaiting_approval: Option<AwaitingApprovalV1>,
     pending_scope_expansion: Option<PendingScopeExpansionV1>,
+    pending_profile_switch: Option<PendingProfileSwitchV1>,
     // ST-C3 / audit P-3: VecDeque for O(1) FIFO eviction (see agent_edges).
     provenance: VecDeque<ProvenanceEdgeV1>,
     /// Phase-H H5 — same semantics as `agent_edges_dropped`.
@@ -366,6 +395,38 @@ impl SessionStateReducer {
                     .unwrap_or(false);
                 if matches_pending {
                     self.pending_scope_expansion = None;
+                }
+            }
+
+            AgentEvent::ProfileSwitchPending {
+                tool_use_id,
+                target_mode,
+                capability,
+                resource,
+                deadline_ms,
+            } => {
+                // ST8 PR-B3 — last-write-wins on collision (mirrors
+                // GrantPending); the engine is single-slotted, so a
+                // collision can only happen on a stale replay.
+                self.pending_profile_switch = Some(PendingProfileSwitchV1 {
+                    tool_use_id: tool_use_id.clone(),
+                    target_mode: target_mode.clone(),
+                    capability: capability.clone(),
+                    resource: resource.clone(),
+                    deadline_ms: *deadline_ms,
+                });
+            }
+
+            AgentEvent::ProfileSwitchResolved { tool_use_id, .. } => {
+                // ST8 PR-B3 — clear only if id matches; tolerate
+                // unknown ids (reaped sibling races).
+                let matches_pending = self
+                    .pending_profile_switch
+                    .as_ref()
+                    .map(|p| p.tool_use_id == *tool_use_id)
+                    .unwrap_or(false);
+                if matches_pending {
+                    self.pending_profile_switch = None;
                 }
             }
 
@@ -554,6 +615,7 @@ impl SessionStateReducer {
             envelope,
             awaiting_approval: self.awaiting_approval.clone(),
             pending_scope_expansion: self.pending_scope_expansion.clone(),
+            pending_profile_switch: self.pending_profile_switch.clone(),
             provenance: self.provenance.iter().cloned().collect(),
             last_event_id: self.last_event_id,
             provenance_dropped: self.provenance_dropped,
@@ -1043,6 +1105,117 @@ mod tests {
         assert!(
             r.active_session_snapshot(true)
                 .pending_scope_expansion
+                .is_none()
+        );
+    }
+
+    // ── ST8 PR-B3: ProfileSwitchPending / ProfileSwitchResolved reducer arms ──
+    //
+    // Mirrors the grant tests above. Asserts the four invariants:
+    //   1. Pending populates the dedicated `pending_profile_switch` slot
+    //      (NOT `pending_scope_expansion`).
+    //   2. Last-write-wins on stale-replay collision.
+    //   3. Resolution only clears when `tool_use_id` matches.
+    //   4. Resolution without pending is a no-op.
+
+    #[test]
+    fn st8_pr_b3_profile_switch_pending_populates_dedicated_slot() {
+        let mut r = SessionStateReducer::new();
+        r.ingest(&AgentEvent::ProfileSwitchPending {
+            tool_use_id: "tu-ps-7".into(),
+            target_mode: "developer".into(),
+            capability: "fs.write".into(),
+            resource: "/repo".into(),
+            deadline_ms: 1_700_000_000_000,
+        });
+        let snap = r.active_session_snapshot(true);
+        let p = snap
+            .pending_profile_switch
+            .expect("pending_profile_switch populated");
+        assert_eq!(p.tool_use_id, "tu-ps-7");
+        assert_eq!(p.target_mode, "developer");
+        assert_eq!(p.capability, "fs.write");
+        assert_eq!(p.resource, "/repo");
+        assert_eq!(p.deadline_ms, 1_700_000_000_000);
+        // MUST NOT leak into the grant-side slot.
+        assert!(snap.pending_scope_expansion.is_none());
+    }
+
+    #[test]
+    fn st8_pr_b3_profile_switch_pending_last_write_wins() {
+        let mut r = SessionStateReducer::new();
+        r.ingest(&AgentEvent::ProfileSwitchPending {
+            tool_use_id: "tu-ps-old".into(),
+            target_mode: "developer".into(),
+            capability: "fs.write".into(),
+            resource: "/old".into(),
+            deadline_ms: 1,
+        });
+        r.ingest(&AgentEvent::ProfileSwitchPending {
+            tool_use_id: "tu-ps-new".into(),
+            target_mode: "developer".into(),
+            capability: "shell.exec".into(),
+            resource: "*".into(),
+            deadline_ms: 2,
+        });
+        let p = r
+            .active_session_snapshot(true)
+            .pending_profile_switch
+            .unwrap();
+        assert_eq!(p.tool_use_id, "tu-ps-new");
+        assert_eq!(p.capability, "shell.exec");
+    }
+
+    #[test]
+    fn st8_pr_b3_profile_switch_resolved_clears_matching_pending() {
+        let mut r = SessionStateReducer::new();
+        r.ingest(&AgentEvent::ProfileSwitchPending {
+            tool_use_id: "tu-ps-1".into(),
+            target_mode: "developer".into(),
+            capability: "fs.write".into(),
+            resource: "/repo".into(),
+            deadline_ms: 5,
+        });
+        r.ingest(&AgentEvent::ProfileSwitchResolved {
+            tool_use_id: "tu-ps-1".into(),
+            outcome: "switched".into(),
+        });
+        assert!(
+            r.active_session_snapshot(true)
+                .pending_profile_switch
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn st8_pr_b3_profile_switch_resolved_ignores_mismatched_tool_use_id() {
+        let mut r = SessionStateReducer::new();
+        r.ingest(&AgentEvent::ProfileSwitchPending {
+            tool_use_id: "tu-ps-live".into(),
+            target_mode: "developer".into(),
+            capability: "fs.write".into(),
+            resource: "/repo".into(),
+            deadline_ms: 0,
+        });
+        r.ingest(&AgentEvent::ProfileSwitchResolved {
+            tool_use_id: "tu-ps-stale".into(),
+            outcome: "timeout".into(),
+        });
+        let p = r.active_session_snapshot(true).pending_profile_switch;
+        assert!(p.is_some(), "stale resolution must not clear live pending");
+        assert_eq!(p.unwrap().tool_use_id, "tu-ps-live");
+    }
+
+    #[test]
+    fn st8_pr_b3_profile_switch_resolved_without_pending_is_noop() {
+        let mut r = SessionStateReducer::new();
+        r.ingest(&AgentEvent::ProfileSwitchResolved {
+            tool_use_id: "tu-ps-ghost".into(),
+            outcome: "stayed".into(),
+        });
+        assert!(
+            r.active_session_snapshot(true)
+                .pending_profile_switch
                 .is_none()
         );
     }

@@ -288,6 +288,8 @@ impl Conversation {
                     | AcpThreadEvent::WorkingDirectoriesUpdated
                     | AcpThreadEvent::GrantApprovalRequested
                     | AcpThreadEvent::GrantApprovalResolved
+                    | AcpThreadEvent::ProfileSwitchRequested
+                    | AcpThreadEvent::ProfileSwitchResolved
                     | AcpThreadEvent::NoticeAdded(_)
                     | AcpThreadEvent::NoticeRemoved(_) => {}
                 }
@@ -415,6 +417,8 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::SubagentSpawned(_)
         | AcpThreadEvent::GrantApprovalRequested
         | AcpThreadEvent::GrantApprovalResolved
+        | AcpThreadEvent::ProfileSwitchRequested
+        | AcpThreadEvent::ProfileSwitchResolved
         | AcpThreadEvent::NoticeAdded(_)
         | AcpThreadEvent::NoticeRemoved(_) => false,
     }
@@ -1650,6 +1654,8 @@ impl ConversationView {
             // mirroring needed.
             AcpThreadEvent::GrantApprovalRequested
             | AcpThreadEvent::GrantApprovalResolved
+            | AcpThreadEvent::ProfileSwitchRequested
+            | AcpThreadEvent::ProfileSwitchResolved
             | AcpThreadEvent::NoticeAdded(_)
             | AcpThreadEvent::NoticeRemoved(_) => {
                 cx.notify();

@@ -1421,6 +1421,8 @@ impl AgentDiff {
             | AcpThreadEvent::WorkingDirectoriesUpdated
             | AcpThreadEvent::GrantApprovalRequested
             | AcpThreadEvent::GrantApprovalResolved
+            | AcpThreadEvent::ProfileSwitchRequested
+            | AcpThreadEvent::ProfileSwitchResolved
             | AcpThreadEvent::NoticeAdded(_)
             | AcpThreadEvent::NoticeRemoved(_) => {}
         }

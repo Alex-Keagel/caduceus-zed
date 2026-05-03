@@ -37,14 +37,14 @@
 use async_trait::async_trait;
 use caduceus_bridge::orchestrator::OrchestratorBridge;
 use caduceus_core::{AgentEvent, StopReason, ToolResult, ToolSpec, ToolUse};
-use caduceus_permissions::envelope::{PathAllowlist, PermissionEnvelope};
 use caduceus_permissions::GrantOutcome;
-use caduceus_providers::mock::MockLlmAdapter;
+use caduceus_permissions::envelope::{PathAllowlist, PermissionEnvelope};
 use caduceus_providers::ChatResponse;
+use caduceus_providers::mock::MockLlmAdapter;
 use caduceus_tools::{Tool, ToolRegistry};
-use serde_json::{json, Value};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Tool registered as `write_file` so `classify_tool_call` routes it through
@@ -201,7 +201,9 @@ async fn st8_intercept_does_not_execute_recording_tool() {
     let mut history = OrchestratorBridge::new_history();
 
     // ── Act ──────────────────────────────────────────────────────────────
-    let run_result = harness.run(&mut state, &mut history, "please write the file").await;
+    let run_result = harness
+        .run(&mut state, &mut history, "please write the file")
+        .await;
 
     // Drop the emitter so the broadcast channel closes and the grant task
     // can exit its recv loop. The emitter was cloned into the harness, so
