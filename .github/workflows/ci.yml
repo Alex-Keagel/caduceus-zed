@@ -2,9 +2,9 @@ name: Caduceus CI
 
 on:
   push:
-    branches: [caduceus-main]
+    branches: [main]
   pull_request:
-    branches: [caduceus-main]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,9 +15,21 @@ jobs:
     name: Check & Test
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout caduceus-zed (this repo)
+        uses: actions/checkout@v4
         with:
           submodules: recursive
+          path: caduceus-zed
+
+      - name: Checkout sibling caduceus engine
+        # caduceus-zed has path deps on `../caduceus/crates/*` so the
+        # sibling repo MUST be present at the same parent dir.  We clone
+        # the matching default branch with depth=1 — the heavy crates we
+        # consume are stable enough that a deeper history is not needed
+        # for `cargo check`/`cargo test`.
+        run: |
+          git clone --depth=1 https://github.com/Alex-Keagel/caduceus.git caduceus
+        working-directory: ${{ github.workspace }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -28,14 +40,25 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            caduceus-zed/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('caduceus-zed/**/Cargo.lock') }}
 
       - name: Check agent crate
         run: cargo check -p agent -p agent_ui
+        working-directory: caduceus-zed
 
-      - name: Test bridge
-        run: cargo test -p caduceus_bridge --test agent_tool_integration
+      - name: Test caduceus_bridge (lib + integration)
+        run: cargo test -p caduceus_bridge --lib --tests
+        working-directory: caduceus-zed
+
+      - name: Test agent_ui
+        run: cargo test -p agent_ui --lib
+        working-directory: caduceus-zed
+
+      - name: Clippy gate
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: caduceus-zed
 
       - name: Check release build
         run: cargo check --release -p zed --features gpui_platform/runtime_shaders
+        working-directory: caduceus-zed
